@@ -2015,11 +2015,16 @@ class C2KVSegmentInfo:
         token_start: int = 0,
         token_end: int = 0,
         repair_key_hashes: Optional[List[str]] = None,
+        repair_placement: Optional[str] = None,
     ):
         self.key_hash = key_hash
         self.token_start = token_start
         self.token_end = token_end
         self.repair_key_hashes = repair_key_hashes or []
+        # One of "in_place" / "append_keep_ledger" / "append_tail" or None
+        # (None = derive from the entry's repair_mode, legacy behaviour).
+        # See c2kv/c2kv_serving_semantics.md, "Repair placement".
+        self.repair_placement = repair_placement
 
 
 @dataclass
@@ -2070,6 +2075,7 @@ class C2KVRepairExtractReqOutput(BaseReq):
     extract_source: str = ""
     cache_hit_tokens: int = 0
     serving_kv_buffer_shape: Optional[Tuple[int, ...]] = None
+    already_rotated: bool = False
     error: str = ""
     success: bool = True
 

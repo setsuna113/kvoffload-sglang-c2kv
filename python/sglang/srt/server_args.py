@@ -578,6 +578,12 @@ class ServerArgs:
     c2kv_gist_param: str = "qkv"
     c2kv_pool_fraction: float = 0.01
     c2kv_max_tokens: int = 65536
+    # Which projections ordinary (non-gist) tokens use once gist KV is present in
+    # a request's cache. "gist" reproduces the checkpoint's training regime
+    # (python/models/qwen3/modeling_qwen3.py use_gist=True for query/answer
+    # tokens); "base" is the paper-text regime and the pre-2026-09 serving
+    # behaviour. See c2kv/c2kv_serving_semantics.md.
+    c2kv_query_proj: str = "gist"
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -765,6 +771,8 @@ class ServerArgs:
             raise ValueError("--c2kv-pool-fraction must be in the range (0, 1].")
         if self.c2kv_max_tokens <= 0:
             raise ValueError("--c2kv-max-tokens must be greater than 0.")
+        if self.c2kv_query_proj not in ("base", "gist"):
+            raise ValueError("--c2kv-query-proj must be 'base' or 'gist'.")
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -5247,6 +5255,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.c2kv_max_tokens,
             help="Maximum number of gist tokens allowed in a single C2KV entry.",
+        )
+        parser.add_argument(
+            "--c2kv-query-proj",
+            type=str,
+            choices=["base", "gist"],
+            default=ServerArgs.c2kv_query_proj,
+            help="Projection used for ordinary tokens that come AFTER gist KV in a "
+            "request (query, current turn, decoded tokens). 'gist' = the same "
+            "gist_{q,k,v}_proj the checkpoint was trained with (use_gist=True in "
+            "modeling_qwen3.py); 'base' = frozen base projections as written in the "
+            "C2KV paper text and as served before 2026-09. Tokens before the first "
+            "gist (system prompt, tool prologue) always use base. "
+            "See c2kv/c2kv_serving_semantics.md.",
         )
 
         # Ktransformer server args

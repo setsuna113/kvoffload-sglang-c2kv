@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import logging
 import os
 
 from dataclasses import dataclass
@@ -430,6 +431,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For C2KV extraction
     c2kv_position_corrections: Optional[torch.Tensor] = None  # (batch_size,) int64
+    # For C2KV --c2kv-query-proj gist: per token, True when the token comes after
+    # gist KV in its request and must be projected with gist_{q,k,v}_proj.
+    c2kv_gist_proj_mask: Optional[torch.Tensor] = None  # (num_tokens,) bool
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
@@ -597,6 +601,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 per_token_corr = torch.repeat_interleave(corr, ext_lens)
                 ret.positions = ret.positions + per_token_corr
+
+        # C2KV query-projection mask (see ServerArgs.c2kv_query_proj)
+        if getattr(batch, "c2kv_gist_seen", None) is not None:
+            seen = torch.tensor(batch.c2kv_gist_seen, dtype=torch.bool, device=device)
+            if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+                ret.c2kv_gist_proj_mask = seen
+            elif batch.extend_seq_lens is not None:
+                ext_lens = torch.tensor(
+                    batch.extend_seq_lens, dtype=torch.int64, device=device
+                )
+                ret.c2kv_gist_proj_mask = torch.repeat_interleave(seen, ext_lens)
 
 
         # ---------------------------------------------------------
@@ -1235,6 +1250,17 @@ def compute_position_kernel(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
+    if (extend_seq_lens < 0).any() or (extend_prefix_lens < 0).any():
+        # Defensive clamp (compat e07c31776): a negative length here would
+        # crash the engine; log loudly and keep going.
+        logging.getLogger(__name__).error(
+            "compute_position_torch: negative lens extend_prefix_lens=%s "
+            "extend_seq_lens=%s - clamping to 0 to keep the engine alive",
+            extend_prefix_lens.tolist(),
+            extend_seq_lens.tolist(),
+        )
+        extend_prefix_lens = extend_prefix_lens.clamp(min=0)
+        extend_seq_lens = extend_seq_lens.clamp(min=0)
     positions = torch.cat(
         [
             torch.arange(

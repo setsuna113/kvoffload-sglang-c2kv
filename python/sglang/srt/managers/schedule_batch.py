@@ -893,6 +893,14 @@ class Req(ReqDllmMixin):
         self.c2kv_round_idx = 0
         self.c2kv_round_start_len = 0       # KV length before the active round's real tokens
         self.c2kv_position_correction = 0  # running sum: original_seq_len - gist_len
+        # True once any gist KV has been injected into this request's cache.
+        # Drives --c2kv-query-proj: ordinary tokens forwarded after this point use
+        # the gist projections (training regime). Repair-only injections do not
+        # set it. See c2kv/c2kv_serving_semantics.md.
+        self.c2kv_gist_seen = False
+        # Per-request layout ledger (gist / repair injections with positions),
+        # returned to the client in metadata.sglang_runtime.c2kv_layout.
+        self.c2kv_layout = []
         self.c2kv_virtual_input_ids = None  # virtual token IDs including synthetic gist IDs
         self.c2kv_requeued = False              # True while waiting for next round
         self.c2kv_pinned_keys = None        # Unique C2KV keys pinned while rounds inject
@@ -2482,6 +2490,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             c2kv_corr = [
                 getattr(r, "c2kv_position_correction", 0) for r in self.reqs
             ]
+        c2kv_gist_seen = None
+        if any(getattr(r, "c2kv_gist_seen", False) for r in self.reqs):
+            c2kv_gist_seen = [
+                bool(getattr(r, "c2kv_gist_seen", False)) for r in self.reqs
+            ]
 
         if os.environ.get("C2KV_DEBUG_POSITIONS") == "1":
             print(
@@ -2562,6 +2575,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             c2kv_position_corrections=c2kv_corr,
+            c2kv_gist_seen=c2kv_gist_seen,
         )
 
     def copy(self):
@@ -2752,3 +2766,5 @@ class ModelWorkerBatch:
 
     # C2KV position corrections per request
     c2kv_position_corrections: Optional[List[int]] = None
+    # C2KV: per request, whether gist KV already sits in the cache (query-proj rule)
+    c2kv_gist_seen: Optional[List[bool]] = None

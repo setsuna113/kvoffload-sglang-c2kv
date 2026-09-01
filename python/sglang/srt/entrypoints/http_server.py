@@ -1470,11 +1470,17 @@ async def v1_c2kv_extract(
             # then tokenize the string.  The two-step approach avoids BPE
             # boundary differences that arise when subtracting token-ID
             # prefixes from a jointly-tokenized multi-message sequence.
+            extract_template_kwargs = dict(chat_template_kwargs)
+            if request.tools:
+                # render tool schemas into the template the same way the
+                # serving path does (serving_chat._chat_template_tools) so
+                # original_seq_len includes the tools prologue
+                extract_template_kwargs["tools"] = request.tools
             text_str = tokenizer.apply_chat_template(
                 [{"role": request.role, "content": request.text}],
                 tokenize=False,
                 add_generation_prompt=False,
-                **chat_template_kwargs,
+                **extract_template_kwargs,
             )
             if tokenizer.bos_token and text_str.startswith(tokenizer.bos_token):
                 text_str = text_str[len(tokenizer.bos_token):]
@@ -1515,6 +1521,84 @@ async def v1_c2kv_extract(
         )
 
 
+def _c2kv_template_ids(tokenizer, messages, tools, chat_template_kwargs):
+    """Token ids of `messages` rendered like a chat request (no generation
+    prompt, BOS stripped), with `tools` serialized exactly as serving_chat does
+    (chat_template_tools_dump) so the tool prologue matches the serving prompt."""
+    from sglang.srt.entrypoints.openai.protocol import Tool, chat_template_tools_dump
+
+    flat_tools = None
+    if tools:
+        flat_tools = chat_template_tools_dump(
+            [Tool.model_validate(item) if isinstance(item, dict) else item for item in tools]
+        )
+    text_str = tokenizer.apply_chat_template(
+        list(messages),
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=flat_tools,
+        **(chat_template_kwargs or {}),
+    )
+    if tokenizer.bos_token and text_str.startswith(tokenizer.bos_token):
+        text_str = text_str[len(tokenizer.bos_token):]
+    ids = tokenizer.encode(text_str, add_special_tokens=False)
+    return list(ids)
+
+
+def _render_c2kv_repair_span(tokenizer, messages, target_index, tools, chat_template_kwargs):
+    """Render messages[:target_index+1] and locate message `target_index`.
+
+    Returns (input_ids, span_start, span_end, rendered_prefix_len). The prefix
+    rendering must be prefix-stable (the full rendering starts with the
+    prefix rendering token for token); otherwise the span cannot be trusted
+    and a ValueError is raised. For target_index == 0 the prologue (system
+    message / tool schemas rendered before the first message) is located by
+    rendering the message with and without tools, mirroring
+    serving_chat._c2kv_first_message_start_offset.
+    """
+    if target_index is None:
+        raise ValueError("target_index is required with messages")
+    messages = [dict(m) for m in messages]
+    if not (0 <= target_index < len(messages)):
+        raise ValueError(
+            f"target_index {target_index} out of range for {len(messages)} messages"
+        )
+    full_ids = _c2kv_template_ids(
+        tokenizer, messages[: target_index + 1], tools, chat_template_kwargs
+    )
+    if target_index > 0:
+        prefix_ids = _c2kv_template_ids(
+            tokenizer, messages[:target_index], tools, chat_template_kwargs
+        )
+        if full_ids[: len(prefix_ids)] != prefix_ids:
+            raise ValueError(
+                "chat template rendering is not prefix-stable at message "
+                f"{target_index}; refusing to build a repair span"
+            )
+        span_start = len(prefix_ids)
+    else:
+        without = _c2kv_template_ids(tokenizer, messages[:1], None, chat_template_kwargs)
+        span_start = 0
+        if tools and without:
+            limit = len(full_ids) - len(without) + 1
+            found = -1
+            for start in range(max(0, limit)):
+                if full_ids[start : start + len(without)] == without:
+                    found = start
+                    break
+            if found < 0 and full_ids[-len(without) :] == without:
+                found = len(full_ids) - len(without)
+            if found < 0:
+                raise ValueError(
+                    "could not locate the first message inside the tool prologue"
+                )
+            span_start = found
+    span_end = len(full_ids)
+    if span_end <= span_start:
+        raise ValueError("target message contributes no tokens")
+    return full_ids, span_start, span_end, span_start
+
+
 @app.post("/v1/c2kv/repair_extract")
 async def v1_c2kv_repair_extract(
     request: C2KVRepairExtractRequest, raw_request: Request
@@ -1525,7 +1609,27 @@ async def v1_c2kv_repair_extract(
         tokenizer = tokenizer_manager.tokenizer
         chat_template_kwargs = request.chat_template_kwargs or {}
 
-        if request.input_ids is not None:
+        span_start = request.span_start
+        span_end = request.span_end
+        position_offset = request.position_offset
+        rendered_prefix_len = 0
+        if request.messages is not None:
+            # Full-context form: the raw KV of messages[target_index] inside the
+            # chat-template rendering of messages[:target_index+1] (with tools),
+            # i.e. what the base model computes for that message in the exact
+            # context a chat request would give it. Positions are absolute in
+            # that rendering, position_offset is ignored (0).
+            input_ids, span_start, span_end, rendered_prefix_len = (
+                _render_c2kv_repair_span(
+                    tokenizer,
+                    request.messages,
+                    request.target_index,
+                    request.tools,
+                    chat_template_kwargs,
+                )
+            )
+            position_offset = 0
+        elif request.input_ids is not None:
             input_ids = list(request.input_ids)
         elif request.role:
             text_str = tokenizer.apply_chat_template(
@@ -1548,13 +1652,13 @@ async def v1_c2kv_repair_extract(
                 error="The repair input contributes no tokens.",
             )
 
-        span_end = len(input_ids) if request.span_end is None else request.span_end
+        span_end = len(input_ids) if span_end is None else span_end
         result = await tokenizer_manager.c2kv_repair_extract(
             input_ids=input_ids,
             input_text=request.text,
-            span_start=request.span_start,
+            span_start=span_start,
             span_end=span_end,
-            position_offset=request.position_offset,
+            position_offset=position_offset,
             repair_mode=request.repair_mode,
             source_doc_index=request.source_doc_index,
             extract_source=request.extract_source,
@@ -1573,6 +1677,10 @@ async def v1_c2kv_repair_extract(
                 if result.serving_kv_buffer_shape is not None
                 else None
             ),
+            already_rotated=bool(getattr(result, "already_rotated", False)),
+            span_start=int(span_start),
+            span_end=int(span_end),
+            rendered_prefix_len=int(rendered_prefix_len),
             success=result.success,
             error=result.error or None,
         )

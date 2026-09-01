@@ -435,8 +435,15 @@ class TokenizerCommunicatorMixin:
         source_doc_index: Optional[int] = None,
         extract_source: str = "model_prefill",
         rid: Optional[str] = None,
+        already_rotated: bool = False,
     ) -> C2KVRepairExtractReqOutput:
-        """Run C2KV repair KV extraction via the scheduler."""
+        """Run C2KV repair KV extraction via the scheduler.
+
+        `already_rotated=False` (default): the model_prefill path stores K
+        pre-RoPE so the entry can be placed at any position at injection time
+        (needed for append_tail). The scheduler forces True for the
+        serving_cache source, whose K is read back already rotated.
+        """
         import uuid
 
         self.auto_create_handle_loop()
@@ -449,7 +456,7 @@ class TokenizerCommunicatorMixin:
             position_offset=position_offset,
             repair_mode=repair_mode,
             source_doc_index=source_doc_index,
-            already_rotated=True,
+            already_rotated=already_rotated,
             extract_source=extract_source,
         )
         return (await self.c2kv_repair_extract_communicator(req))[0]

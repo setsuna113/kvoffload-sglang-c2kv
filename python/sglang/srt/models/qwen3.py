@@ -66,7 +66,15 @@ if _use_aiter:
 if _is_npu:
     import torch_npu
 
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    try:
+        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+            split_qkv_rmsnorm_rope,
+        )
+    except ImportError:
+        # older triton-ascend without language.extra.cann: fall back to the
+        # native path (split + qk_norm + rope) for decode as well
+        # (compat 27f21a588, ported onto 22fbf3146)
+        split_qkv_rmsnorm_rope = None
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
@@ -177,6 +185,9 @@ class Qwen3Attention(nn.Module):
                 f"got {pic_param!r}."
             )
 
+        # --c2kv-query-proj: which of q/k/v ordinary tokens switch to the gist
+        # projections once gist KV is present (empty = never = base).
+        self.c2kv_query_proj_parts = frozenset()
         if get_global_server_args().enable_c2kv:
             c2kv_proj_name = "residual_qkv_proj" if pic_enabled else "gist_qkv_proj"
             c2kv_proj = QKVParallelLinear(
@@ -191,6 +202,17 @@ class Qwen3Attention(nn.Module):
                 prefix=add_prefix(c2kv_proj_name, prefix),
             )
             setattr(self, c2kv_proj_name, c2kv_proj)
+            if (
+                not pic_enabled
+                and getattr(get_global_server_args(), "c2kv_query_proj", "base")
+                == "gist"
+            ):
+                _gist_param = str(
+                    getattr(get_global_server_args(), "c2kv_gist_param", "qkv") or ""
+                ).lower()
+                self.c2kv_query_proj_parts = frozenset(
+                    part for part in "qkv" if part in _gist_param
+                )
             if pic_enabled:
                 # Loading a base Qwen3 checkpoint with PIC enabled must initially
                 # preserve its QKV projections exactly.
@@ -245,8 +267,43 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def _c2kv_project_qkv(self, hidden_states, forward_batch):
+        """QKV projection honouring --c2kv-query-proj.
+
+        Training (python/models/qwen3/modeling_qwen3.py:242-246, :673) projects
+        every token of the main forward with gist_{q,k,v}_proj whenever gist KV
+        sits in the cache; the system prefix is prefilled separately with the
+        base projections. `forward_batch.c2kv_gist_proj_mask` marks the tokens
+        that come after gist KV in their request; those rows take the
+        gist projection for the parts listed in `c2kv_query_proj_parts`
+        (derived from --c2kv-gist-param). Everything else, including repair KV
+        extraction (`generate_raw_repair_kv`, forward_batch=None), stays base.
+        """
         qkv, _ = self.qkv_proj(hidden_states)
+        parts = self.c2kv_query_proj_parts
+        if not parts:
+            return qkv
+        mask = (
+            getattr(forward_batch, "c2kv_gist_proj_mask", None)
+            if forward_batch is not None
+            else None
+        )
+        if mask is None or mask.numel() != hidden_states.shape[0] or not bool(
+            mask.any()
+        ):
+            return qkv
+        qkv_gist, _ = self.gist_qkv_proj(hidden_states)
+        sizes = [self.q_size, self.kv_size, self.kv_size]
+        base_parts = qkv.split(sizes, dim=-1)
+        gist_parts = qkv_gist.split(sizes, dim=-1)
+        sel = mask.view(-1, 1)
+        merged = []
+        for name, base_t, gist_t in zip("qkv", base_parts, gist_parts):
+            merged.append(torch.where(sel, gist_t, base_t) if name in parts else base_t)
+        return torch.cat(merged, dim=-1)
+
+    def forward_prepare_native(self, positions, hidden_states, forward_batch=None):
+        qkv = self._c2kv_project_qkv(hidden_states, forward_batch)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
             q=q,
@@ -260,7 +317,13 @@ class Qwen3Attention(nn.Module):
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
-        qkv, _ = self.qkv_proj(hidden_states)
+        if split_qkv_rmsnorm_rope is None:
+            # compat fallback (27f21a588 port): repair_extract calls this
+            # path directly, bypassing the forward dispatch guard
+            return self.forward_prepare_native(
+                positions, hidden_states, forward_batch=forward_batch
+            )
+        qkv = self._c2kv_project_qkv(hidden_states, forward_batch)
 
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -364,11 +427,13 @@ class Qwen3Attention(nn.Module):
             save_kv_cache = False
         elif (
             not _is_npu
+            or split_qkv_rmsnorm_rope is None
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         ):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
         else:
             q, k, v = self.forward_prepare_npu(
@@ -1193,12 +1258,18 @@ class Qwen3ForCausalLM(nn.Module):
         *,
         position_offset: int = 0,
     ):
-        """Run a correctness-first full prefill and capture raw RoPE'd KV.
+        """Run a correctness-first full prefill and capture raw KV of a span.
 
         This is used by the C2KV repair endpoints. It intentionally captures
-        ordinary self-attention K/V, not gist/PIC K/V. The returned K already
-        carries the requested absolute RoPE phase and must be injected with
-        `already_rotated=True`.
+        ordinary self-attention K/V with the frozen base projections, not
+        gist/PIC K/V (paper 2607.17715 section 3.3.2, original-token invariance:
+        raw KV must be what the base model computes in this exact context).
+        The forward itself runs at `position_offset + i` (so the attention
+        output, and therefore every later layer's K/V, is the full-context one),
+        but the returned K is captured BEFORE RoPE (post k_norm), and the
+        returned position ids record where it was computed. Injection applies
+        RoPE once, either at those positions (in_place / append_keep_ledger) or
+        at a new tail position (append_tail). See c2kv/c2kv_serving_semantics.md.
         """
 
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -1239,16 +1310,25 @@ class Qwen3ForCausalLM(nn.Module):
             # Full-prefill path; using the decode-oriented NPU fused prepare
             # changes the raw K/V slightly and breaks raw-all replacement
             # equivalence on sensitive BFCL trajectories.
-            q, k, v = layer.self_attn.forward_prepare_native(
-                positions=positions,
-                hidden_states=attn_input,
+            # Same ops as forward_prepare_native (qkv_proj -> qk_norm -> rope), split
+            # so the span's K can be captured pre-RoPE. Base projections only:
+            # forward_batch=None keeps _c2kv_project_qkv on the base path.
+            attn = layer.self_attn
+            qkv = attn._c2kv_project_qkv(attn_input, None)
+            q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=attn.q_norm,
+                k_norm=attn.k_norm,
+                head_dim=attn.head_dim,
+                alt_stream=attn.alt_stream,
             )
-            raw_key_values.append(
-                (
-                    k[span_start:span_end].contiguous().clone(),
-                    v[span_start:span_end].contiguous().clone(),
-                )
-            )
+            # clone BEFORE rope: rotary_emb may rotate k in place
+            k_pre_rope = k[span_start:span_end].contiguous().clone()
+            v_span = v[span_start:span_end].contiguous().clone()
+            q, k = attn.rotary_emb(positions, q, k)
+            raw_key_values.append((k_pre_rope, v_span))
 
             q = q.view(1, seq_len, layer.self_attn.num_heads, layer.self_attn.head_dim)
             k_attn = k.view(

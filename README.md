@@ -12,6 +12,14 @@
 
 --------------------------------------------------------------------------------
 
+> **C2KV fork.** This tree serves C2KV gist checkpoints (`--enable-c2kv`).
+> Before changing or interpreting anything C2KV-related read
+> [`c2kv/c2kv_serving_semantics.md`](c2kv/c2kv_serving_semantics.md): it records where the
+> paper text, the training checkpoint and this server disagree (query-token projections,
+> position frames, repair placement) and which server flag / response field covers each.
+> Design docs: `c2kv/c2kv_integration_plan.md`, `c2kv/c2kv_implementation_report.md`.
+
+
 <p align="center">
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |
 <a href="https://docs.sglang.io/"><b>Documentation</b></a> |

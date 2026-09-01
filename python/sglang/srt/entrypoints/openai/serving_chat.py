@@ -16,6 +16,7 @@ from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
+    chat_template_tools_dump,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -245,12 +246,14 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.tools or request.tool_choice == "none":
             return None
         if not isinstance(request.tool_choice, str):
-            return [
-                item.model_dump()
-                for item in request.tools
-                if item.function.name == request.tool_choice.function.name
-            ]
-        return [item.model_dump() for item in request.tools]
+            return chat_template_tools_dump(
+                [
+                    item
+                    for item in request.tools
+                    if item.function.name == request.tool_choice.function.name
+                ]
+            )
+        return chat_template_tools_dump(request.tools)
 
     def _chat_template_extra_kwargs(
         self, request: "ChatCompletionRequest"
@@ -446,6 +449,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             getattr(msg, "c2kv_repair_only_key_hashes", None) or []
                         )
                     ),
+                    repair_placement=getattr(msg, "c2kv_repair_placement", None),
                 )
             )
 

@@ -82,8 +82,14 @@ class SchedulerOutputProcessorMixin:
 
         return None
 
-    def _get_kv_runtime_stats(self: Scheduler) -> Optional[dict]:
-        """Return a real KV allocator residency snapshot for accounting."""
+    def _get_kv_runtime_stats(self: Scheduler, req=None) -> Optional[dict]:
+        """Return a real KV allocator residency snapshot for accounting.
+
+        When `req` is given, the request's C2KV layout ledger (gist / repair
+        injections with their RoPE positions) and the server's query-projection
+        mode are attached so the client can verify position-frame consistency
+        and record provenance. See c2kv/c2kv_serving_semantics.md.
+        """
 
         allocator = getattr(self, "token_to_kv_pool_allocator", None)
         if allocator is None:
@@ -97,13 +103,29 @@ class SchedulerOutputProcessorMixin:
                 resident,
             )
             self._c2kv_runtime_peak_kv_tokens = peak
-            return {
+            stats = {
                 "kv_pool_size": size,
                 "kv_available_tokens": available,
                 "kv_resident_tokens": resident,
                 "kv_peak_resident_tokens": peak,
                 "kv_page_size": int(getattr(allocator, "page_size", 1) or 1),
             }
+            server_args = getattr(self, "server_args", None)
+            if server_args is not None and getattr(server_args, "enable_c2kv", False):
+                stats["c2kv_query_proj"] = getattr(
+                    server_args, "c2kv_query_proj", "base"
+                )
+            if req is not None:
+                layout = getattr(req, "c2kv_layout", None)
+                if layout:
+                    stats["c2kv_layout"] = list(layout)
+                    stats["c2kv_position_correction"] = int(
+                        getattr(req, "c2kv_position_correction", 0) or 0
+                    )
+                    stats["c2kv_gist_seen"] = bool(
+                        getattr(req, "c2kv_gist_seen", False)
+                    )
+            return stats
         except Exception:
             return None
 
@@ -1202,7 +1224,7 @@ class SchedulerOutputProcessorMixin:
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
-                kv_runtime_stats.append(self._get_kv_runtime_stats())
+                kv_runtime_stats.append(self._get_kv_runtime_stats(req))
 
                 retraction_counts.append(req.retraction_count)
 
