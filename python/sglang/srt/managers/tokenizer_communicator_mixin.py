@@ -443,6 +443,8 @@ class TokenizerCommunicatorMixin:
         history_kv_kernel_size: int = 5,
         history_kv_pooling: str = "avgpool",
         history_kv_h2o_recent_fraction: float = 0.5,
+        kv_reuse_method: Optional[str] = None,
+        cacheblend: Optional[dict] = None,
         rid: Optional[str] = None,
         already_rotated: bool = False,
     ) -> C2KVRepairExtractReqOutput:
@@ -483,6 +485,8 @@ class TokenizerCommunicatorMixin:
             history_kv_kernel_size=history_kv_kernel_size,
             history_kv_pooling=history_kv_pooling,
             history_kv_h2o_recent_fraction=history_kv_h2o_recent_fraction,
+            kv_reuse_method=kv_reuse_method,
+            cacheblend=cacheblend,
         )
         return (await self.c2kv_repair_extract_communicator(req))[0]
 

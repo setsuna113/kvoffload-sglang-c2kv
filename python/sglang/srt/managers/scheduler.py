@@ -2482,6 +2482,45 @@ class Scheduler(
                 error=f"Unsupported raw_kv_position_mode: {raw_kv_position_mode!r}.",
                 success=False,
             )
+        kv_reuse_method = (recv_req.kv_reuse_method or "").strip().lower() or None
+        cacheblend_cfg = None
+        cacheblend_meta = None
+        if kv_reuse_method:
+            from sglang.srt.mem_cache.cacheblend import CacheBlendConfig
+
+            if kv_reuse_method != "cacheblend":
+                return C2KVRepairExtractReqOutput(
+                    error=f"Unsupported kv_reuse_method: {kv_reuse_method!r}.",
+                    success=False,
+                    kv_reuse_method=kv_reuse_method,
+                    requested_span_tokens=token_len,
+                )
+            if history_kv_method:
+                return C2KVRepairExtractReqOutput(
+                    error="kv_reuse_method is exclusive with history_kv_method.",
+                    success=False,
+                    kv_reuse_method=kv_reuse_method,
+                    history_kv_method=history_kv_method,
+                    requested_span_tokens=token_len,
+                )
+            if raw_kv_position_mode != "rotated":
+                return C2KVRepairExtractReqOutput(
+                    error="cacheblend entries are post-RoPE at their native "
+                    "positions; raw_kv_position_mode must be 'rotated'.",
+                    success=False,
+                    kv_reuse_method=kv_reuse_method,
+                    requested_span_tokens=token_len,
+                )
+            try:
+                CacheBlendConfig.from_request(recv_req.cacheblend)  # validate
+                cacheblend_cfg = dict(recv_req.cacheblend or {})
+            except (TypeError, ValueError) as exc:
+                return C2KVRepairExtractReqOutput(
+                    error=f"Invalid cacheblend config: {exc}",
+                    success=False,
+                    kv_reuse_method=kv_reuse_method,
+                    requested_span_tokens=token_len,
+                )
         if recv_req.repair_position_ids is not None and (
             len(recv_req.repair_position_ids) != token_len
         ):
@@ -2536,6 +2575,8 @@ class Scheduler(
             "history_kv_kernel_size": recv_req.history_kv_kernel_size,
             "history_kv_pooling": recv_req.history_kv_pooling,
             "history_kv_h2o_recent_fraction": recv_req.history_kv_h2o_recent_fraction,
+            "kv_reuse_method": kv_reuse_method,
+            "cacheblend": cacheblend_cfg,
         }
         key_hash = hashlib.sha256(
             json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -2546,6 +2587,14 @@ class Scheduler(
                 error=f"Unsupported repair extract_source: {extract_source!r}.",
                 success=False,
                 extract_source=extract_source,
+            )
+        if extract_source == "serving_cache" and kv_reuse_method:
+            return C2KVRepairExtractReqOutput(
+                error="cacheblend needs the model_prefill extraction path.",
+                success=False,
+                extract_source=extract_source,
+                kv_reuse_method=kv_reuse_method,
+                requested_span_tokens=token_len,
             )
         if extract_source == "serving_cache" and raw_kv_position_mode == "pre_rope":
             return C2KVRepairExtractReqOutput(
@@ -2573,6 +2622,12 @@ class Scheduler(
                 requested_span_tokens=token_len,
                 selected_token_count=existing.token_len,
                 already_rotated=bool(existing.already_rotated),
+                kv_reuse_method=kv_reuse_method,
+                cacheblend=(
+                    {"cache_hit": True, "requested_span_tokens": token_len}
+                    if kv_reuse_method
+                    else None
+                ),
             )
 
         has_space = self.c2kv_pool.can_allocate(alloc_check_len, existing_key=key_hash)
@@ -2722,11 +2777,17 @@ class Scheduler(
                     history_kv_kernel_size=recv_req.history_kv_kernel_size,
                     history_kv_pooling=recv_req.history_kv_pooling,
                     history_kv_h2o_recent_fraction=recv_req.history_kv_h2o_recent_fraction,
+                    cacheblend=cacheblend_cfg,
                 )
                 if isinstance(repair_result, tuple) and len(repair_result) == 3:
                     key_values, position_ids, history_meta = repair_result
                 else:
                     key_values, position_ids = repair_result
+                if kv_reuse_method and isinstance(history_meta, dict):
+                    # the model returns the CacheBlend accounting in the meta
+                    # slot; it is not a history_kv selection
+                    cacheblend_meta = dict(history_meta)
+                    history_meta = {}
             except Exception as e:
                 logger.error("C2KV repair extract failed: %s", e, exc_info=True)
                 error_msg = str(e)
@@ -2757,6 +2818,7 @@ class Scheduler(
                 extract_source=extract_source,
                 cache_hit_tokens=cache_hit_tokens,
                 history_kv_method=history_kv_method or None,
+                kv_reuse_method=kv_reuse_method,
                 requested_span_tokens=token_len,
             )
 
@@ -2844,6 +2906,8 @@ class Scheduler(
                 and history_meta.get("selected_relative_indices") is not None
                 else None
             ),
+            kv_reuse_method=kv_reuse_method,
+            cacheblend=cacheblend_meta,
         )
 
     def _init_c2kv_kv_memory_report(self, req: "Req", hint) -> None:
@@ -3967,7 +4031,9 @@ class Scheduler(
     # history_kv_<method> entries produced by /v1/c2kv/repair_extract also
     # replace their history unit, so the legacy rule treats any "history_kv_"
     # prefix as in_place.
-    _C2KV_IN_PLACE_REPAIR_MODE_PREFIXES = ("history_kv_",)
+    # "cacheblend": the blended history span likewise stands in for the
+    # history unit it was extracted from (mem_cache/cacheblend.py).
+    _C2KV_IN_PLACE_REPAIR_MODE_PREFIXES = ("history_kv_", "cacheblend")
     _C2KV_REPAIR_PLACEMENTS = ("in_place", "append_keep_ledger", "append_tail")
 
     @staticmethod

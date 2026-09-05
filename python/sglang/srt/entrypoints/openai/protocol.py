@@ -1603,11 +1603,30 @@ class C2KVRepairExtractRequest(BaseModel):
     history_kv_kernel_size: int = 5
     history_kv_pooling: str = "avgpool"
     history_kv_h2o_recent_fraction: float = 0.5
+    # KV reuse with selective recompute (CacheBlend, arXiv 2405.16444):
+    # kv_reuse_method="cacheblend" stores the span as per-chunk standalone KV
+    # with the `cacheblend_recomp_ratio` highest-deviation tokens recomputed in
+    # context (mem_cache/cacheblend.py).  Exclusive with history_kv_method;
+    # requires raw_kv_position_mode "rotated" (the default of the input_ids
+    # form; the messages form switches to it automatically).  Chunks: one per
+    # message of messages[target_index..target_end_index] when
+    # `target_end_index` is given, else a `cacheblend_chunk_tokens` grid, else
+    # explicit `cacheblend_chunk_bounds` (relative to the span), else one chunk.
+    kv_reuse_method: Optional[str] = None
+    cacheblend_recomp_ratio: float = 0.16
+    cacheblend_check_layer: int = 1
+    cacheblend_metric: str = "v"
+    cacheblend_mask: str = "causal"
+    cacheblend_chunk_tokens: Optional[int] = None
+    cacheblend_chunk_bounds: Optional[List[List[int]]] = None
     # Full-context form: render `messages[:target_index+1]` (with `tools`) through
     # the chat template exactly like a chat request and capture the raw KV of
     # message `target_index` inside that context. Overrides text/input_ids/span.
     messages: Optional[List[Dict[str, Any]]] = None
     target_index: Optional[int] = None
+    # Inclusive end of a multi-message span (messages[target_index ..
+    # target_end_index]); each message becomes one CacheBlend chunk.
+    target_end_index: Optional[int] = None
     tools: Optional[List[Dict[str, Any]]] = None
 
 
@@ -1628,6 +1647,11 @@ class C2KVRepairExtractResponse(BaseModel):
     requested_span_tokens: int = 0
     selected_token_count: int = 0
     selected_relative_indices: Optional[List[int]] = None
+    # CacheBlend echo: the method actually applied and its accounting
+    # (chunk_count, chunk_bounds, recomputed_tokens,
+    # recomputed_relative_indices, effective_recomp_ratio, config).
+    kv_reuse_method: Optional[str] = None
+    cacheblend: Optional[Dict[str, Any]] = None
     # True when K was captured post-RoPE (serving_cache source, or the
     # "rotated" storage form) and can only be placed at its original
     # positions; False = pre-RoPE, re-rotatable (required by append_tail).

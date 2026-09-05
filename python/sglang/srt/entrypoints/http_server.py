@@ -1629,6 +1629,56 @@ def _render_c2kv_repair_span(tokenizer, messages, target_index, tools, chat_temp
     return full_ids, span_start, span_end, span_start
 
 
+def _render_c2kv_repair_span_range(
+    tokenizer, messages, target_index, target_end_index, tools, chat_template_kwargs
+):
+    """Multi-message span: messages[target_index .. target_end_index] inside the
+    rendering of messages[:target_end_index+1], with the token boundary of
+    every message in the range (one CacheBlend chunk each).
+
+    Returns (input_ids, span_start, span_end, rendered_prefix_len, chunk_bounds)
+    where chunk_bounds are RELATIVE to span_start.  Each boundary is the
+    length of the prefix rendering messages[:i+1], checked prefix-stable
+    against the next one exactly as _render_c2kv_repair_span does.
+    """
+    if target_end_index is None:
+        raise ValueError("target_end_index is required for a multi-message span")
+    messages = [dict(m) for m in messages]
+    if not (0 <= target_index <= target_end_index < len(messages)):
+        raise ValueError(
+            f"target range [{target_index}, {target_end_index}] out of range for "
+            f"{len(messages)} messages"
+        )
+    _, span_start, first_end, rendered_prefix_len = _render_c2kv_repair_span(
+        tokenizer, messages, target_index, tools, chat_template_kwargs
+    )
+    ends = [first_end]
+    prev_ids = _c2kv_template_ids(
+        tokenizer, messages[: target_index + 1], tools, chat_template_kwargs
+    )
+    for index in range(target_index + 1, target_end_index + 1):
+        ids = _c2kv_template_ids(
+            tokenizer, messages[: index + 1], tools, chat_template_kwargs
+        )
+        if ids[: len(prev_ids)] != prev_ids:
+            raise ValueError(
+                "chat template rendering is not prefix-stable at message "
+                f"{index}; refusing to build a multi-message repair span"
+            )
+        if len(ids) <= len(prev_ids):
+            raise ValueError(f"message {index} contributes no tokens")
+        ends.append(len(ids))
+        prev_ids = ids
+    full_ids = prev_ids
+    span_end = ends[-1]
+    bounds = []
+    cursor = span_start
+    for end in ends:
+        bounds.append([cursor - span_start, end - span_start])
+        cursor = end
+    return full_ids, span_start, span_end, rendered_prefix_len, bounds
+
+
 @app.post("/v1/c2kv/repair_extract")
 async def v1_c2kv_repair_extract(
     request: C2KVRepairExtractRequest, raw_request: Request
@@ -1644,7 +1694,42 @@ async def v1_c2kv_repair_extract(
         position_offset = request.position_offset
         raw_kv_position_mode = request.raw_kv_position_mode
         rendered_prefix_len = 0
-        if request.messages is not None:
+        kv_reuse_method = (request.kv_reuse_method or "").strip().lower() or None
+        cacheblend_cfg = None
+        if kv_reuse_method:
+            if kv_reuse_method != "cacheblend":
+                return C2KVRepairExtractResponse(
+                    key_hash="",
+                    success=False,
+                    error=f"Unsupported kv_reuse_method: {kv_reuse_method!r}.",
+                )
+            cacheblend_cfg = {
+                "recomp_ratio": request.cacheblend_recomp_ratio,
+                "check_layer": request.cacheblend_check_layer,
+                "metric": request.cacheblend_metric,
+                "mask": request.cacheblend_mask,
+                "chunk_tokens": request.cacheblend_chunk_tokens,
+                "chunk_bounds": request.cacheblend_chunk_bounds,
+            }
+        if request.messages is not None and request.target_end_index is not None:
+            # Multi-message span (CacheBlend chunks = messages): rendered like
+            # the single-message form, with per-message token boundaries.
+            input_ids, span_start, span_end, rendered_prefix_len, chunk_bounds = (
+                _render_c2kv_repair_span_range(
+                    tokenizer,
+                    request.messages,
+                    request.target_index,
+                    request.target_end_index,
+                    request.tools,
+                    chat_template_kwargs,
+                )
+            )
+            position_offset = 0
+            if cacheblend_cfg is not None and not cacheblend_cfg.get("chunk_bounds"):
+                cacheblend_cfg["chunk_bounds"] = chunk_bounds
+            # a multi-message span is only ever re-placed at its own positions
+            raw_kv_position_mode = "rotated"
+        elif request.messages is not None:
             # Full-context form: the raw KV of messages[target_index] inside the
             # chat-template rendering of messages[:target_index+1] (with tools),
             # i.e. what the base model computes for that message in the exact
@@ -1674,7 +1759,8 @@ async def v1_c2kv_repair_extract(
             if fields_set is None:
                 fields_set = getattr(request, "__fields_set__", None) or ()
             if "raw_kv_position_mode" not in fields_set:
-                raw_kv_position_mode = "pre_rope"
+                # CacheBlend entries are post-RoPE at their native positions
+                raw_kv_position_mode = "rotated" if cacheblend_cfg else "pre_rope"
         elif request.input_ids is not None:
             input_ids = list(request.input_ids)
         elif request.role:
@@ -1723,6 +1809,8 @@ async def v1_c2kv_repair_extract(
             history_kv_kernel_size=request.history_kv_kernel_size,
             history_kv_pooling=request.history_kv_pooling,
             history_kv_h2o_recent_fraction=request.history_kv_h2o_recent_fraction,
+            kv_reuse_method=kv_reuse_method,
+            cacheblend=cacheblend_cfg,
         )
         return C2KVRepairExtractResponse(
             key_hash=result.key_hash,
@@ -1742,6 +1830,8 @@ async def v1_c2kv_repair_extract(
             requested_span_tokens=result.requested_span_tokens,
             selected_token_count=result.selected_token_count,
             selected_relative_indices=result.selected_relative_indices,
+            kv_reuse_method=getattr(result, "kv_reuse_method", None),
+            cacheblend=getattr(result, "cacheblend", None),
             already_rotated=bool(getattr(result, "already_rotated", False)),
             span_start=int(span_start),
             span_end=int(span_end),

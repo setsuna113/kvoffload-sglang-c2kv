@@ -2761,6 +2761,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         history_kv_kernel_size: int = 5,
         history_kv_pooling: str = "avgpool",
         history_kv_h2o_recent_fraction: float = 0.5,
+        cacheblend: Optional[dict] = None,
     ):
         """Capture ordinary full-prefill KV for a repair span."""
         if not hasattr(self.model, "generate_raw_repair_kv"):
@@ -2781,6 +2782,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             history_kv_kernel_size=history_kv_kernel_size,
             history_kv_pooling=history_kv_pooling,
             history_kv_h2o_recent_fraction=history_kv_h2o_recent_fraction,
+            cacheblend=cacheblend,
         )
 
     def get_c2kv_compression_ratio(self, requested_ratio: int) -> int:

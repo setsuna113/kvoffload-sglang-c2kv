@@ -2114,6 +2114,11 @@ class TokenizedRepairExtractReqInput(BaseReq):
     history_kv_kernel_size: int = 5
     history_kv_pooling: str = "avgpool"
     history_kv_h2o_recent_fraction: float = 0.5
+    # KV reuse with selective recompute (CacheBlend); exclusive with
+    # history_kv_method.  `cacheblend` carries recomp_ratio / check_layer /
+    # metric / mask / chunk_tokens / chunk_bounds (mem_cache/cacheblend.py).
+    kv_reuse_method: Optional[str] = None
+    cacheblend: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -2133,6 +2138,11 @@ class C2KVRepairExtractReqOutput(BaseReq):
     requested_span_tokens: int = 0
     selected_token_count: int = 0
     selected_relative_indices: Optional[List[int]] = None
+    # CacheBlend accounting (kv_reuse_method == "cacheblend"): chunk_count,
+    # chunk_bounds, recomputed_tokens, recomputed_relative_indices,
+    # effective_recomp_ratio, deviation stats, config echo.
+    kv_reuse_method: Optional[str] = None
+    cacheblend: Optional[Dict[str, Any]] = None
     # Rotation state of the STORED entry: True = K is post-RoPE at its native
     # absolute positions (can only be re-placed there); False = pre-RoPE and
     # therefore eligible for the append_tail placement.

@@ -41,6 +41,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.mem_cache.cacheblend import CacheBlendConfig
+from sglang.srt.mem_cache.cacheblend import blend as cacheblend_blend
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
@@ -1376,6 +1378,7 @@ class Qwen3ForCausalLM(nn.Module):
         history_kv_kernel_size: int = 5,
         history_kv_pooling: str = "avgpool",
         history_kv_h2o_recent_fraction: float = 0.5,
+        cacheblend: Optional[Dict[str, Any]] = None,
     ):
         """Run a correctness-first full prefill and capture raw repair KV.
 
@@ -1399,6 +1402,20 @@ class Qwen3ForCausalLM(nn.Module):
         ``repair_position_ids`` records the positions to store with the entry.
         See c2kv/c2kv_serving_semantics.md.
         """
+
+        if cacheblend:
+            # CacheBlend (chunk-KV reuse + selective recompute) shares this
+            # entry point so every caller/route is the same; the algorithm
+            # lives in mem_cache/cacheblend.py (see its module docstring).
+            return self.generate_cacheblend_kv(
+                input_ids,
+                span_start=span_start,
+                span_end=span_end,
+                position_offset=position_offset,
+                raw_kv_position_mode=raw_kv_position_mode,
+                history_kv_method=history_kv_method,
+                cacheblend=cacheblend,
+            )
 
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError(
@@ -1791,6 +1808,73 @@ class Qwen3ForCausalLM(nn.Module):
             return raw_key_values, repair_positions, history_meta
         return raw_key_values, repair_positions
 
+
+    @torch.no_grad()
+    def generate_cacheblend_kv(
+        self,
+        input_ids: torch.Tensor,
+        span_start: int,
+        span_end: int,
+        *,
+        position_offset: int = 0,
+        raw_kv_position_mode: str = "rotated",
+        history_kv_method: Optional[str] = None,
+        cacheblend: Optional[Dict[str, Any]] = None,
+    ):
+        """CacheBlend repair extraction: the span's KV = per-chunk standalone KV
+        with the highest-deviation ``recomp_ratio`` of its tokens recomputed
+        in context (mem_cache/cacheblend.py, EuroSys artifact semantics).
+
+        Same contract as ``generate_raw_repair_kv``: ``(raw_key_values,
+        repair_positions, meta)`` with K post-RoPE at the span's absolute
+        positions (``rotated``), base projections only (paper 2607.17715
+        section 3.3.2 original-token invariance holds for the recomputed rows;
+        the reused rows are the base model's out-of-context KV by design).
+        The entry can only be placed ``in_place`` at those positions.
+        """
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError(
+                f"generate_cacheblend_kv expects input_ids shape (1, L), got {input_ids.shape}."
+            )
+        seq_len = int(input_ids.shape[1])
+        if not (0 <= span_start < span_end <= seq_len):
+            raise ValueError(
+                f"Invalid cacheblend span: {span_start=}, {span_end=}, {seq_len=}."
+            )
+        if raw_kv_position_mode != "rotated":
+            raise ValueError(
+                "cacheblend entries are post-RoPE at their native positions; "
+                f"raw_kv_position_mode must be 'rotated', got {raw_kv_position_mode!r}."
+            )
+        if history_kv_method:
+            raise ValueError(
+                "cacheblend is exclusive with history_kv_method "
+                f"(got {history_kv_method!r})."
+            )
+        config = CacheBlendConfig.from_request(cacheblend)
+        device = input_ids.device
+        positions = torch.arange(
+            position_offset,
+            position_offset + seq_len,
+            dtype=torch.long,
+            device=device,
+        )
+        ops = _Qwen3CacheBlendOps(self)
+        out_kv, meta = cacheblend_blend(
+            ops, input_ids.view(-1), positions, span_start, span_end, config
+        )
+        span_len = span_end - span_start
+        raw_key_values = [
+            (
+                k.reshape(span_len, -1).contiguous(),
+                v.reshape(span_len, -1).contiguous(),
+            )
+            for k, v in out_kv
+        ]
+        repair_positions = positions[span_start:span_end].view(1, -1).contiguous()
+        meta["position_offset"] = int(position_offset)
+        return raw_key_values, repair_positions, meta
+
     @torch.no_grad()
     def generate_pic(self, input_ids, attention_mask, ratio=1, **kwargs):
         """Extract full-length residual-QKV PIC states for one document."""
@@ -1931,3 +2015,134 @@ class Qwen3ForCausalLM(nn.Module):
 
 
 EntryClass = Qwen3ForCausalLM
+
+
+class _Qwen3CacheBlendOps:
+    """``cacheblend.LayerOps`` over this model's BASE projections.
+
+    The primitives are the repair-extract ones of ``generate_raw_repair_kv``
+    (qkv_proj -> qk_norm -> rope, explicit causal attention, o_proj +
+    all-reduce + residual + MLP), so a CacheBlend row is computed with exactly
+    the arithmetic every other repair entry is; only the token set differs.
+    Never touches ``gist_qkv_proj`` (original-token invariance).
+    """
+
+    def __init__(self, model: "Qwen3ForCausalLM"):
+        self.model = model
+        self.layers = model.model.layers
+        self.num_layers = len(self.layers)
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.model.embed_tokens(input_ids.view(1, -1)).squeeze(0)
+
+    def input_norm(self, layer_index: int, hidden_rows: torch.Tensor) -> torch.Tensor:
+        return self.layers[layer_index].input_layernorm(hidden_rows)
+
+    def qkv(self, layer_index: int, attn_input: torch.Tensor):
+        attn = self.layers[layer_index].self_attn
+        qkv, _ = attn.qkv_proj(attn_input)
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=attn.q_norm,
+            k_norm=attn.k_norm,
+            head_dim=attn.head_dim,
+            alt_stream=attn.alt_stream,
+        )
+        n = int(attn_input.shape[0])
+        return (
+            q.reshape(n, attn.num_heads, attn.head_dim),
+            k.reshape(n, attn.num_kv_heads, attn.head_dim),
+            v.reshape(n, attn.num_kv_heads, attn.head_dim),
+        )
+
+    def rope(self, layer_index: int, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor):
+        attn = self.layers[layer_index].self_attn
+        n = int(q.shape[0])
+        q_flat, k_flat = attn.rotary_emb(
+            positions, q.reshape(n, -1).contiguous(), k.reshape(n, -1).contiguous()
+        )
+        return (
+            q_flat.reshape(n, attn.num_heads, attn.head_dim),
+            k_flat.reshape(n, attn.num_kv_heads, attn.head_dim),
+        )
+
+    def attention(
+        self,
+        layer_index: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        blocked: torch.Tensor,
+    ) -> torch.Tensor:
+        attn = self.layers[layer_index].self_attn
+        num_q = int(q.shape[0])
+        num_k = int(k.shape[0])
+        q_b = q.reshape(1, num_q, attn.num_heads, attn.head_dim).transpose(1, 2).contiguous()
+        k_b = k.reshape(1, num_k, attn.num_kv_heads, attn.head_dim).transpose(1, 2).contiguous()
+        v_b = v.reshape(1, num_k, attn.num_kv_heads, attn.head_dim).transpose(1, 2).contiguous()
+        mask = blocked.reshape(1, 1, num_q, num_k)
+        if _is_npu:
+            # same ops and the same env switch as generate_raw_repair_kv
+            if os.environ.get(
+                "C2KV_REPAIR_EXTRACT_ATTN_IMPL",
+                "prompt_flash",
+            ) == "prompt_flash" and hasattr(torch_npu, "npu_prompt_flash_attention"):
+                attn_output = torch_npu.npu_prompt_flash_attention(
+                    q_b,
+                    k_b,
+                    v_b,
+                    num_heads=q_b.shape[1],
+                    num_key_value_heads=k_b.shape[1],
+                    input_layout="BNSD",
+                    atten_mask=mask,
+                    scale_value=attn.scaling,
+                    sparse_mode=0,
+                )
+            else:
+                attn_output = torch_npu.npu_fusion_attention(
+                    q_b,
+                    k_b,
+                    v_b,
+                    q_b.shape[1],
+                    input_layout="BNSD",
+                    atten_mask=mask,
+                    scale=attn.scaling,
+                    keep_prob=1.0,
+                    sparse_mode=0,
+                )
+            attn_output = _npu_fusion_attention_output(attn_output, q_b.shape)
+        else:
+            if attn.num_heads != attn.num_kv_heads:
+                groups = attn.num_heads // attn.num_kv_heads
+                k_run = k_b.repeat_interleave(groups, dim=1)
+                v_run = v_b.repeat_interleave(groups, dim=1)
+            else:
+                k_run, v_run = k_b, v_b
+            scores = torch.matmul(q_b.float(), k_run.transpose(-2, -1).float()) * attn.scaling
+            scores = scores.masked_fill(mask, float("-inf"))
+            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(v_run.dtype)
+            attn_output = torch.matmul(probs, v_run)
+        return (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .reshape(num_q, attn.num_heads * attn.head_dim)
+        )
+
+    def post_attention(
+        self, layer_index: int, attn_output: torch.Tensor, residual_rows: torch.Tensor
+    ) -> torch.Tensor:
+        layer = self.layers[layer_index]
+        projected, _ = layer.self_attn.o_proj(attn_output)
+        projected = tensor_model_parallel_all_reduce(projected)
+        hidden = residual_rows + projected
+        mlp_input = layer.post_attention_layernorm(hidden)
+        return hidden + layer.mlp(mlp_input)
+
+    def all_reduce_sum(self, value: torch.Tensor) -> torch.Tensor:
+        # the deviation must be summed over ALL kv heads (artifact), which
+        # under tensor parallelism are sharded across ranks
+        if get_tensor_model_parallel_world_size() > 1:
+            return tensor_model_parallel_all_reduce(value)
+        return value

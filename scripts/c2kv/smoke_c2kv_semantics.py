@@ -332,6 +332,51 @@ def main() -> int:
         )
         print(f"  bogus placement: status={status} {surfaces} {blob[:300]!r}")
 
+    # 6. CacheBlend (c2kv_serving_semantics.md section 10): the history docs
+    # as ONE multi-message span, one chunk per doc, 16 % recomputed; then a
+    # chat request carrying the entry in place of the docs.
+    cb_plain = [{"role": "system", "content": SYSTEM}] + [
+        {"role": "user", "content": doc} for doc in HISTORY_DOCS]
+    cb = post(args.base_url, "/v1/c2kv/repair_extract", {
+        "messages": cb_plain, "target_index": 1,
+        "target_end_index": len(HISTORY_DOCS), "tools": TOOLS,
+        "chat_template_kwargs": kw, "repair_mode": "cacheblend",
+        "source_doc_index": 0, "kv_reuse_method": "cacheblend",
+        "cacheblend_recomp_ratio": 0.16,
+    })
+    ok &= check(cb.get("success"), f"cacheblend extract success token_len={cb.get('token_len')} span=[{cb.get('span_start')},{cb.get('span_end')}) prefix={cb.get('rendered_prefix_len')} err={cb.get('error')!r}")
+    if cb.get("success"):
+        acct = cb.get("cacheblend") or {}
+        span_len = int(cb["span_end"]) - int(cb["span_start"])
+        ok &= check(cb.get("kv_reuse_method") == "cacheblend",
+                    "server echoes kv_reuse_method=cacheblend")
+        ok &= check(int(cb.get("token_len") or 0) == span_len,
+                    "cacheblend entry keeps the WHOLE span (compute saving, not memory)")
+        ok &= check(int(acct.get("chunk_count") or 0) == len(HISTORY_DOCS),
+                    f"one chunk per history doc ({acct.get('chunk_count')} == {len(HISTORY_DOCS)})")
+        ok &= check(int(acct.get("recomputed_tokens") or 0) == max(1, int(span_len * 0.16)),
+                    f"recomputed_tokens {acct.get('recomputed_tokens')} == int(span*0.16)")
+        ok &= check(bool(cb.get("already_rotated")), "cacheblend entry stored post-RoPE (rotated)")
+        ok &= check(int(cb["position_start"]) == int(cb["rendered_prefix_len"]),
+                    "cacheblend position_start == rendered_prefix_len")
+        cb_msgs = [{"role": "system", "content": SYSTEM},
+                   {"role": "user", "content": "[cacheblend history kv]",
+                    "c2kv_repair_only_key_hashes": [cb["key_hash"]],
+                    "c2kv_repair_placement": "in_place"},
+                   {"role": "user", "content": CURRENT}]
+        resp = post(args.base_url, "/v1/chat/completions", {**chat, "messages": cb_msgs})
+        rt = (resp.get("metadata") or {}).get("sglang_runtime") or {}
+        reps = [e for e in (rt.get("c2kv_layout") or []) if e.get("kind") == "repair"]
+        ok &= check(len(reps) == 1 and reps[0].get("placement") == "in_place",
+                    "cacheblend: entry injected in_place")
+        if reps:
+            ok &= check(int(reps[0]["position_start"]) == int(cb["position_start"]),
+                        "cacheblend: keeps its absolute position")
+        ok &= check("c2kv_injection_error" not in rt, "cacheblend: no c2kv_injection_error")
+        text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content")
+        print(f"  cacheblend: recomputed={acct.get('recomputed_tokens')}/{span_len} "
+              f"dev_max={acct.get('deviation_max')} {str(text)[:120]!r}")
+
     print("ALL PASS" if ok else "SOME CHECKS FAILED")
     return 0 if ok else 1
 

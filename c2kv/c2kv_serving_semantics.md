@@ -1099,3 +1099,92 @@ Before quoting any number produced by this build, on the NPU box:
 The open items in section 8 are the ones already known to be wrong or fragile;
 they are read off the code too, and none of them has been reproduced on a
 server either.
+
+---
+
+## 10. CacheBlend as a repair extraction mode (2026-09-05, `task/c2kv-cacheblend`)
+
+CacheBlend (Yao et al., EuroSys 2025, arXiv 2405.16444) is served as a KV
+REUSE baseline through `/v1/c2kv/repair_extract`, the same route and storage
+the history-KV eviction baselines (section 7) use: the history span becomes
+ONE repair entry, placed `in_place` at its absolute positions by a repair-only
+carrier message, and the query attends to it.  Nothing is gisted.  The
+mechanism is the real one -- chunk KV computed out of context, the
+highest-deviation tokens recomputed in context, everything else reused -- not
+the "oracle" variant the bench design doc of 2026-09-03 proposed (a full
+dense prefill keeping 16 % of it), which must not be labelled CacheBlend.
+
+**Where.** `mem_cache/cacheblend.py` is the model-agnostic engine (module
+docstring = the algorithm, step by step, with the artifact line references);
+`models/qwen3.py` `generate_cacheblend_kv` + `_Qwen3CacheBlendOps` bind it to
+the base projections and the repair-extract attention primitives
+(`qkv_proj -> apply_qk_norm -> rotary_emb`, explicit causal attention on CUDA,
+`npu_prompt_flash_attention` / `npu_fusion_attention` on Ascend, `o_proj` +
+all-reduce + MLP), so a CacheBlend row is computed with exactly the arithmetic
+every other repair entry is.  `generate_raw_repair_kv(..., cacheblend=...)`
+delegates to it, so every route (`model_runner.forward_c2kv_repair_extract`,
+`scheduler.handle_repair_extract_request`, `tokenizer_communicator_mixin`,
+`http_server.v1_c2kv_repair_extract`) is the existing one plus two fields.
+
+**Wire (request).** `kv_reuse_method: "cacheblend"` plus
+`cacheblend_recomp_ratio` (0.16, artifact `recomp_ratio`),
+`cacheblend_check_layer` (1, artifact `check_layers=[1]`),
+`cacheblend_metric` (`v` = artifact V-deviation; `k` = the LMCache-lineage
+K-deviation), `cacheblend_mask` (`causal` = exact causality for the scattered
+recompute queries; `bottom_right` = the artifact's
+`LowerTriangularFromBottomRightMask`, which admits later keys -- kept only to
+reproduce the artifact), chunking by `target_end_index` (messages form:
+every message of `messages[target_index..target_end_index]` is one chunk, the
+per-message token boundaries come from prefix-stable renderings, see
+`http_server._render_c2kv_repair_span_range`), else `cacheblend_chunk_tokens`
+(fixed grid), else `cacheblend_chunk_bounds` (explicit, relative to the
+span), else the whole span is one chunk.  Exclusive with `history_kv_method`
+and with `extract_source="serving_cache"`; `raw_kv_position_mode` is forced
+to `rotated` (the entry is post-RoPE at its native positions and can only be
+re-placed there -- `append_tail` is meaningless for it).  The cache key of the
+entry includes every one of these fields.
+
+**Wire (response / entry).** `kv_reuse_method` echoes `"cacheblend"` -- a
+client MUST check it, exactly as the history-KV client checks
+`history_kv_method`, or an ignored field silently yields a full raw-history
+entry wearing the baseline's name.  `cacheblend` carries the accounting:
+`chunk_count`, `chunk_bounds`, `requested_span_tokens`, `recomputed_tokens`
+(= `int(span_len * ratio)`, floored at 1 -- artifact `topk_num`),
+`recomputed_relative_indices`, `effective_recomp_ratio`,
+`fresh_outside_tokens` (prologue + suffix tokens, always recomputed),
+`deviation_mean` / `deviation_max` / `deviation_selected_min`, and the config
+echo.  `token_len` of the entry is the WHOLE span: CacheBlend saves compute,
+not KV memory, so `active_raw_repair_tokens` = span and the compute saving
+is `1 - effective_recomp_ratio` of the span at layers `> check_layer`
+(layers `0..check_layer` are computed for every token, as in the artifact).
+A cache hit on the same key echoes `{"cache_hit": true}` instead.
+
+**What is and is not the artifact's.**  Same: standalone per-chunk KV with K
+kept pre-RoPE and rotated at the concatenated positions at blend time; full
+compute of layers 0..1; V-deviation summed over (kv heads, head dim) at
+layer 1; top-`int(n*r)` selection once, reused for every later layer; layers
+2.. computed only for the selected rows with the span's KV = chunk cache
+overwritten at those rows.  Different, by construction of this server and
+recorded so a report can say so: (a) chunks are the bench's history docs
+(rendered chat messages) or a token grid, not the artifact's dataset
+passages; (b) the system/tool prologue is prefilled fresh in the same forward
+(the artifact caches it as chunk 0) and the suffix is the chat request's
+current turn served by the normal extend path over the entry, not a
+`last_len` tail inside one forward; (c) the chunk cache is materialised per
+request from the chunk tokens (identical values -- a deterministic function
+of the tokens -- so the entry is the same, but no wall-clock or TTFT number
+from this path is CacheBlend's); (d) the default mask is exactly causal,
+the artifact's bottom-right approximation is opt-in; (e) under tensor
+parallelism the deviation is all-reduced over ranks so the selection is the
+full-head one and identical on every rank.
+
+**Verified.** `test/registered/unit/test_c2kv_cacheblend.py` (synthetic
+3-layer GQA decoder, CPU): recomp_ratio 1.0 reproduces the dense prefill KV
+at every layer to 1e-5; recomp_ratio 0.0 returns the chunk cache rotated to
+the absolute positions at every layer past the check layer and the dense KV
+up to it; selection size / sortedness / prologue-and-suffix-always-fresh;
+mask semantics; chunk-bound and config validation.  NOT verified: any run of
+`generate_cacheblend_kv` on a checkpoint, on CUDA or NPU, or through the HTTP
+route -- the smoke script's step 6 (`scripts/c2kv/smoke_c2kv_semantics.py`)
+is the first thing to run on the NPU box, and until it has passed no number
+from this path exists.
