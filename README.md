@@ -12,6 +12,30 @@
 
 --------------------------------------------------------------------------------
 
+> **C2KV fork.** This tree serves C2KV gist checkpoints (`--enable-c2kv`).
+> Before changing or interpreting anything C2KV-related read
+> [`c2kv/c2kv_serving_semantics.md`](c2kv/c2kv_serving_semantics.md): it records where the
+> paper text, the training checkpoint and this server disagree (query-token projections,
+> position frames, repair placement) and which server flag / response field covers each.
+>
+> Two server flags change what the model is actually served, so record both next to every
+> run (both are echoed back per request in `metadata.sglang_runtime`):
+> `--c2kv-query-proj {base,gist}` (default `gist`, `python/sglang/srt/server_args.py:586`)
+> is the per-request default for the query projection, overridable per message; and
+> `--c2kv-tools-dump {full,exclude_unset}` (default `full`, `server_args.py:599`) decides how
+> tool schemas are serialized into the prompt -- `full` reproduces the upstream token frame,
+> `exclude_unset` the one the C2KV bench proxy predicts its insertion points in. Runs made
+> under different values of either flag were served different prompts and are not comparable.
+> `metadata.sglang_runtime` is attached to non-streaming responses only: serve C2KV runs with
+> `stream=false`.
+>
+> This tree is the 2026-09-05 reconciliation of upstream `d42ce815f` with
+> `fork/task/c2kv-serve-align`; nothing in it has been run against a model or a server yet
+> (section 9 of the semantics doc). Run `scripts/c2kv/smoke_c2kv_semantics.py` on the NPU box
+> before quoting any number produced by this build.
+> Design docs: `c2kv/c2kv_integration_plan.md`, `c2kv/c2kv_implementation_report.md`.
+
+
 <p align="center">
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |
 <a href="https://docs.sglang.io/"><b>Documentation</b></a> |

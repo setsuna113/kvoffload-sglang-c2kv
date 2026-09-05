@@ -984,8 +984,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 num_items_assigned=obj.num_items_assigned,
                 c2kv_segments=getattr(obj, "c2kv_segments", None),
                 c2kv_kv_memory_hint=getattr(obj, "c2kv_kv_memory_hint", None),
+                # D8: TRI-STATE, forwarded verbatim. None means "the request
+                # said nothing", and only the scheduler resolver may turn that
+                # into --c2kv-query-proj. A `False` fallback here would make
+                # every request that omits the field force the BASE projection
+                # and the server flag unreachable.
                 c2kv_use_gist_projection=getattr(
-                    obj, "c2kv_use_gist_projection", False
+                    obj, "c2kv_use_gist_projection", None
                 ),
             )
         elif isinstance(obj, EmbeddingReqInput):

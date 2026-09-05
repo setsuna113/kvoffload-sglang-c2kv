@@ -500,7 +500,13 @@ class ChatCompletionMessageGenericParam(BaseModel):
     c2kv_repair_key_hashes: Optional[List[str]] = None
     c2kv_repair_only_key_hashes: Optional[List[str]] = None
     c2kv_repair_token_start: Optional[int] = None
+    # Tri-state per-message query-projection override:
+    #   True  = force the gist projection, False = force the base projection,
+    #   None  = unset -> the --c2kv-query-proj server flag decides.
     c2kv_use_gist_projection: Optional[bool] = None
+    # "in_place" | "append_keep_ledger" | "append_tail"; None = legacy
+    # (derived from repair_mode). See c2kv/c2kv_serving_semantics.md.
+    c2kv_repair_placement: Optional[str] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -522,7 +528,13 @@ class ChatCompletionMessageUserParam(BaseModel):
     c2kv_repair_key_hashes: Optional[List[str]] = None
     c2kv_repair_only_key_hashes: Optional[List[str]] = None
     c2kv_repair_token_start: Optional[int] = None
+    # Tri-state per-message query-projection override:
+    #   True  = force the gist projection, False = force the base projection,
+    #   None  = unset -> the --c2kv-query-proj server flag decides.
     c2kv_use_gist_projection: Optional[bool] = None
+    # "in_place" | "append_keep_ledger" | "append_tail"; None = legacy
+    # (derived from repair_mode). See c2kv/c2kv_serving_semantics.md.
+    c2kv_repair_placement: Optional[str] = None
 
 
 ChatCompletionMessageParam = Union[
@@ -537,6 +549,36 @@ class Function(BaseModel):
     name: str
     parameters: Optional[object] = None
     strict: bool = False
+
+
+def chat_template_tools_dump(
+    tools, exclude_unset: bool = True
+) -> List[Dict[str, Any]]:
+    """Serialize `Tool` models for the chat template.
+
+    `exclude_unset=True` serializes them exactly as the client sent them, so the
+    tool prologue the server renders is token-identical to what a client that
+    tokenizes the same OpenAI tool JSON itself would get.
+
+    `exclude_unset=False` is plain `model_dump()`: it adds pydantic defaults
+    such as `"strict": false` (+4 tokens per tool with the Qwen3 template),
+    which shifts every C2KV insertion point and repair position by a constant
+    the client cannot see -- but it is what this server rendered before
+    2026-09-05, so silently dropping it would move the served prompt of every
+    already-collected trajectory and frozen reference.
+
+    The mode is therefore a server flag, `--c2kv-tools-dump`
+    (`ServerArgs.c2kv_tools_dump`, default "full" = `model_dump()`). Callers
+    must pass it explicitly so `/v1/chat/completions` and the `messages` form of
+    `/v1/c2kv/repair_extract` always render the same prologue. See
+    c2kv/c2kv_serving_semantics.md."""
+    out: List[Dict[str, Any]] = []
+    for item in tools or []:
+        if isinstance(item, BaseModel):
+            out.append(item.model_dump(exclude_unset=exclude_unset))
+        else:
+            out.append(dict(item))
+    return out
 
 
 class Tool(BaseModel):
@@ -1521,6 +1563,11 @@ class C2KVExtractRequest(BaseModel):
     compression_ratio: int = Field(default=4)
     role: Optional[str] = None
     chat_template_kwargs: Optional[Dict] = None
+    # optional tool schemas: rendered into the chat template exactly as the
+    # serving path renders them (Qwen templates put tools in the system
+    # block), so original_seq_len measures the TRUE system-block length —
+    # required for callers computing repair position offsets
+    tools: Optional[List[Dict]] = None
 
 
 class C2KVExtractResponse(BaseModel):
@@ -1548,6 +1595,7 @@ class C2KVRepairExtractRequest(BaseModel):
     repair_mode: str = "d_corr"
     source_doc_index: Optional[int] = None
     extract_source: str = "model_prefill"
+    # History-KV compression applied to the extracted span before it is stored.
     history_kv_method: Optional[str] = None
     history_kv_target_tokens: Optional[int] = None
     history_kv_retention_ratio: Optional[float] = None
@@ -1555,6 +1603,12 @@ class C2KVRepairExtractRequest(BaseModel):
     history_kv_kernel_size: int = 5
     history_kv_pooling: str = "avgpool"
     history_kv_h2o_recent_fraction: float = 0.5
+    # Full-context form: render `messages[:target_index+1]` (with `tools`) through
+    # the chat template exactly like a chat request and capture the raw KV of
+    # message `target_index` inside that context. Overrides text/input_ids/span.
+    messages: Optional[List[Dict[str, Any]]] = None
+    target_index: Optional[int] = None
+    tools: Optional[List[Dict[str, Any]]] = None
 
 
 class C2KVRepairExtractResponse(BaseModel):
@@ -1569,9 +1623,19 @@ class C2KVRepairExtractResponse(BaseModel):
     extract_source: str = ""
     cache_hit_tokens: int = 0
     serving_kv_buffer_shape: Optional[List[int]] = None
+    # History-KV compression actually applied, and its accounting.
     history_kv_method: Optional[str] = None
     requested_span_tokens: int = 0
     selected_token_count: int = 0
     selected_relative_indices: Optional[List[int]] = None
+    # True when K was captured post-RoPE (serving_cache source, or the
+    # "rotated" storage form) and can only be placed at its original
+    # positions; False = pre-RoPE, re-rotatable (required by append_tail).
+    already_rotated: bool = False
+    # Filled by the messages/target_index form: span inside the rendered prefix
+    # and the length of the rendered context before the target message.
+    span_start: int = 0
+    span_end: int = 0
+    rendered_prefix_len: int = 0
     success: bool = True
     error: Optional[str] = None

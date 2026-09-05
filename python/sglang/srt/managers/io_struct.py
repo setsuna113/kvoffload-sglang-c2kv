@@ -245,7 +245,9 @@ class GenerateReqInput(BaseReq):
     # C2KV: per-segment descriptors for gist injection
     c2kv_segments: Optional[List] = None  # List[C2KVSegmentInfo]
     c2kv_kv_memory_hint: Optional[Dict[str, Any]] = None
-    c2kv_use_gist_projection: bool = False
+    # Tri-state: True/False = explicit per-request override taken from a chat
+    # message field; None = unset -> ServerArgs.c2kv_query_proj decides.
+    c2kv_use_gist_projection: Optional[bool] = None
     min_dynamic_patch: Optional[int] = None
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
@@ -285,6 +287,7 @@ class GenerateReqInput(BaseReq):
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
+        self._validate_c2kv_not_batched()
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -359,6 +362,30 @@ class GenerateReqInput(BaseReq):
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+
+    def _validate_c2kv_not_batched(self):
+        """Reject C2KV fields on a request that will be split per item.
+
+        __getitem__ rebuilds each item field by field and copies none of
+        c2kv_segments / c2kv_kv_memory_hint / c2kv_use_gist_projection, so a
+        batched request reaches the scheduler with c2kv_segments=None: the
+        resolver and the round builder are both behind
+        `if getattr(recv_req, "c2kv_segments", None):` and the client gets a
+        normal 200 with no injection at all. That silent plain-prompt serving
+        is the failure this rejects; propagating the fields instead would be a
+        new behaviour neither parent branch had. Note this also covers
+        parallel sampling (n > 1), which _handle_parallel_sampling above turns
+        into a non-single request that goes through the same __getitem__ path.
+        See c2kv/c2kv_serving_semantics.md section 5.
+        """
+        if self.is_single:
+            return
+        if (
+            self.c2kv_segments is not None
+            or self.c2kv_kv_memory_hint is not None
+            or self.c2kv_use_gist_projection is not None
+        ):
+            raise ValueError("C2KV fields are not supported on batched requests")
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -759,7 +786,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # C2KV: per-segment descriptors for gist injection
     c2kv_segments: Optional[List] = None  # List[C2KVSegmentInfo]
     c2kv_kv_memory_hint: Optional[Dict[str, Any]] = None
-    c2kv_use_gist_projection: bool = False
+    # Tri-state: True/False = explicit per-request override taken from a chat
+    # message field; None = unset -> ServerArgs.c2kv_query_proj decides.
+    c2kv_use_gist_projection: Optional[bool] = None
 
 
 @dataclass
@@ -2025,13 +2054,22 @@ class C2KVSegmentInfo:
         token_start: int = 0,
         token_end: int = 0,
         repair_key_hashes: Optional[List[str]] = None,
-        use_gist_projection: bool = False,
+        use_gist_projection: Optional[bool] = None,
+        repair_placement: Optional[str] = None,
     ):
         self.key_hash = key_hash
         self.token_start = token_start
         self.token_end = token_end
         self.repair_key_hashes = repair_key_hashes or []
+        # Tri-state gist-projection control for this segment:
+        #   True  = force the gist projection for this request,
+        #   False = force the base projection,
+        #   None  = unset -> ServerArgs.c2kv_query_proj decides.
         self.use_gist_projection = use_gist_projection
+        # One of "in_place" / "append_keep_ledger" / "append_tail" or None
+        # (None = derive from the entry's repair_mode, legacy behaviour).
+        # See c2kv/c2kv_serving_semantics.md, "Repair placement".
+        self.repair_placement = repair_placement
 
 
 @dataclass
@@ -2095,6 +2133,10 @@ class C2KVRepairExtractReqOutput(BaseReq):
     requested_span_tokens: int = 0
     selected_token_count: int = 0
     selected_relative_indices: Optional[List[int]] = None
+    # Rotation state of the STORED entry: True = K is post-RoPE at its native
+    # absolute positions (can only be re-placed there); False = pre-RoPE and
+    # therefore eligible for the append_tail placement.
+    already_rotated: bool = False
     error: str = ""
     success: bool = True
 
