@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sys
 import urllib.error
@@ -213,6 +214,33 @@ def main() -> int:
         and base_override_rt.get("c2kv_query_proj_decode_verified") is True,
         "request-level base override remains graph eligible and decode verified",
     )
+
+    # Different request policies may share a scheduler batch. Both must keep
+    # their own routing through prefill and decode.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(post, args.base_url, "/v1/chat/completions",
+                                   {**chat, "c2kv_use_gist_projection": mode})
+                   for mode in (False, True)]
+        for mode, future in zip(("base", "gist"), futures):
+            mixed_response = future.result()
+            mixed_rt = ((mixed_response.get("metadata") or {}).get("sglang_runtime") or {})
+            finish = (mixed_response.get("choices") or [{}])[0].get("finish_reason")
+            ok &= check(finish in ("stop", "length", "tool_calls")
+                        and mixed_rt.get("c2kv_query_proj_effective") == mode
+                        and mixed_rt.get("c2kv_query_proj_source") == "request"
+                        and mixed_rt.get("c2kv_query_proj_decode_verified") is True,
+                        f"concurrent {mode} override completes with its own verified policy")
+
+    conflicting = [dict(message) for message in messages]
+    conflicting[1]["c2kv_use_gist_projection"] = False
+    conflicting[2]["c2kv_use_gist_projection"] = True
+    conflict_status, conflict_body = post_allow_error(
+        args.base_url, "/v1/chat/completions", {**chat, "messages": conflicting})
+    conflict_finish = ((conflict_body.get("choices") or [{}])[0].get("finish_reason")
+                       if isinstance(conflict_body, dict) else None)
+    ok &= check((conflict_status != 200 or conflict_finish == "abort")
+                and "C2KV_QUERY_PROJECTION_CONFLICT" in json.dumps(conflict_body),
+                "conflicting message projection policies are explicitly rejected")
 
     # 2b. the "full" arm: no C2KV annotation at all. The projection keys are
     # still there, the request never reached the resolver, and the ledger keys
