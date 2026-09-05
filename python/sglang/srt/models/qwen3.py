@@ -2068,6 +2068,18 @@ class _Qwen3CacheBlendOps:
             k_flat.reshape(n, attn.num_kv_heads, attn.head_dim),
         )
 
+    def rotate_k(
+        self, layer_index: int, positions: torch.Tensor, k: torch.Tensor
+    ) -> torch.Tensor:
+        attn = self.layers[layer_index].self_attn
+        n = int(k.shape[0])
+        # Qwen3's rotary adapter reshapes Q with num_heads and K with
+        # num_kv_heads. GQA therefore needs a throwaway Q with query-head shape,
+        # rather than zeros_like(K).
+        fake_q = k.new_zeros((n, attn.num_heads, attn.head_dim))
+        _, k_rot = self.rope(layer_index, positions, fake_q, k)
+        return k_rot
+
     def attention(
         self,
         layer_index: int,

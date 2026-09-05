@@ -95,7 +95,13 @@ class TinyDecoder:
         )
 
     def rope(self, li, positions, q, k):
+        assert q.shape[1:] == (self.num_heads, self.head_dim)
+        assert k.shape[1:] == (self.num_kv_heads, self.head_dim)
         return _apply_rope(q, positions, self.cos, self.sin), _apply_rope(k, positions, self.cos, self.sin)
+
+    def rotate_k(self, li, positions, k):
+        fake_q = k.new_zeros((k.shape[0], self.num_heads, self.head_dim))
+        return self.rope(li, positions, fake_q, k)[1]
 
     def attention(self, li, q, k, v, blocked):
         self.attention_calls.append((li, int(q.shape[0]), int(k.shape[0])))
@@ -209,6 +215,16 @@ def test_config_from_request_validation():
 
 
 # ------------------------------------------------------------------ engine
+
+def test_k_only_rotation_respects_gqa_head_counts():
+    model = TinyDecoder(num_heads=4, num_kv_heads=2)
+    positions = torch.tensor([3, 7, 11])
+    k_pre = torch.randn(3, model.num_kv_heads, model.head_dim)
+
+    actual = cb._rotate_k_only(model, 0, positions, k_pre)
+    expected = _apply_rope(k_pre, positions, model.cos, model.sin)
+    torch.testing.assert_close(actual, expected)
+
 
 def test_full_budget_reproduces_dense_prefill():
     model = TinyDecoder()

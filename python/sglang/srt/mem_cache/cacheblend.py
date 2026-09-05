@@ -246,6 +246,12 @@ class LayerOps(Protocol):
         """Rotate (q, k) at ``positions``; the engine passes clones."""
         ...
 
+    def rotate_k(
+        self, layer_index: int, positions: torch.Tensor, k: torch.Tensor
+    ) -> torch.Tensor:
+        """Rotate K without assuming that query and KV head counts match."""
+        ...
+
     def attention(
         self,
         layer_index: int,
@@ -271,15 +277,8 @@ class LayerOps(Protocol):
 def _rotate_k_only(
     ops: LayerOps, layer_index: int, positions: torch.Tensor, k_pre: torch.Tensor
 ) -> torch.Tensor:
-    """Rotate a pre-RoPE K at ``positions`` through the model's rotary
-    (artifact: ``rotary_emb(org_pos, fake_q, old_k)`` with a throwaway q)."""
-    fake_q = torch.zeros(
-        (k_pre.shape[0], k_pre.shape[1], k_pre.shape[2]),
-        dtype=k_pre.dtype,
-        device=k_pre.device,
-    )
-    _, k_rot = ops.rope(layer_index, positions, fake_q, k_pre.clone())
-    return k_rot
+    """Rotate pre-RoPE K through the model-owned GQA-aware adapter."""
+    return ops.rotate_k(layer_index, positions, k_pre.clone())
 
 
 @torch.no_grad()
