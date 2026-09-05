@@ -138,12 +138,14 @@ def main() -> int:
     runtime = (resp.get("metadata") or {}).get("sglang_runtime") or {}
     print("sglang_runtime:", json.dumps(runtime, indent=1)[:2000])
     ok &= check("c2kv_query_proj" in runtime, "response echoes c2kv_query_proj")
-    # D6 provenance is three keys plus the tool-dump frame; all four must be
+    # Projection provenance, graph eligibility, and the tool-dump frame must be
     # present on every request of a C2KV-enabled server.
     for key in (
         "c2kv_query_proj",
         "c2kv_query_proj_effective",
         "c2kv_query_proj_source",
+        "c2kv_query_proj_decode_verified",
+        "c2kv_query_proj_graph_eligible",
         "c2kv_tools_dump",
     ):
         ok &= check(key in runtime, f"compressed request reports {key}")
@@ -166,6 +168,15 @@ def main() -> int:
         "request",
     )
     ok &= check(
+        runtime.get("c2kv_query_proj_graph_eligible")
+        == (runtime.get("c2kv_query_proj_effective") != "gist"),
+        "graph eligibility matches the effective projection mode",
+    )
+    ok &= check(
+        runtime.get("c2kv_query_proj_decode_verified") is True,
+        "decode projection is verified (gist batches fall back to eager)",
+    )
+    ok &= check(
         isinstance(runtime.get("c2kv_layout"), list),
         f"c2kv_layout is a list (got {type(runtime.get('c2kv_layout')).__name__})",
     )
@@ -181,6 +192,28 @@ def main() -> int:
                         "position_cursor advances by original_seq_len (frame consistent)")
     ok &= check(bool(runtime.get("c2kv_gist_seen")), "c2kv_gist_seen is True after gist injection")
 
+    # 2a. Request-level schema override. This field used to be passed through
+    # serving_chat via getattr but was absent from ChatCompletionRequest, so
+    # pydantic silently discarded it and this branch was unreachable.
+    base_override = post(
+        args.base_url,
+        "/v1/chat/completions",
+        {**chat, "c2kv_use_gist_projection": False},
+    )
+    base_override_rt = (
+        (base_override.get("metadata") or {}).get("sglang_runtime") or {}
+    )
+    ok &= check(
+        base_override_rt.get("c2kv_query_proj_effective") == "base"
+        and base_override_rt.get("c2kv_query_proj_source") == "request",
+        "request-level projection override resolves to base with request provenance",
+    )
+    ok &= check(
+        base_override_rt.get("c2kv_query_proj_graph_eligible") is True
+        and base_override_rt.get("c2kv_query_proj_decode_verified") is True,
+        "request-level base override remains graph eligible and decode verified",
+    )
+
     # 2b. the "full" arm: no C2KV annotation at all. The projection keys are
     # still there, the request never reached the resolver, and the ledger keys
     # are present-and-empty rather than absent (an absent key is ambiguous --
@@ -195,6 +228,7 @@ def main() -> int:
         "c2kv_query_proj_effective",
         "c2kv_query_proj_source",
         "c2kv_query_proj_decode_verified",
+        "c2kv_query_proj_graph_eligible",
         "c2kv_tools_dump",
     ):
         ok &= check(key in full_rt, f"full-arm request reports {key}")

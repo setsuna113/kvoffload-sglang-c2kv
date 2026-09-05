@@ -578,12 +578,10 @@ class ServerArgs:
     c2kv_gist_param: str = "qkv"
     c2kv_pool_fraction: float = 0.01
     c2kv_max_tokens: int = 65536
-    # Which projections ordinary (non-gist) tokens use once gist KV is present in
-    # a request's cache. "gist" reproduces the checkpoint's training regime
-    # (python/models/qwen3/modeling_qwen3.py use_gist=True for query/answer
-    # tokens); "base" is the paper-text regime and the pre-2026-09 serving
-    # behaviour. See c2kv/c2kv_serving_semantics.md.
-    c2kv_query_proj: str = "gist"
+    # Which projections ordinary (non-gist) tokens use once gist KV is present.
+    # Lowercase qkv checkpoints from the paper/reference path use base query
+    # projections. "gist" remains an explicit local-fork A/B extension.
+    c2kv_query_proj: str = "base"
     # How tool schemas are serialized into the chat template. "full" =
     # `model_dump()`, i.e. pydantic defaults such as `"strict": false` are
     # emitted (+4 tokens per tool with the Qwen3 template); this is what every
@@ -786,6 +784,9 @@ class ServerArgs:
             raise ValueError("--c2kv-max-tokens must be greater than 0.")
         if self.c2kv_query_proj not in ("base", "gist"):
             raise ValueError("--c2kv-query-proj must be 'base' or 'gist'.")
+        from sglang.srt.mem_cache.c2kv_semantics import validate_gist_param
+
+        self.c2kv_gist_param = validate_gist_param(self.c2kv_gist_param)
         if self.c2kv_tools_dump not in ("full", "exclude_unset"):
             raise ValueError(
                 "--c2kv-tools-dump must be 'full' or 'exclude_unset'."
@@ -5258,7 +5259,11 @@ class ServerArgs:
             "--c2kv-gist-param",
             type=str,
             default=ServerArgs.c2kv_gist_param,
-            help="Which projections are gist-parameterised for C2KV (e.g. 'qkv').",
+            help=(
+                "Which gist-token projections exist (lowercase combinations of "
+                "q/k/v). Mixed-case reference configs encode partial query "
+                "projection and are rejected until that mode is implemented."
+            ),
         )
         parser.add_argument(
             "--c2kv-pool-fraction",
@@ -5278,13 +5283,11 @@ class ServerArgs:
             type=str,
             choices=["base", "gist"],
             default=ServerArgs.c2kv_query_proj,
-            help="Projection used for ordinary tokens that come AFTER gist KV in a "
-            "request (query, current turn, decoded tokens). 'gist' = the same "
-            "gist_{q,k,v}_proj the checkpoint was trained with (use_gist=True in "
-            "modeling_qwen3.py); 'base' = frozen base projections as written in the "
-            "C2KV paper text and as served before 2026-09. Tokens before the first "
-            "gist (system prompt, tool prologue) always use base. "
-            "See c2kv/c2kv_serving_semantics.md.",
+            help="Projection used for ordinary tokens that come AFTER C2KV KV in a "
+            "request. 'base' is the paper/reference lowercase-qkv mode and the "
+            "default; 'gist' is an explicit local-fork A/B mode. Tokens before "
+            "the first C2KV segment always use base. See "
+            "c2kv/c2kv_serving_semantics.md.",
         )
         parser.add_argument(
             "--c2kv-tools-dump",

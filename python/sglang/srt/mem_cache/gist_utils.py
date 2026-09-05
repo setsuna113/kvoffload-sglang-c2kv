@@ -182,9 +182,14 @@ def _apply_gist_residual_interleave(
     batch_size, seq_length, hidden_size = tokens_tensor.shape
     pad_length = seq_length % ratio
     nopad_length = seq_length - pad_length
-    mean_tensor = tokens_tensor[:, :nopad_length].reshape(
-        batch_size, -1, ratio, hidden_size
-    ).mean(dim=2)
+    if nopad_length:
+        mean_tensor = tokens_tensor[:, :nopad_length].reshape(
+            batch_size, nopad_length // ratio, ratio, hidden_size
+        ).mean(dim=2)
+    else:
+        # ``reshape(batch, -1, ratio, hidden)`` cannot infer the empty chunk
+        # dimension when the document is shorter than one compression block.
+        mean_tensor = tokens_tensor.new_empty((batch_size, 0, hidden_size))
     if pad_length != 0:
         pad_mean = tokens_tensor[:, nopad_length:].mean(dim=1, keepdim=True)
         mean_tensor = torch.cat([mean_tensor, pad_mean], dim=1)

@@ -178,6 +178,11 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
+from sglang.srt.mem_cache.c2kv_semantics import (
+    C2KV_REPAIR_PLACEMENTS,
+    resolve_query_projection,
+    resolve_repair_placement,
+)
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -896,35 +901,12 @@ class Scheduler(
                 f"memory_budget_gib="
                 f"{total_memory_bytes * server_args.c2kv_pool_fraction / (1 << 30):.2f})"
             )
-            # D9: fire ONLY where decode replay actually loses the mask, i.e.
-            # --enable-c2kv (this whole block) AND graph capture on AND the
-            # resolved projection can be gist. A --disable-cuda-graph server
-            # replays nothing and must stay silent.
-            if (
-                getattr(server_args, "c2kv_query_proj", "base") == "gist"
-                and not server_args.disable_cuda_graph
-            ):
-                # State only what the code shows. The mask is rebuilt per
-                # forward from request state and is not part of graph capture,
-                # so a replayed decode step does not rebuild it. Whether NPU
-                # graph mode replays the same way has not been checked, so on
-                # device npu the same sentence is logged at INFO with that
-                # caveat attached.
-                message = (
-                    "C2KV: --c2kv-query-proj gist with graph capture enabled. "
-                    "Graph-captured decode steps do not rebuild the C2KV "
-                    "gist-projection mask; decoded tokens of a request that "
-                    "resolved to gist may run base projections. "
-                    "metadata.sglang_runtime.c2kv_query_proj_decode_verified "
-                    "reports false for such requests. Pass "
-                    "--disable-cuda-graph for a projection A/B."
+            if not server_args.disable_cuda_graph:
+                logger.info(
+                    "C2KV: batches that use gist query projections run eagerly "
+                    "because graph captures do not carry the per-token C2KV "
+                    "projection mask. Base-projection batches remain graph eligible."
                 )
-                if getattr(server_args, "device", None) == "npu":
-                    logger.info(
-                        "%s (graph behaviour on Ascend not verified)", message
-                    )
-                else:
-                    logger.warning("%s", message)
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -2088,32 +2070,27 @@ class Scheduler(
 
         if getattr(recv_req, "c2kv_segments", None):
             req.c2kv_segments = recv_req.c2kv_segments
-            # D1 query-projection policy. --c2kv-query-proj is the DEFAULT for a
-            # request that carries no explicit c2kv_use_gist_projection; an
-            # explicit value (request level first, else per segment) overrides
-            # it. Segments that leave the field unset follow the flag and the
-            # per-segment values are then OR-ed, which reproduces the pre-merge
-            # behaviour exactly while the flag keeps its default "gist".
-            default_gist = (
-                getattr(self.server_args, "c2kv_query_proj", "gist") == "gist"
-            )
+            # One mode applies to the whole request. A request-level value wins;
+            # otherwise explicit message values must agree. Unset messages do
+            # not override an explicit message value with the server default.
             req_level_proj = getattr(recv_req, "c2kv_use_gist_projection", None)
             seg_proj = [
                 getattr(seg, "use_gist_projection", None)
                 for seg in recv_req.c2kv_segments
             ]
-            if req_level_proj is not None:
-                req.c2kv_use_gist_projection = bool(req_level_proj)
-                req.c2kv_query_proj_source = "message"
-            elif any(value is not None for value in seg_proj):
-                req.c2kv_use_gist_projection = any(
-                    default_gist if value is None else bool(value)
-                    for value in seg_proj
+            try:
+                (
+                    req.c2kv_use_gist_projection,
+                    req.c2kv_query_proj_source,
+                ) = resolve_query_projection(
+                    getattr(self.server_args, "c2kv_query_proj", "base"),
+                    req_level_proj,
+                    seg_proj,
                 )
-                req.c2kv_query_proj_source = "message"
-            else:
-                req.c2kv_use_gist_projection = default_gist
-                req.c2kv_query_proj_source = "flag"
+            except ValueError as exc:
+                req.set_finish_with_abort(str(exc))
+                self._add_request_to_queue(req)
+                return
             self._init_c2kv_kv_memory_report(
                 req,
                 getattr(recv_req, "c2kv_kv_memory_hint", None),
@@ -2237,7 +2214,26 @@ class Scheduler(
         except ValueError as e:
             return C2KVExtractReqOutput(error=str(e), success=False)
 
-        key_hash = self.c2kv_pool.compute_hash(recv_req.input_ids)
+        hf_config = getattr(self.model_config, "hf_config", None)
+        key_hash = self.c2kv_pool.compute_hash(
+            recv_req.input_ids,
+            compression_ratio=compression_ratio,
+            extractor_config={
+                "gist_type": getattr(
+                    self.server_args, "c2kv_gist_type", "dynamic-interleave"
+                ),
+                "gist_param": getattr(self.server_args, "c2kv_gist_param", "qkv"),
+                "gist_extra_embed_num": getattr(
+                    hf_config, "gist_extra_embed_num", 1
+                ),
+                "gist_residual_type": getattr(
+                    hf_config, "gist_residual_type", "none"
+                ),
+                "gist_overlap": getattr(hf_config, "gist_overlap", 0),
+                "pic_enabled": bool(getattr(hf_config, "pic_enabled", False)),
+                "pic_param": getattr(hf_config, "pic_param", "qkv"),
+            },
+        )
         self._log_c2kv_token_usage(
             "extract_request",
             key_hash=key_hash[:16],
@@ -2609,6 +2605,11 @@ class Scheduler(
         existing = self.c2kv_pool.get(key_hash)
         if existing is not None:
             pos = self.c2kv_pool.get_position_ids(existing)
+            repair_metadata = dict(existing.repair_metadata or {})
+            cached_cacheblend = repair_metadata.get("cacheblend")
+            if isinstance(cached_cacheblend, dict):
+                cached_cacheblend = dict(cached_cacheblend)
+                cached_cacheblend["cache_hit"] = True
             return C2KVRepairExtractReqOutput(
                 key_hash=key_hash,
                 token_len=existing.token_len,
@@ -2621,13 +2622,12 @@ class Scheduler(
                 history_kv_method=history_kv_method or None,
                 requested_span_tokens=token_len,
                 selected_token_count=existing.token_len,
+                selected_relative_indices=repair_metadata.get(
+                    "selected_relative_indices"
+                ),
                 already_rotated=bool(existing.already_rotated),
                 kv_reuse_method=kv_reuse_method,
-                cacheblend=(
-                    {"cache_hit": True, "requested_span_tokens": token_len}
-                    if kv_reuse_method
-                    else None
-                ),
+                cacheblend=cached_cacheblend,
             )
 
         has_space = self.c2kv_pool.can_allocate(alloc_check_len, existing_key=key_hash)
@@ -2836,6 +2836,19 @@ class Scheduler(
                 already_rotated=already_rotated,
                 repair_mode=recv_req.repair_mode,
                 source_doc_index=recv_req.source_doc_index,
+                repair_metadata={
+                    "selected_relative_indices": (
+                        list(history_meta.get("selected_relative_indices") or [])
+                        if isinstance(history_meta, dict)
+                        and history_meta.get("selected_relative_indices") is not None
+                        else None
+                    ),
+                    "cacheblend": (
+                        dict(cacheblend_meta)
+                        if isinstance(cacheblend_meta, dict)
+                        else None
+                    ),
+                },
             )
         except ValueError as e:
             key_values = position_ids = None
@@ -3945,10 +3958,15 @@ class Scheduler(
                 key_hash=seg.key_hash[:16],
                 gist_len=gist_len,
             )
+            detail = str(e)
             self._set_c2kv_injection_error(
                 req,
-                f"C2KV_GIST_INJECTION_FAILED: gist entry {seg.key_hash} could "
-                f"not be written into the KV cache: {e}",
+                detail
+                if detail.startswith("C2KV_")
+                else (
+                    f"C2KV_GIST_INJECTION_FAILED: gist entry {seg.key_hash} "
+                    f"could not be written into the KV cache: {detail}"
+                ),
             )
             return False
 
@@ -3961,8 +3979,8 @@ class Scheduler(
             original_tokens=entry.original_seq_len,
         )
         req.c2kv_position_correction += entry.original_seq_len - gist_len
-        # From here on every ordinary token of this request comes after gist KV:
-        # the query-projection rule (--c2kv-query-proj) switches to gist proj.
+        # From here on ordinary tokens are eligible for the request's resolved
+        # query-projection mode. The default base mode leaves them unchanged.
         req.c2kv_gist_seen = True
         self._c2kv_layout_append(
             req,
@@ -4015,26 +4033,7 @@ class Scheduler(
     # the same history unit; the query must then continue from the raw span's
     # own absolute end. Legacy behaviour, used when a segment carries no
     # explicit repair_placement. See c2kv/c2kv_serving_semantics.md.
-    _C2KV_IN_PLACE_REPAIR_MODES = frozenset(
-        {
-            "d_corr_recompute",
-            "d_corr_recompute_w2",
-            "d_corr_replace_w1",
-            "d_corr_replace_w2",
-            "d_corr_replace_w4",
-            "d_corr_replace_all",
-            "append_masked_w2",
-            "raw_all_replace",
-            "raw_all_replace_direct",
-        }
-    )
-    # history_kv_<method> entries produced by /v1/c2kv/repair_extract also
-    # replace their history unit, so the legacy rule treats any "history_kv_"
-    # prefix as in_place.
-    # "cacheblend": the blended history span likewise stands in for the
-    # history unit it was extracted from (mem_cache/cacheblend.py).
-    _C2KV_IN_PLACE_REPAIR_MODE_PREFIXES = ("history_kv_", "cacheblend")
-    _C2KV_REPAIR_PLACEMENTS = ("in_place", "append_keep_ledger", "append_tail")
+    _C2KV_REPAIR_PLACEMENTS = C2KV_REPAIR_PLACEMENTS
 
     @staticmethod
     def _set_c2kv_injection_error(req: "Req", reason: str) -> None:
@@ -4066,19 +4065,7 @@ class Scheduler(
         layout.append(record)
 
     def _resolve_c2kv_repair_placement(self, entry, placement) -> str:
-        if placement is None or placement == "":
-            repair_mode = str(entry.repair_mode or "")
-            legacy_in_place = (
-                repair_mode in self._C2KV_IN_PLACE_REPAIR_MODES
-                or repair_mode.startswith(self._C2KV_IN_PLACE_REPAIR_MODE_PREFIXES)
-            )
-            return "in_place" if legacy_in_place else "append_keep_ledger"
-        if placement not in self._C2KV_REPAIR_PLACEMENTS:
-            raise ValueError(
-                f"Unknown c2kv_repair_placement {placement!r}; expected one of "
-                f"{self._C2KV_REPAIR_PLACEMENTS}"
-            )
-        return placement
+        return resolve_repair_placement(entry.repair_mode, placement)
 
     def _inject_c2kv_repair_entry(self, req: "Req", entry, placement=None) -> bool:
         """Inject an already stored repair KV entry after the current prefix.
@@ -4278,10 +4265,16 @@ class Scheduler(
         except Exception as e:
             logger.error("C2KV repair injection failed: %s", e, exc_info=True)
             _rollback()
+            detail = str(e)
             self._set_c2kv_injection_error(
                 req,
-                f"C2KV_REPAIR_INJECTION_FAILED: repair entry {entry.key_hash} "
-                f"could not be written into the KV cache: {e}",
+                detail
+                if detail.startswith("C2KV_")
+                else (
+                    f"C2KV_REPAIR_INJECTION_FAILED: repair entry "
+                    f"{entry.key_hash} could not be written into the KV "
+                    f"cache: {detail}"
+                ),
             )
             return False
 

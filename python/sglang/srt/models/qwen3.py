@@ -273,10 +273,12 @@ class Qwen3Attention(nn.Module):
     def _c2kv_project_qkv(self, hidden_states, forward_batch):
         """QKV projection honouring --c2kv-query-proj.
 
-        Training (python/models/qwen3/modeling_qwen3.py:242-246, :673) projects
-        every token of the main forward with gist_{q,k,v}_proj whenever gist KV
-        sits in the cache; the system prefix is prefilled separately with the
-        base projections. `forward_batch.c2kv_use_gist_projection` is the
+        The paper/reference lowercase-qkv regime leaves ordinary query tokens
+        on the base projections. The post-2026-08-09 local fork can instead use
+        gist_{q,k,v}_proj for the main forward; that extension is selected
+        explicitly with ``--c2kv-query-proj gist``. The system prefix is
+        prefilled separately with base projections.
+        `forward_batch.c2kv_use_gist_projection` is the
         per-token mask built in ForwardBatch from the request's EFFECTIVE mode
         (explicit message-level ``c2kv_use_gist_projection`` if the client sent
         one, otherwise ``ServerArgs.c2kv_query_proj``) gated by the absolute
@@ -289,14 +291,12 @@ class Qwen3Attention(nn.Module):
         parts = self.c2kv_query_proj_parts
         if not parts or not hasattr(self, "gist_qkv_proj"):
             return qkv
-        if os.environ.get("C2KV_USE_GIST_QUERY_PROJECTION", "1") == "0":
-            return qkv
         mask = (
             getattr(forward_batch, "c2kv_use_gist_projection", None)
             if forward_batch is not None
             else None
         )
-        if mask is None or not bool(mask.any().item()):
+        if mask is None:
             return qkv
         if mask.ndim != 1 or mask.shape[0] != qkv.shape[0]:
             raise RuntimeError(

@@ -6,15 +6,15 @@ like SGLang's regular KV cache pool. Individual entries only retain their slot
 indices and lightweight metadata, avoiding long-lived per-entry CUDA tensors.
 """
 
-import hashlib
 import struct
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.c2kv_semantics import compute_gist_cache_key
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 C2KV_GIST_TOKEN_BASE = 1 << 60
@@ -70,6 +70,7 @@ class C2KVEntry:
     already_rotated: bool = False
     repair_mode: Optional[str] = None
     source_doc_index: Optional[int] = None
+    repair_metadata: Optional[Dict[str, Any]] = None
 
     @property
     def token_len(self) -> int:
@@ -135,9 +136,17 @@ class C2KVPool:
         self._pin_counts: Counter[str] = Counter()
 
     @staticmethod
-    def compute_hash(token_ids: List[int]) -> str:
-        raw = struct.pack(f"{len(token_ids)}i", *token_ids)
-        return hashlib.sha256(raw).hexdigest()
+    def compute_hash(
+        token_ids: List[int],
+        *,
+        compression_ratio: int,
+        extractor_config: Optional[dict] = None,
+    ) -> str:
+        return compute_gist_cache_key(
+            token_ids,
+            compression_ratio,
+            extractor_config,
+        )
 
     def _validate_store_inputs(
         self,
@@ -331,6 +340,7 @@ class C2KVPool:
         already_rotated: bool,
         repair_mode: str,
         source_doc_index: Optional[int] = None,
+        repair_metadata: Optional[Dict[str, Any]] = None,
     ) -> C2KVEntry:
         """Store raw/neutral repair KV using the same paged-token pool.
 
@@ -426,6 +436,7 @@ class C2KVPool:
             already_rotated=already_rotated,
             repair_mode=repair_mode,
             source_doc_index=source_doc_index,
+            repair_metadata=dict(repair_metadata or {}),
         )
         self._cache[key_hash] = entry
         self._current_tokens += token_len

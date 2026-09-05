@@ -12,6 +12,17 @@ import torch
 
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.mem_cache.c2kv_pool import C2KVEntry, C2KVPool
+from sglang.srt.mem_cache.c2kv_semantics import validate_rope_position_range
+
+
+def _validate_rope_positions(position_ids: torch.Tensor, table_size: int) -> None:
+    if position_ids.numel() == 0:
+        raise ValueError("C2KV_ROPE_POSITION_OUT_OF_RANGE: no positions supplied")
+    validate_rope_position_range(
+        int(position_ids.min().item()),
+        int(position_ids.max().item()),
+        int(table_size),
+    )
 
 
 def inject_c2kv_gist(
@@ -45,12 +56,8 @@ def inject_c2kv_gist(
 
     gist_pos = c2kv_pool.get_position_ids(entry)
 
-    abs_pos = (
-        position_cursor + gist_pos
-    ).clamp(
-        0,
-        cos_sin_cache.shape[0] - 1,
-    )
+    abs_pos = position_cursor + gist_pos
+    _validate_rope_positions(abs_pos, cos_sin_cache.shape[0])
 
     rotary_dim = cos_sin_cache.shape[1]
     half_dim = rotary_dim // 2
@@ -297,15 +304,15 @@ def inject_c2kv_stored_kv(
         abs_pos = position_ids.to(device=cos_sin_cache.device, dtype=torch.long)
     else:
         abs_pos = c2kv_pool.get_position_ids(entry)
-    abs_pos = abs_pos.clamp(
-        0,
-        cos_sin_cache.shape[0] - 1,
-    )
     rotary_dim = cos_sin_cache.shape[1]
     half_dim = rotary_dim // 2
-    cos = cos_sin_cache[abs_pos, :half_dim]
-    sin = cos_sin_cache[abs_pos, half_dim:]
     head_dim = half_dim * 2
+    if entry.already_rotated:
+        cos = sin = None
+    else:
+        _validate_rope_positions(abs_pos, cos_sin_cache.shape[0])
+        cos = cos_sin_cache[abs_pos, :half_dim]
+        sin = cos_sin_cache[abs_pos, half_dim:]
 
     for layer_idx in range(c2kv_pool.num_layers):
         k_stored, v_stored = c2kv_pool.get_layer_kv(entry, layer_idx)

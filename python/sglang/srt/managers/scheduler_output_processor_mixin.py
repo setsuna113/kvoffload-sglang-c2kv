@@ -141,9 +141,9 @@ class SchedulerOutputProcessorMixin:
             #                              forward_batch_info.py), so it ran
             #                              base whatever the flag says.
             #   c2kv_query_proj_source     which rule chose the mode:
-            #                              "message" (an explicit request- or
-            #                              message-level
-            #                              c2kv_use_gist_projection),
+            #                              "request" (request-wide override),
+            #                              "message" (agreeing message-level
+            #                              overrides),
             #                              "flag" (--c2kv-query-proj), or
             #                              "none" (no C2KV segments, so no
             #                              projection decision was ever made
@@ -161,19 +161,13 @@ class SchedulerOutputProcessorMixin:
             else:
                 stats["c2kv_query_proj_effective"] = "base"
                 stats["c2kv_query_proj_source"] = "none"
-            # The projection mask is rebuilt per forward from request state and
-            # is NOT part of CUDA/NPU graph capture: a replayed decode graph
-            # runs whatever mode was in force at capture time (base). Say
-            # whether the decode steps of this request could actually have run
-            # the mode reported above, so no downstream number is attributed to
-            # a decode regime that never ran. Keyed on the EFFECTIVE mode --
-            # the value this key has always been computed from -- not on the
-            # flag: a request that ran base has nothing for graph replay to
-            # lose. See c2kv/c2kv_serving_semantics.md section 1.
-            stats["c2kv_query_proj_decode_verified"] = not (
-                stats["c2kv_query_proj_effective"] == "gist"
-                and not bool(getattr(server_args, "disable_cuda_graph", False))
-            )
+            # Graph captures do not own the dynamic projection mask. All graph
+            # runners therefore reject a batch whose effective mode needs that
+            # mask and let it run eagerly. This makes the reported mode valid
+            # for decode as well as prefill.
+            graph_eligible = stats["c2kv_query_proj_effective"] != "gist"
+            stats["c2kv_query_proj_graph_eligible"] = graph_eligible
+            stats["c2kv_query_proj_decode_verified"] = True
         if req is not None:
             layout = getattr(req, "c2kv_layout", None)
             if layout:

@@ -158,6 +158,32 @@ class TestC2KVPoolSizing(unittest.TestCase):
         torch.testing.assert_close(key.view(1, 8), values(1, 5)[0][0])
         torch.testing.assert_close(value.view(1, 8), values(1, 5)[0][1])
 
+    def test_repair_entry_preserves_cache_hit_provenance(self):
+        pool = self.create_pool(max_total_tokens=2, max_entry_tokens=2)
+        key_values = [
+            (
+                torch.full((1, 8), layer + 1, dtype=torch.float32),
+                torch.full((1, 8), layer + 11, dtype=torch.float32),
+            )
+            for layer in range(2)
+        ]
+        metadata = {
+            "selected_relative_indices": [0],
+            "cacheblend": {"chunk_count": 1, "deviation_mean": 0.25},
+        }
+
+        entry = pool.store_repair(
+            key_hash="repair",
+            key_values=key_values,
+            position_ids=torch.tensor([[3]], dtype=torch.int64),
+            original_seq_len=4,
+            already_rotated=True,
+            repair_mode="cacheblend",
+            repair_metadata=metadata,
+        )
+
+        self.assertEqual(entry.repair_metadata, metadata)
+
 
 if __name__ == "__main__":
     unittest.main()

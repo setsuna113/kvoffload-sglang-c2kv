@@ -29,6 +29,7 @@ import tqdm
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.mem_cache.c2kv_semantics import is_c2kv_graph_compatible
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -571,6 +572,8 @@ class CPUGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
+        if not is_c2kv_graph_compatible(forward_batch):
+            return False
         is_bs_supported = (
             forward_batch.batch_size in self.graphs
             if self.disable_padding

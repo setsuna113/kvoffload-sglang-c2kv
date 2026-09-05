@@ -8,7 +8,7 @@ are called "C2KV" in this project and they do **not** agree with each other:
 | | what it is | where |
 |---|---|---|
 | **paper** | arXiv 2607.17715, "C²KV: Compressed and Composable KV Cache Reuse" | text only |
-| **training checkpoint** | `qwen3-4b-agent-history-c2kv-toolcall-npu-v2/checkpoint-1088` and every other checkpoint produced by `python/train/*` of the `c2kv` repo | `c2kv` repo: `python/models/qwen3/modeling_qwen3.py`, `python/models/gist_utils.py`, `python/train/trainer.py`, `python/train/train_data_multiturn.py` |
+| **training checkpoint** | `qwen3-4b-agent-history-c2kv-toolcall-npu-v2/checkpoint-1088`; its exact as-trained dirty-tree state was not archived | `c2kv` repo: checkpoint config, dated source history, `python/models/qwen3/modeling_qwen3.py`, `python/models/gist_utils.py`, `python/train/trainer.py`, `python/train/train_data_multiturn.py` |
 | **this server** | the SGLang fork that serves those checkpoints | this repo |
 
 Every `file:line` below without a repo prefix is a path in **this** tree,
@@ -17,12 +17,13 @@ the training repo are prefixed `c2kv` repo; `benchmarks/*` is the C2KV bench
 (`tmp/bench-recover`); `yuhan_*` are the upstream client and run scripts, which
 live with that client and not here.
 
-The rule for every decision in this file: **the checkpoint is the ground
-truth**. A checkpoint is defined by how it was trained. When the paper text and
-the training code disagree, serving must follow the training code, otherwise
-the served model is not the model that was trained. When you find such a
-disagreement, do not "fix" the server towards the paper without an A/B
-number; record it here instead.
+The checkpoint's as-trained semantics are the target, but its dirty training
+tree was not archived. Claims below therefore distinguish the paper/reference
+path, dated repository history, and the later local-fork extension. The
+checkpoint-1088 config uses lowercase `qkv` and predates the 2026-08-09 commit
+that lowercased projection selection; this supports `base` as the default by a
+time-line inference, not by a recovered training SHA. Tensor/logit parity is
+still required before claiming exact checkpoint parity.
 
 Do not conclude from "the server matches the paper" that the checkpoint is
 wrong, and do not conclude from "the server matches the training code" that
@@ -45,23 +46,22 @@ that are trained (`--only_train_gist True`).
 | document tokens during extraction | base | base | base (`forward_with_gist`) |
 | gist tokens during extraction | gist | gist | gist (`forward_with_gist`, `gist_qkv_proj`) |
 | system prefix (before any gist) | base | base (`trainer.py:_build_system_kv`, prefilled without `use_gist`) | base |
-| **query / current turn / decoded tokens (after gist KV)** | base ("applied only to the original document tokens") | **gist**: `modeling_qwen3.py:673` sets `use_gist=True` for the whole main forward whenever `context_input_ids` (gists) are present, and `:242-246` then routes every token's q/k/v through `gist_*_proj` for the parts listed in `gist_param` (`qkv` in every training script) | resolved per request (rules below): an explicit message-level `c2kv_use_gist_projection` wins, otherwise `--c2kv-query-proj {base,gist}` decides (default `gist`, `server_args.py:586`). `gist` = gist projections for every token from the request's **first C2KV segment** onward -- gist or repair-only alike since **D7** (`scheduler.py:3258-3267`); `base` = the behaviour before 2026-09-02 |
+| **query / current turn / decoded tokens (after gist KV)** | base | reference lowercase `qkv`: base; uppercase letters opt individual main-forward parts into gist projections (for example `QkV` means gist Q/V and base K). The later local fork lowercases this test and therefore makes lowercase `qkv` select gist Q/K/V | resolved once per request (rules below). Default `base` matches paper/reference lowercase `qkv`; explicit `gist` selects all parts present in lowercase `--c2kv-gist-param` for the later local-fork A/B mode |
 | raw repair KV (`/v1/c2kv/repair_extract`) | n/a (paper §3.3.2 "original-token invariance": raw KV must equal the frozen base model's) | HF harness computes it with base projections | base (`models/qwen3.py:1363` `generate_raw_repair_kv` calls `self.qkv_proj` directly; it never enters the gist path) |
 
-So the checkpoint was trained with a query that reads gist K through
-`W_q^g` and produces its own K/V through `W_k^g, W_v^g`. Serving with base
-projections for the query (the pre-2026-09 behaviour, still available as
-`--c2kv-query-proj base`) is a train/serve mismatch. Because `W^g` starts as a
-copy of `W` and is trained with LR 5e-5 for O(10^3) steps, the two differ by a
-small delta; the size of the effect on downstream numbers is **not
-established** (2026-09-05: still no A/B run).
+For checkpoint-1088, lowercase `qkv` plus the dated source history points to
+base query projections. This is why `--c2kv-query-proj base` is the server
+default. `gist` remains explicit because checkpoints or experiments produced
+from the post-2026-08-09 local fork may require it. The effect size is not
+established; compare both modes against the same HF reference logits before
+attributing a downstream difference to checkpoint compatibility.
 
-Which parts of q/k/v are swapped is decided by `--c2kv-gist-param`
-(`server_args.py:578`, default `qkv`) and by nothing else:
-`Qwen3Attention.c2kv_query_proj_parts` (`models/qwen3.py:193`, filled at
-`:214`) is derived from it, and with the default the per-part select in
-`_c2kv_project_qkv` (`models/qwen3.py:271-313`) reduces to swapping the whole
-fused QKV row, which is what both parents did.
+`--c2kv-gist-param` currently accepts lowercase combinations of `q`, `k`, and
+`v` only. It determines which extra heads exist and which parts the explicit
+`gist` mode swaps. Mixed-case reference configs encode partial main-forward
+selection and are rejected at server setup with
+`C2KV_GIST_PARAM_CASE_UNSUPPORTED`; serving `QkV` faithfully is outside this
+implementation's current capability.
 
 ### Which mode a request gets
 
@@ -71,20 +71,14 @@ inside `if getattr(recv_req, "c2kv_segments", None):` (`scheduler.py:2089`) --
 a request with no C2KV segments is never touched and keeps the `Req` default
 `False` (`schedule_batch.py:936`):
 
-1. an explicit **request-level** `c2kv_use_gist_projection` wins
-   (`scheduler.py:2105-2107`; `c2kv_query_proj_source = "message"`).
-   `GenerateReqInput` carries the field (`io_struct.py:250`) but
-   `ChatCompletionRequest` does not, so `serving_chat.py:788-790` always sends
-   `None`: this branch is unreachable over `/v1/chat/completions` today;
-2. otherwise, if any annotated **message** carries `c2kv_use_gist_projection`
-   (`protocol.py:506` / `:534`, forwarded verbatim into
-   `C2KVSegmentInfo.use_gist_projection` at `serving_chat.py:574-591`,
-   `io_struct.py:2057`, `:2068`), the per-message fields decide: the request
-   uses gist if **any** of them asks for it, a message that carries no field
-   following the flag (`scheduler.py:2108-2113`; source `"message"`);
-3. otherwise `--c2kv-query-proj` decides (`scheduler.py:2114-2116`; source
-   `"flag"`). The resolver's own fallback is `"gist"`
-   (`scheduler.py:2097-2099`), the same as the flag default.
+1. an explicit request-level `ChatCompletionRequest.c2kv_use_gist_projection`
+   wins (`c2kv_query_proj_source = "request"`);
+2. otherwise, explicit annotated-message values decide when they all agree
+   (`source = "message"`). Unset messages do not dilute an explicit value. A
+   mixture of explicit `true` and `false` is rejected with
+   `C2KV_QUERY_PROJECTION_CONFLICT`;
+3. otherwise `--c2kv-query-proj` decides (`source = "flag"`), with `base` as
+   the server and resolver default.
 
 Both fields are tri-state on the wire: absent means "unset", not `false`
 (`protocol.py:506`, `io_struct.py:250`, `io_struct.py:2064-2068`). Collapsing
@@ -117,16 +111,11 @@ falls back to base, keyed on `Req.c2kv_gist_seen` -- is **DROPPED**. Nothing
 now reads `c2kv_gist_seen` to decide a projection; it is echoed in
 `metadata.sglang_runtime` as provenance and nowhere else.
 
-That is a real behaviour change against `fork/task/c2kv-serve-align`, not a
-no-op. A request that has C2KV segments but **no gist** segment -- its history
-is entirely raw repair KV, e.g. a runtime history-KV arm (section 7), or the
-bench's `c2kv_repair_inplace` arm on a conversation whose only compressed doc
-has had its gist replaced by the raw span -- still *resolves* to gist under
-rule 3 with the default flag, and is now served with **gist** projections
-where serve-align served base. Such a request is identifiable in the response:
-`c2kv_query_proj_effective = "gist"` next to `c2kv_gist_seen = false`. Do not
-compare its numbers against a serve-align (Sep-2) trace without carrying that
-column.
+The mask anchor remains the first C2KV segment, including repair-only segments,
+when a request explicitly resolves to `gist`. Under the default `base` mode a
+fully raw-repair history stays on base projections. Carry the effective mode and
+source columns when comparing old traces because the earlier reconciled branch
+defaulted the flag to `gist`.
 
 ### What the response reports
 
@@ -147,8 +136,8 @@ allocator, `:227-232`), so the guarantee is "present whenever
 `metadata.sglang_runtime` is present at all", not "present unconditionally".
 On a normally initialised server the allocator always exists.
 
-Whenever `--enable-c2kv` (`:118`), four more keys follow (**D6**: the
-projection provenance is three keys, deliberately not merged into one):
+Whenever `--enable-c2kv` (`:118`), projection provenance and graph eligibility
+are reported separately:
 
 - `c2kv_query_proj` -- the value of the `--c2kv-query-proj` **server flag**
   (`scheduler_output_processor_mixin.py:151`). Constant for the life of the
@@ -162,14 +151,17 @@ projection provenance is three keys, deliberately not merged into one):
   `"base"` (`:162`). A request with no C2KV segments never reaches the
   resolver and never builds a mask (`schedule_batch.py:2543-2547` ->
   `forward_batch_info.py:618`), so it reports `"base"` whatever the flag says.
-- `c2kv_query_proj_source` -- which of the three rules chose the mode:
-  `"message"` (an explicit request- or message-level
-  `c2kv_use_gist_projection`), `"flag"` (`--c2kv-query-proj`), or `"none"` --
+- `c2kv_query_proj_source` -- which rule chose the mode:
+  `"request"` (request-wide override), `"message"` (agreeing message-level
+  values), `"flag"` (`--c2kv-query-proj`), or `"none"` --
   no C2KV segments, so no projection decision was ever made for this request
   (`:158-160`, `:163`). `"none"` is what separates a segment-less request from
   a genuinely flag-defaulted one; before the reconciliation both said
   `"flag"`.
-- `c2kv_query_proj_decode_verified` (`:173-176`) -- see below.
+- `c2kv_query_proj_graph_eligible` -- `false` for effective `gist`, whose
+  dynamic mask cannot be represented by the graph captures; `true` for base.
+- `c2kv_query_proj_decode_verified` -- `true`: gist batches are forced to the
+  eager path, so decode uses the same resolved projections as prefill.
 
 and the per-request injection ledger -- `c2kv_layout`,
 `c2kv_position_correction`, `c2kv_gist_seen`
@@ -194,55 +186,14 @@ only on a request whose C2KV injection failed
 `Scheduler._set_c2kv_injection_error`, `scheduler.py:3973-3992`). Section 3
 lists what produces it and how it reaches an OpenAI client.
 
-Known limitation: the mask is built per forward from request state; it is not
-part of CUDA/NPU graph capture, so a **replayed decode graph runs the base
-projection whatever the flag says**, while prefill runs the flag's mode. Serve
-C2KV with `--disable-cuda-graph` if decoded tokens must follow the flag (the
-c2kv position correction has the same limitation).
-`c2kv_query_proj_decode_verified` is `false` exactly when
-`c2kv_query_proj_effective` is `gist` and graph capture is on
-(`scheduler_output_processor_mixin.py:173-176`) -- keyed on the **effective**
-mode, not the flag, because a request that ran base has nothing for graph
-replay to have lost.
-
-The scheduler logs once at startup (**D9**, `scheduler.py:899-927`) in exactly
-the configuration where the flag path loses the mask: inside
-`if server_args.enable_c2kv:` (`scheduler.py:851`) and gated on
-`c2kv_query_proj == "gist" and not server_args.disable_cuda_graph`
-(`scheduler.py:903-906`). A `--disable-cuda-graph` server is silent, which is
-what the D9 change bought.
-
-The text says only what the code shows (message built at
-`scheduler.py:913-921`): graph-captured decode steps do not rebuild the C2KV
-gist-projection mask; decoded tokens of a request that resolved to gist may run
-base projections; `c2kv_query_proj_decode_verified` reports false for such
-requests; pass `--disable-cuda-graph` for a projection A/B. It no longer
-declares that such a run "must not be used as one side of a gist-vs-base A/B"
--- that was a verdict about experiments, not a reading of the code, and what
-the code establishes is the four clauses above. On `--device npu` the same
-sentence is logged at **INFO** with "(graph behaviour on Ascend not verified)"
-appended (`scheduler.py:922-925`), because nothing in this tree establishes how
-Ascend graph mode replays the mask.
-
-**The startup line covers the flag path only.** Its gate reads
-`server_args.c2kv_query_proj` (`scheduler.py:903-906`) and never the resolved
-per-request mode: on a `--c2kv-query-proj base` server a message-level
-`c2kv_use_gist_projection: true` still resolves that request to gist
-(`scheduler.py:2105-2113`) and still builds a mask graph capture does not
-carry, and no startup line says so. Read that server per request instead --
-`c2kv_query_proj_effective="gist"` next to
-`c2kv_query_proj_decode_verified=false`
-(`scheduler_output_processor_mixin.py:153-157`, `:173-176`) is the per-request
-form of the same statement, and it is what a base-flag server with per-message
-gist overrides has to be judged on. Any server started with `--enable-c2kv` and
-neither `--disable-cuda-graph` nor `--c2kv-query-proj base` prints the line;
-that includes the upstream history-KV run script
-(`yuhan_run_history_kv_baselines.sh:187`, client-side file, not in this tree),
-which passes `--enable-c2kv` and never `--disable-cuda-graph`. Expect the line
-there; it is D9 behaving as specified, not a misconfiguration introduced by the
-merge. For the per-run statement read the startup line, or `c2kv_query_proj`
-together with `--disable-cuda-graph`; for a single request read
-`c2kv_query_proj_decode_verified`.
+The mask is built per forward from request state and is not part of CUDA, CPU,
+or piecewise graph capture. Each graph runner's `can_run` therefore rejects a
+batch whenever `ForwardBatch.c2kv_use_gist_projection` is non-`None`. Such a
+batch runs eagerly and preserves the projection mask for prefill and decode;
+base-only batches remain graph eligible. The scheduler logs this policy once at
+startup when C2KV and graph capture are enabled. The position correction is
+already materialized in `ForwardBatch.positions` and is not the reason for the
+eager fallback.
 
 ## 2. Position frames: what "original_seq_len" means
 
@@ -569,10 +520,10 @@ merged server.
 |---|---|---|---|
 | `--enable-c2kv` | `False` (`:576`, CLI `:5247`) | pre-existing | gates the pool and everything below |
 | `--c2kv-gist-type` | `dynamic-interleave` (`:577`, CLI `:5252`) | pre-existing | `GistConfig.gist_type` (`models/qwen3.py:1119-1120`); only `dynamic-interleave` is implemented (CLI help, `server_args.py:5255`) |
-| `--c2kv-gist-param` | `qkv` (`:578`, CLI `:5258`) | pre-existing | which of q/k/v the gist projection replaces (`models/qwen3.py:214`) |
+| `--c2kv-gist-param` | `qkv` (`:578`, CLI `:5258`) | pre-existing, validation tightened here | lowercase parts for which gist heads exist; mixed-case reference selection such as `QkV` is rejected because partial main-forward selection is not implemented |
 | `--c2kv-pool-fraction` | `0.01` (`:579`, validated `:783-784`, CLI `:5264`) | pre-existing | share of device memory given to the gist/repair pool (`scheduler.py:860-871`) |
 | `--c2kv-max-tokens` | `65536` (`:580`, validated `:785-786`, CLI `:5271`) | pre-existing | per-entry cap in the pool |
-| `--c2kv-query-proj {base,gist}` | `gist` (`:586`, validated `:787-788`, CLI `:5277`) | serve-align | section 1; in the merged server it is the per-request **default** only -- an explicit message field overrides it |
+| `--c2kv-query-proj {base,gist}` | `base` (validated at startup) | serve-align, default corrected here | section 1; request-wide or agreeing message-level fields may override it |
 | `--c2kv-tools-dump {full,exclude_unset}` | `full` (`:599`, validated `:789-792`, CLI `:5290`) | merge | section 2; `full` = upstream's tool prologue, `exclude_unset` = serve-align's |
 
 ### Chat message fields (`ChatCompletionMessageGenericParam` / `...UserParam`)
@@ -594,11 +545,13 @@ filled at `serving_chat.py:574-591`).
 | field | default | owner | meaning |
 |---|---|---|---|
 | `ChatCompletionRequest.c2kv_kv_memory_hint` | `None` (`protocol.py:644`) | upstream | section 7 |
-| `GenerateReqInput.c2kv_use_gist_projection` | `None` (`io_struct.py:250`) | upstream, retyped tri-state by the merge | section 1, rule 1 (no chat field feeds it today) |
+| `ChatCompletionRequest.c2kv_use_gist_projection` | `None` | this consolidation | section 1, rule 1; request-wide override exposed on `/v1/chat/completions` |
+| `GenerateReqInput.c2kv_use_gist_projection` | `None` (`io_struct.py:250`) | upstream, retyped tri-state by the merge | internal tri-state forwarded from chat serving |
 | `metadata.sglang_runtime.c2kv_query_proj` | | serve-align | section 1 -- the `--c2kv-query-proj` **flag**, constant per run (`scheduler_output_processor_mixin.py:151`) |
 | `metadata.sglang_runtime.c2kv_query_proj_effective` | | merge (D6) | section 1 -- `"gist"` / `"base"`, what this request actually ran (`:153-157`, `:162`) |
-| `metadata.sglang_runtime.c2kv_query_proj_source` | | merge | `"message"` / `"flag"` / `"none"` (`:158-160`, `:163`); `"none"` = no C2KV segments |
-| `metadata.sglang_runtime.c2kv_query_proj_decode_verified` | | merge | section 1, graph capture; keyed on `_effective` (`:173-176`) |
+| `metadata.sglang_runtime.c2kv_query_proj_source` | | merge, request source added here | `"request"` / `"message"` / `"flag"` / `"none"`; `"none"` = no C2KV segments |
+| `metadata.sglang_runtime.c2kv_query_proj_graph_eligible` | | this consolidation | `false` for effective gist because the dynamic mask forces eager execution; `true` for base |
+| `metadata.sglang_runtime.c2kv_query_proj_decode_verified` | | merge, corrected here | always `true`; graph runners refuse masked batches so decode preserves the resolved mode |
 | `metadata.sglang_runtime.c2kv_tools_dump` | | merge (D5) | the active `--c2kv-tools-dump` (`:114`), emitted whether or not C2KV is enabled |
 | `metadata.sglang_runtime.c2kv_layout`, `.c2kv_position_correction`, `.c2kv_gist_seen` | `[]`, `0`, `false` when nothing was injected; absent only off `--enable-c2kv` or with no allocator | serve-align, always-present since 2026-09-05 | per-request injection ledger (`:177-196`); since D7 `c2kv_gist_seen` is provenance only (section 1) |
 | `metadata.sglang_runtime.c2kv_injection_error` | absent unless the injection failed | 2026-09-05 | machine-readable `C2KV_*` reason (`:205-207`); section 3 |
@@ -608,6 +561,8 @@ filled at `serving_chat.py:574-591`).
 | error prefix `C2KV_CACHE_MISS:` | | serve-align, extended 2026-09-05 | admission-time misses `scheduler.py:3309`, `:3320`, `:3422`; **injection-time misses now carry it too** -- repair-only `:3489`, gist `:3522`, repair-attached `:3922` -- so the structured retry (the gist pool is an in-process LRU; a miss after eviction is not a client error) fires for both. Before this change an injection-time miss returned a bare `False` with no text and reached the client as a text-less abort |
 | error prefix `C2KV_APPEND_TAIL_REQUIRES_PRE_ROPE:` | | merge | `scheduler.py:4176` (guard `:4173-4185`); section 3. Readable by an OpenAI client since 2026-09-05, on `metadata.sglang_runtime.c2kv_injection_error` / `metadata.finish_message` |
 | error prefix `C2KV_REPAIR_PLACEMENT_INVALID:` | | pre-2026-09-05 (injection), 2026-09-05 (admission) | `scheduler.py:4043` at injection and `:3296` at admission (D10) -- the same code on both channels, so a client can key on it whether the request is refused with HTTP 400 or aborted at 200. Which parent introduced the injection-time string was not traced |
+| error prefix `C2KV_ROPE_POSITION_OUT_OF_RANGE:` | | this consolidation | gist or pre-RoPE repair injection would exceed the RoPE table; the request is rejected instead of aliasing positions by clamping |
+| error prefix `C2KV_QUERY_PROJECTION_CONFLICT:` | | this consolidation | explicit message-level projection values disagree; set the request-wide field or make them agree |
 | `metadata.sglang_runtime` on `/v1/chat/completions` | absent for `stream=true` | serve-align | attached only in `_build_chat_response` (`serving_chat.py:1520-1548`); `ChatCompletionStreamResponse` has no `metadata` field (`protocol.py:955-962`) |
 
 **Batched `/generate` rejects C2KV fields.** `GenerateReqInput.__getitem__`
@@ -633,6 +588,11 @@ Note that `metadata.sglang_runtime` reaches the client only because
 `kv_memory_reports` relay on the same line is upstream's.
 
 ### C2KV endpoints
+
+The `/v1/c2kv/extract` cache identity hashes token IDs, the resolved
+compression ratio, gist type/parts, and PIC configuration. Requests with the
+same text but different extraction settings cannot reuse each other's entry.
+The repair endpoint already hashes its complete extraction payload.
 
 | where | field | default | owner |
 |---|---|---|---|
@@ -811,37 +771,30 @@ silently serving the uncompacted prompt (`scheduler.py:3031-3034`).
 **Interaction with section 1.** The runtime-eviction arms attach the stored
 entry to a carrier message that sets `c2kv_use_gist_projection: false`
 (`yuhan_client_history_kv_baselines.py:471-476`), so rule 2 resolves them to
-base -- and after **D7** that explicit `false` is the *only* thing keeping
-them there. The carrier carries no `c2kv_key_hash`, but the no-gist-segment
-fallback that used to catch that case is gone (section 1): a runtime
-history-KV arm whose carrier omits `c2kv_use_gist_projection` now resolves to
-gist under the default flag and is served with gist projections. Check
-`c2kv_query_proj_effective` on every such run rather than assuming base. The
+base. An arm that omits the field also resolves to base under the corrected
+server default. Check `c2kv_query_proj_effective` on every run because an
+explicit request field or a server launched with `--c2kv-query-proj gist` can
+still change it. The
 `full` arm sends no C2KV annotation at all, so it never reaches the resolver
 and reports `c2kv_query_proj_effective="base"` with
 `c2kv_query_proj_source="none"` and an empty `c2kv_layout` (`[]`, not an
 absent key, since 2026-09-05 -- section 1).
 
-**These servers print the D9 line.** The upstream run script passes
-`--enable-c2kv` (`yuhan_run_history_kv_baselines.sh:187`; client-side file, not
-in this tree) and neither `--disable-cuda-graph` nor `--c2kv-query-proj`, so
-`c2kv_query_proj` is its default `gist` (`server_args.py:586`) and the startup
-line at `scheduler.py:899-927` fires on every such server. That is D9 behaving
-as specified, not a merge defect: graph capture really is on. It says nothing
-about these arms' own numbers -- their carrier message forces
-`c2kv_use_gist_projection: false`, so they resolve to base and report
-`c2kv_query_proj_decode_verified=true` -- but any request on that server that
-resolves to gist has decode steps the mask was not rebuilt for. On an
-Ascend/NPU server the same sentence is emitted at INFO with "(graph behaviour
-on Ascend not verified)" appended (`scheduler.py:922-925`): the wording has not
-been checked against the device's actual graph mode, so read it as "graph
-capture is not disabled", not as a verified statement about NPU replay.
+When graph capture is enabled, these servers print one INFO line describing the
+eager fallback for gist-projection batches. Their default base requests remain
+graph eligible; a request that explicitly resolves to gist reports
+`c2kv_query_proj_graph_eligible=false` and runs eagerly.
 
 ## 8. Things that are still open
 
 Carried over:
 
 - Effect size of `--c2kv-query-proj gist` vs `base`: no A/B yet.
+- Exact checkpoint-1088 projection parity: the dated source/config evidence
+  supports lowercase-`qkv` base query semantics, but the as-trained dirty tree
+  is unavailable. Compare HF and SGLang logits/first token under both modes.
+- Mixed-case reference configs such as `QkV` are rejected; partial query-part
+  selection is not implemented.
 - The `text`+`role` repair form still exists and is silently lower fidelity;
   clients in the `c2kv` repo were moved to the `messages` form.
 - `c2kv_gist_seen` / `c2kv_position_correction` are not restored on
@@ -853,21 +806,18 @@ Carried over:
 - `_c2kv_project_qkv` computes both projections for a mixed batch and
   selects per token; cost is one extra QKV GEMM on those tokens
   (`models/qwen3.py:271-313`).
+- A gist-projection request forces its whole scheduler batch off graph replay;
+  this is required for correctness and may reduce decode throughput.
 
 Found while reconciling the two branches (2026-09-05). Items marked
 **Resolved by** or **Closed** were fixed in the D5-D10 close-out and are kept
 for traceability; the rest are still open:
 
-- **Resolved by D6**, kept here for traceability: `c2kv_query_proj` used to be
+- **Resolved by D6 and extended here**, kept for traceability: `c2kv_query_proj` used to be
   the effective mode for a request with segments and the flag for one without,
   so a turn-1 or `full`-arm request that provably ran base self-reported
-  `"gist"` under the default flag. It is now three keys (section 1): the flag,
-  `_effective`, and `_source` with a third value `"none"`. Residual: a
-  consumer that read `c2kv_query_proj_decode_verified` as a per-RUN flag now
-  sees `true` on the segment-less requests of a gist-flag run (they genuinely
-  ran base). No such consumer exists in `tmp/bench-recover`
-  (`benchmarks/backends/sglang.py:252-273` only records the keys into the
-  per-request cost dict).
+  `"gist"` under the old default flag. It now reports flag, effective mode,
+  source, graph eligibility, and decode verification separately (section 1).
 - `--c2kv-tools-dump` defaults to `full` (`server_args.py:599`), i.e. upstream's
   frame. Traces collected against `fork/task/c2kv-serve-align` were produced
   under `exclude_unset`; comparing them with a default-flag run compares two
@@ -987,7 +937,8 @@ This tree is a merge of two independent C2KV serving lines, not a rewrite:
   `718a654e3` (`kv_runtime_stats` carried across the detokenizer hop);
 - common ancestor: `7de9e8105`.
 
-Decisions taken (implemented; not open for re-litigation here):
+Historical reconciliation decisions, followed by the bounded consolidation in
+this branch:
 
 - **D1** upstream's projection mechanism is the implementation
   (`Req.c2kv_use_gist_projection` + `Req.c2kv_gist_projection_start_pos` -> one
@@ -1005,9 +956,9 @@ Decisions taken (implemented; not open for re-litigation here):
   eviction, persistent sessions and KV-memory reporting (section 7);
   serve-align's full-context repair extraction, `tools` on the extract
   endpoints, layout provenance and error prefixes (sections 3 and 5).
-- **D4** a request that sends none of the serve-align fields must behave as it
-  did on `d42ce815f`, and a request from the bench proxy must get serve-align
-  behaviour. The one place the two frames genuinely differ is
+- **D4** at reconciliation time, a request that sent none of the serve-align
+  fields followed `d42ce815f`. The projection default is superseded below after
+  the checkpoint/reference audit. The remaining frame difference is
   `--c2kv-tools-dump` (section 2): its default `full` is upstream's frame, so a
   serve-align client has to ask for `exclude_unset` explicitly.
 - **D5** `--c2kv-tools-dump {full,exclude_unset}` stays, default `full`: the
@@ -1023,10 +974,10 @@ Decisions taken (implemented; not open for re-litigation here):
   (`scheduler_output_processor_mixin.py:114`). A serve-align client must pass
   `--c2kv-tools-dump exclude_unset` explicitly (the bench launcher does:
   `tmp/bench-recover/benchmarks/ops/launch_sgl1088.sh:69`).
-- **D6** projection provenance is three keys, not one: `c2kv_query_proj` (the
+- **D6** projection provenance separates `c2kv_query_proj` (the
   server flag, constant per run), `c2kv_query_proj_effective` (what this
-  request ran) and `c2kv_query_proj_source` (`"message"` / `"flag"` /
-  `"none"`). Section 1.
+  request ran), `c2kv_query_proj_source` (`"request"` / `"message"` /
+  `"flag"` / `"none"`), graph eligibility, and decode verification. Section 1.
 - **D7** repair-only segments follow upstream: once the resolved mode is gist,
   the mask starts at `segments[0].token_start` whether that segment is a gist
   or a repair-only one. Serve-align's `c2kv_gist_seen`-keyed fallback to base
@@ -1042,15 +993,11 @@ Decisions taken (implemented; not open for re-litigation here):
   `getattr(..., False)` reads that remain (`schedule_batch.py:2544`, `:2546`,
   `scheduler_output_processor_mixin.py:155`, `scheduler.py:3266`) are all on
   `Req` *after* resolution, where the value is a real bool.
-- **D9** the startup line fires only where the flag path actually loses the
-  mask on decode replay: `--enable-c2kv` (`scheduler.py:851`) and
-  `--c2kv-query-proj gist` and graph capture on (`scheduler.py:903-906`, inside
-  the block at `:899-927`). A `--disable-cuda-graph` server is silent. The gate
-  reads the flag, not the resolved per-request mode -- section 1 says what that
-  leaves uncovered. Its wording was narrowed on 2026-09-05 to the four clauses
-  the code supports and demoted to INFO on `--device npu`
-  (`scheduler.py:913-925`); the "must not be used as one side of a
-  gist-vs-base A/B" verdict was removed.
+- **D9**, superseded here: the startup warning originally described graph
+  replay losing the projection mask. All graph runners now refuse masked
+  batches, so the scheduler emits one INFO description of the eager fallback
+  whenever C2KV graph capture is enabled. Per-request graph eligibility is
+  reported in metadata.
 - **D10** hygiene: an invalid `c2kv_repair_placement` is rejected at admission
   (`scheduler.py:3284-3299`) instead of at injection;
   `TokenizedRepairExtractReqInput.already_rotated` was audited against its
@@ -1065,8 +1012,8 @@ an OpenAI client on two extra metadata keys, with no status-code change (S1,
 section 3); the `c2kv_layout` ledger keys are always present on a
 C2KV-enabled server and empty means "nothing injected" (S2, section 1);
 batched `/generate` requests carrying C2KV fields are rejected instead of
-silently served as plain prompts (S3, section 5); the D9 startup line says
-only what the code shows and is INFO on NPU (S4, section 1); the stale
+silently served as plain prompts (S3, section 5); the graph policy is reported
+at INFO (S4, section 1); the stale
 "first gist segment" comment in `schedule_batch.py` is corrected (S5,
 `schedule_batch.py:2848-2852`); the smoke script covers the D6 keys, the
 empty-ledger contract and the placement rejection (S6, section 6).
@@ -1075,24 +1022,23 @@ empty-ledger contract and the placement rejection (S6, section 6).
 since the merge: no model load, no server start, no forward pass, and in
 particular **no `scripts/c2kv/smoke_c2kv_semantics.py` run** -- there is no NPU
 and no checkpoint in the environment the merge was resolved in. Verification so
-far is limited to conflict-marker checks (0 markers), `python -m py_compile` on
-the changed files, and reading the merged functions. Every behavioural
+far is limited to focused CPU-only serving-contract tests, syntax compilation,
+conflict-marker checks, and code review. Every behavioural
 statement in this file, every `file:line` in it, and every claim about what a
 response contains is a claim about code as read on 2026-09-05, not an
 observation of a run.
 
 Before quoting any number produced by this build, on the NPU box:
 
-1. run the smoke script (section 6) against a live server, and read section 6
-   on what it does *not* assert -- a pass still does not cover the D7
-   repair-only mask start, and nothing ties the reported `c2kv_query_proj` to
-   the flag the server was started with;
-2. check the startup log for the D9 line and record whether it fired (and at
-   which level -- INFO on `--device npu`), next to the `--c2kv-query-proj` and
-   `--c2kv-tools-dump` values the server was started with;
+1. run the smoke script (section 6) against a live server under both
+   `--c2kv-query-proj base` and `gist`; a pass still does not establish HF
+   checkpoint parity;
+2. record the startup INFO line next to the `--c2kv-query-proj` and
+   `--c2kv-tools-dump` values;
 3. on one real request of each arm, record `c2kv_query_proj`,
    `c2kv_query_proj_effective`, `c2kv_query_proj_source`,
-   `c2kv_query_proj_decode_verified`, `c2kv_tools_dump`, whether `c2kv_layout`
+   `c2kv_query_proj_graph_eligible`, `c2kv_query_proj_decode_verified`,
+   `c2kv_tools_dump`, whether `c2kv_layout`
    is `[]` or populated, and whether `c2kv_injection_error` is present -- that
    is the whole reconciled contract in one response.
 
@@ -1157,7 +1103,8 @@ echo.  `token_len` of the entry is the WHOLE span: CacheBlend saves compute,
 not KV memory, so `active_raw_repair_tokens` = span and the compute saving
 is `1 - effective_recomp_ratio` of the span at layers `> check_layer`
 (layers `0..check_layer` are computed for every token, as in the artifact).
-A cache hit on the same key echoes `{"cache_hit": true}` instead.
+A cache hit on the same key repeats the stored accounting and adds
+`"cache_hit": true`; selection and deviation provenance is not discarded.
 
 **What is and is not the artifact's.**  Same: standalone per-chunk KV with K
 kept pre-RoPE and rotated at the concatenated positions at blend time; full

@@ -642,6 +642,9 @@ class ChatCompletionRequest(BaseModel):
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
     c2kv_kv_memory_hint: Optional[Dict[str, Any]] = None
+    # Request-wide projection override. This takes precedence over message-level
+    # values; None leaves resolution to the messages and --c2kv-query-proj.
+    c2kv_use_gist_projection: Optional[bool] = None
     reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "

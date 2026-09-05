@@ -930,9 +930,9 @@ class Req(ReqDllmMixin):
         # came from. Resolved in Scheduler.handle_generate_request:
         #   c2kv_use_gist_projection True  -> effective mode "gist"
         #                            False -> effective mode "base"
-        #   c2kv_query_proj_source   "message" if a chat message carried an
-        #                            explicit c2kv_use_gist_projection, else
-        #                            "flag" (ServerArgs.c2kv_query_proj).
+        #   c2kv_query_proj_source   "request" for the request-wide override,
+        #                            "message" for agreeing message overrides,
+        #                            else "flag" (ServerArgs.c2kv_query_proj).
         self.c2kv_use_gist_projection = False
         self.c2kv_query_proj_source = "flag"
         self.c2kv_gist_projection_start_pos = 0

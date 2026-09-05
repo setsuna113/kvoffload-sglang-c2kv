@@ -780,11 +780,10 @@ class OpenAIServingChat(OpenAIServingBase):
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             c2kv_segments=c2kv_segments,
             c2kv_kv_memory_hint=request.c2kv_kv_memory_hint,
-            # D1: tri-state. ChatCompletionRequest carries no request-level
-            # c2kv_use_gist_projection today, so this stays None ("unset") and
-            # the per-segment values plus --c2kv-query-proj decide in the
-            # scheduler (scheduler.py, _handle_generate_request). Do NOT
-            # collapse the segment values to a bool here.
+            # Tri-state request override. None leaves the per-segment values and
+            # --c2kv-query-proj to the scheduler. Do not collapse segment
+            # values here: the scheduler also rejects conflicting explicit
+            # message choices instead of silently selecting one.
             c2kv_use_gist_projection=getattr(
                 request, "c2kv_use_gist_projection", None
             ),
