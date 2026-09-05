@@ -16,6 +16,7 @@ from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
+    chat_template_tools_dump,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -353,18 +354,38 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return None
 
+    def _c2kv_tools_dump_exclude_unset(self) -> bool:
+        """Whether tool schemas are serialized with `exclude_unset=True`.
+
+        `--c2kv-tools-dump full` (the default) reproduces plain `model_dump()`,
+        i.e. the tool prologue this server rendered before 2026-09-05 (pydantic
+        defaults such as `"strict": false` included, +4 tokens per tool with the
+        Qwen3 template). `exclude_unset` renders the client's tool JSON verbatim,
+        which is what a client that predicts C2KV insertion points or repair
+        positions itself needs. The value also drives
+        `http_server._c2kv_template_ids`, so the chat frame and the repair frame
+        agree. Changing the flag changes the served prompt; see
+        c2kv/c2kv_serving_semantics.md.
+        """
+        server_args = getattr(self.tokenizer_manager, "server_args", None)
+        return getattr(server_args, "c2kv_tools_dump", "full") == "exclude_unset"
+
     def _chat_template_tools(
         self, request: "ChatCompletionRequest"
     ) -> Optional[List[Dict]]:
         if not request.tools or request.tool_choice == "none":
             return None
+        exclude_unset = self._c2kv_tools_dump_exclude_unset()
         if not isinstance(request.tool_choice, str):
-            return [
-                item.model_dump()
-                for item in request.tools
-                if item.function.name == request.tool_choice.function.name
-            ]
-        return [item.model_dump() for item in request.tools]
+            return chat_template_tools_dump(
+                [
+                    item
+                    for item in request.tools
+                    if item.function.name == request.tool_choice.function.name
+                ],
+                exclude_unset=exclude_unset,
+            )
+        return chat_template_tools_dump(request.tools, exclude_unset=exclude_unset)
 
     def _chat_template_extra_kwargs(
         self, request: "ChatCompletionRequest"
@@ -560,9 +581,14 @@ class OpenAIServingChat(OpenAIServingBase):
                             getattr(msg, "c2kv_repair_only_key_hashes", None) or []
                         )
                     ),
-                    use_gist_projection=(
-                        getattr(msg, "c2kv_use_gist_projection", None) is not False
+                    # Tri-state, forwarded VERBATIM: None means "unset", and
+                    # the scheduler then falls back to --c2kv-query-proj.
+                    # Collapsing it to a bool here would make "no field sent"
+                    # indistinguishable from "sent False" (D1).
+                    use_gist_projection=getattr(
+                        msg, "c2kv_use_gist_projection", None
                     ),
+                    repair_placement=getattr(msg, "c2kv_repair_placement", None),
                 )
             )
 
@@ -754,12 +780,13 @@ class OpenAIServingChat(OpenAIServingBase):
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             c2kv_segments=c2kv_segments,
             c2kv_kv_memory_hint=request.c2kv_kv_memory_hint,
-            c2kv_use_gist_projection=bool(
-                c2kv_segments
-                and any(
-                    getattr(seg, "use_gist_projection", True)
-                    for seg in c2kv_segments
-                )
+            # D1: tri-state. ChatCompletionRequest carries no request-level
+            # c2kv_use_gist_projection today, so this stays None ("unset") and
+            # the per-segment values plus --c2kv-query-proj decide in the
+            # scheduler (scheduler.py, _handle_generate_request). Do NOT
+            # collapse the segment values to a bool here.
+            c2kv_use_gist_projection=getattr(
+                request, "c2kv_use_gist_projection", None
             ),
         )
         if persistent_session_id is not None:
@@ -1490,20 +1517,34 @@ class OpenAIServingChat(OpenAIServingBase):
                 kv_memory_report.get("history_kv_runtime_status"),
             )
 
+        metadata = {
+            "weight_version": ret[0]["meta_info"]["weight_version"],
+            "sglang_runtime": ret[0]["meta_info"].get("kv_runtime_stats"),
+            # Keep the per-request layout report produced by the scheduler.
+            # BFCL uses this to distinguish measured physical KV residency
+            # from client-side history-token estimates.
+            "kv_memory_report": kv_memory_report,
+        }
+        # A C2KV injection that fails mid-prefill ends as FINISH_ABORT with no
+        # status_code, i.e. an HTTP 200 whose finish_reason.type is "abort";
+        # the per-choice field above copies only finish_reason["type"], so the
+        # reason string would otherwise never reach an OpenAI client. Surface
+        # it at response level, next to sglang_runtime (whose
+        # c2kv_injection_error carries the same C2KV_* code). Only for an
+        # abort, and only as an extra metadata key -- the HTTP status and every
+        # existing field are unchanged. See c2kv/c2kv_serving_semantics.md
+        # section 3.
+        first_finish_reason = ret[0]["meta_info"].get("finish_reason") or {}
+        if first_finish_reason.get("type") == "abort":
+            metadata["finish_message"] = first_finish_reason.get("message")
+
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={
-                "weight_version": ret[0]["meta_info"]["weight_version"],
-                "sglang_runtime": ret[0]["meta_info"].get("kv_runtime_stats"),
-                # Keep the per-request layout report produced by the scheduler.
-                # BFCL uses this to distinguish measured physical KV residency
-                # from client-side history-token estimates.
-                "kv_memory_report": kv_memory_report,
-            },
+            metadata=metadata,
             sglext=response_sglext,
         )
 

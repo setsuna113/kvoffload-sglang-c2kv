@@ -444,8 +444,15 @@ class TokenizerCommunicatorMixin:
         history_kv_pooling: str = "avgpool",
         history_kv_h2o_recent_fraction: float = 0.5,
         rid: Optional[str] = None,
+        already_rotated: bool = False,
     ) -> C2KVRepairExtractReqOutput:
-        """Run C2KV repair KV extraction via the scheduler."""
+        """Run C2KV repair KV extraction via the scheduler.
+
+        `already_rotated=False` (default): the model_prefill path stores K
+        pre-RoPE so the entry can be placed at any position at injection time
+        (needed for append_tail). The scheduler forces True for the
+        serving_cache source, whose K is read back already rotated.
+        """
         import uuid
 
         self.auto_create_handle_loop()
@@ -460,7 +467,14 @@ class TokenizerCommunicatorMixin:
             raw_kv_position_mode=raw_kv_position_mode,
             repair_mode=repair_mode,
             source_doc_index=source_doc_index,
-            already_rotated=(raw_kv_position_mode != "pre_rope"),
+            # D2: two orthogonal knobs collapse into the one wire field.
+            # `raw_kv_position_mode` is the STORAGE form ("pre_rope" is the
+            # only re-rotatable one); `already_rotated` is the caller's
+            # explicit request. An upstream client never passes the latter, so
+            # this reduces exactly to (raw_kv_position_mode != "pre_rope").
+            already_rotated=(
+                bool(already_rotated) or raw_kv_position_mode != "pre_rope"
+            ),
             extract_source=extract_source,
             history_kv_method=history_kv_method,
             history_kv_target_tokens=history_kv_target_tokens,

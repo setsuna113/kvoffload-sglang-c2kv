@@ -904,6 +904,14 @@ class Req(ReqDllmMixin):
         self.c2kv_round_idx = 0
         self.c2kv_round_start_len = 0       # KV length before the active round's real tokens
         self.c2kv_position_correction = 0  # running sum: original_seq_len - gist_len
+        # True once any gist KV has been injected into this request's cache.
+        # Drives --c2kv-query-proj: ordinary tokens forwarded after this point use
+        # the gist projections (training regime). Repair-only injections do not
+        # set it. See c2kv/c2kv_serving_semantics.md.
+        self.c2kv_gist_seen = False
+        # Per-request layout ledger (gist / repair injections with positions),
+        # returned to the client in metadata.sglang_runtime.c2kv_layout.
+        self.c2kv_layout = []
         self.c2kv_virtual_input_ids = None  # virtual token IDs including synthetic gist IDs
         self.c2kv_requeued = False              # True while waiting for next round
         self.c2kv_pinned_keys = None        # Unique C2KV keys pinned while rounds inject
@@ -914,7 +922,19 @@ class Req(ReqDllmMixin):
         self.history_kv_eviction_report_snapshot = None
         self.history_kv_selection_scores = None
         self.c2kv_persistent_active_input_ids = None
+        # Machine-readable reason for the last failed C2KV injection, so the
+        # abort surfaced to the client can say WHY (e.g.
+        # "C2KV_APPEND_TAIL_REQUIRES_PRE_ROPE: ..."). None when unset.
+        self.c2kv_injection_error = None
+        # Effective C2KV query-projection mode for this request and where it
+        # came from. Resolved in Scheduler.handle_generate_request:
+        #   c2kv_use_gist_projection True  -> effective mode "gist"
+        #                            False -> effective mode "base"
+        #   c2kv_query_proj_source   "message" if a chat message carried an
+        #                            explicit c2kv_use_gist_projection, else
+        #                            "flag" (ServerArgs.c2kv_query_proj).
         self.c2kv_use_gist_projection = False
+        self.c2kv_query_proj_source = "flag"
         self.c2kv_gist_projection_start_pos = 0
         self.kv_memory_report = None
 
@@ -2517,6 +2537,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             c2kv_corr = [
                 getattr(r, "c2kv_position_correction", 0) for r in self.reqs
             ]
+        # C2KV query-projection mask inputs. r.c2kv_use_gist_projection is
+        # already the EFFECTIVE mode resolved by the scheduler (explicit message
+        # field if present, otherwise ServerArgs.c2kv_query_proj).
         c2kv_use_gist_projection = None
         if any(getattr(r, "c2kv_use_gist_projection", False) for r in self.reqs):
             c2kv_use_gist_projection = [
@@ -2822,6 +2845,11 @@ class ModelWorkerBatch:
 
     # C2KV position corrections per request
     c2kv_position_corrections: Optional[List[int]] = None
+    # C2KV query projection (see ServerArgs.c2kv_query_proj): per request, the
+    # EFFECTIVE mode, plus the absolute position of the request's first C2KV
+    # segment -- gist or repair-only alike, under D7 (scheduler.py,
+    # _build_c2kv_prefill_rounds). The per-token mask is built from the pair in
+    # ForwardBatch.
     c2kv_use_gist_projection: Optional[List[bool]] = None
     c2kv_gist_projection_start_positions: Optional[List[int]] = None
     c2kv_history_kv_eviction_configs: Optional[List[Optional[Dict[str, Any]]]] = None

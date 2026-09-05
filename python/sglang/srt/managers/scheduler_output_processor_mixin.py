@@ -82,13 +82,19 @@ class SchedulerOutputProcessorMixin:
 
         return None
 
-    def _get_kv_runtime_stats(self: Scheduler) -> Optional[dict]:
-        """Return a real KV allocator residency snapshot for accounting."""
+    def _get_kv_runtime_stats(self: Scheduler, req=None) -> Optional[dict]:
+        """Return a real KV allocator residency snapshot for accounting.
+
+        When `req` is given, the request's C2KV layout ledger (gist / repair
+        injections with their RoPE positions) and the server's query-projection
+        mode are attached so the client can verify position-frame consistency
+        and record provenance. See c2kv/c2kv_serving_semantics.md.
+        """
 
         snapshot = self._get_physical_kv_snapshot()
         if snapshot is None:
             return None
-        return {
+        stats = {
             "kv_pool_size": snapshot["main_kv_pool_size"],
             "kv_available_tokens": snapshot["main_kv_available_slots"],
             "kv_resident_tokens": snapshot["physical_main_kv_slots"],
@@ -96,6 +102,110 @@ class SchedulerOutputProcessorMixin:
             "kv_page_size": snapshot["page_size_tokens"],
             **snapshot,
         }
+        server_args = getattr(self, "server_args", None)
+        if server_args is not None:
+            # D5: the tool-serialization mode decides the rendered prompt of
+            # /v1/chat/completions, /v1/c2kv/extract and the `messages` form of
+            # /v1/c2kv/repair_extract alike (http_server._c2kv_flat_tools,
+            # serving_chat._chat_template_tools), i.e. the token frame every
+            # client-computed insertion point and repair span is measured in.
+            # It is echoed whether or not C2KV is enabled so a client can check
+            # that the frame it assumed is the frame the server served.
+            stats["c2kv_tools_dump"] = getattr(server_args, "c2kv_tools_dump", "full")
+        c2kv_enabled = server_args is not None and bool(
+            getattr(server_args, "enable_c2kv", False)
+        )
+        if c2kv_enabled:
+            # D6 projection provenance: THREE keys, deliberately not merged.
+            #
+            #   c2kv_query_proj            the --c2kv-query-proj SERVER FLAG.
+            #                              Constant for the life of the run,
+            #                              exactly what serve-align echoed; the
+            #                              bench's mixed-regime check keys on
+            #                              it, so it must never vary with the
+            #                              request (turn 1 of a conversation
+            #                              carries no gisted history yet, and a
+            #                              per-request value here made a
+            #                              single-flag run self-report as
+            #                              mixing projection regimes).
+            #   c2kv_query_proj_effective  what THIS request actually ran:
+            #                              "gist" iff some token of it was
+            #                              projected with gist_{q,k,v}_proj.
+            #                              The per-request resolver in
+            #                              Scheduler.handle_generate_request
+            #                              runs inside `if
+            #                              recv_req.c2kv_segments:`, and a
+            #                              segment-less request builds no mask
+            #                              at all (schedule_batch.py
+            #                              get_model_worker_batch ->
+            #                              forward_batch_info.py), so it ran
+            #                              base whatever the flag says.
+            #   c2kv_query_proj_source     which rule chose the mode:
+            #                              "message" (an explicit request- or
+            #                              message-level
+            #                              c2kv_use_gist_projection),
+            #                              "flag" (--c2kv-query-proj), or
+            #                              "none" (no C2KV segments, so no
+            #                              projection decision was ever made
+            #                              for this request).
+            stats["c2kv_query_proj"] = getattr(server_args, "c2kv_query_proj", "base")
+            if req is not None and getattr(req, "c2kv_segments", None):
+                stats["c2kv_query_proj_effective"] = (
+                    "gist"
+                    if getattr(req, "c2kv_use_gist_projection", False)
+                    else "base"
+                )
+                stats["c2kv_query_proj_source"] = getattr(
+                    req, "c2kv_query_proj_source", "flag"
+                )
+            else:
+                stats["c2kv_query_proj_effective"] = "base"
+                stats["c2kv_query_proj_source"] = "none"
+            # The projection mask is rebuilt per forward from request state and
+            # is NOT part of CUDA/NPU graph capture: a replayed decode graph
+            # runs whatever mode was in force at capture time (base). Say
+            # whether the decode steps of this request could actually have run
+            # the mode reported above, so no downstream number is attributed to
+            # a decode regime that never ran. Keyed on the EFFECTIVE mode --
+            # the value this key has always been computed from -- not on the
+            # flag: a request that ran base has nothing for graph replay to
+            # lose. See c2kv/c2kv_serving_semantics.md section 1.
+            stats["c2kv_query_proj_decode_verified"] = not (
+                stats["c2kv_query_proj_effective"] == "gist"
+                and not bool(getattr(server_args, "disable_cuda_graph", False))
+            )
+        if req is not None:
+            layout = getattr(req, "c2kv_layout", None)
+            if layout:
+                stats["c2kv_layout"] = list(layout)
+                stats["c2kv_position_correction"] = int(
+                    getattr(req, "c2kv_position_correction", 0) or 0
+                )
+                stats["c2kv_gist_seen"] = bool(getattr(req, "c2kv_gist_seen", False))
+            elif c2kv_enabled:
+                # Positive "nothing was injected" signal. An absent key is
+                # ambiguous -- it also happens when the whole stats dict is
+                # dropped for a missing allocator, or on a build that predates
+                # the ledger -- so on a C2KV-enabled server the three ledger
+                # keys are always present and an empty list means "this request
+                # injected nothing" (a `full`-arm request, or turn 1 of a
+                # compression arm). Off a C2KV server the keys stay absent, so
+                # an upstream client sees exactly what it saw before.
+                stats["c2kv_layout"] = []
+                stats["c2kv_position_correction"] = 0
+                stats["c2kv_gist_seen"] = False
+            # Machine-readable reason the injection failed, when one did. The
+            # abort that carries it has no status_code (the FINISH_ABORT built
+            # in process_batch_result_prefill below), so the response is an
+            # HTTP 200 whose finish_reason.type is "abort"; this key, and
+            # ChatCompletionResponse.metadata.finish_message next to it, are
+            # the only places an OpenAI client can read WHY. Absent when the
+            # request injected without failing. See
+            # c2kv/c2kv_serving_semantics.md section 3.
+            injection_error = getattr(req, "c2kv_injection_error", None)
+            if injection_error:
+                stats["c2kv_injection_error"] = str(injection_error)
+        return stats
 
     def _bytes_per_kv_token(self: Scheduler) -> Optional[int]:
         try:
@@ -323,7 +433,31 @@ class SchedulerOutputProcessorMixin:
                                 )
                                 from sglang.srt.managers.schedule_batch import FINISH_ABORT as _FA
 
-                                req.to_finish = _FA("C2KV injection failed")
+                                # Machine-readable reason: every injection
+                                # failure path in Scheduler sets one through
+                                # _set_c2kv_injection_error, so this is a
+                                # C2KV_* code (C2KV_CACHE_MISS,
+                                # C2KV_APPEND_TAIL_REQUIRES_PRE_ROPE,
+                                # C2KV_ALLOC_FAILED, ...) rather than the bare
+                                # fallback. This is mid-prefill, so it stays an
+                                # abort finish reason with NO status_code
+                                # (HTTP 200, meta_info.finish_reason.message)
+                                # exactly as before -- unlike the
+                                # pre-scheduling admission errors, which go
+                                # through set_finish_with_abort and are a 400.
+                                # A /generate client reads the message off
+                                # meta_info.finish_reason; an OpenAI client
+                                # reads it off
+                                # metadata.sglang_runtime.c2kv_injection_error
+                                # (_get_kv_runtime_stats above) or
+                                # metadata.finish_message
+                                # (serving_chat._build_chat_response), because
+                                # the choice carries only
+                                # finish_reason["type"].
+                                req.to_finish = _FA(
+                                    getattr(req, "c2kv_injection_error", None)
+                                    or "C2KV injection failed"
+                                )
                                 req.check_finished()
                                 self._log_c2kv_token_usage(
                                     "inject_abort_release_before",
@@ -1319,7 +1453,7 @@ class SchedulerOutputProcessorMixin:
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
-                kv_runtime_stats.append(self._get_kv_runtime_stats())
+                kv_runtime_stats.append(self._get_kv_runtime_stats(req))
                 kv_memory_report = self._get_kv_memory_report(req)
                 if getattr(req, "history_kv_eviction_result", None) is not None:
                     logger.info(

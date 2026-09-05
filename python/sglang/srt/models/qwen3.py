@@ -66,7 +66,15 @@ if _use_aiter:
 if _is_npu:
     import torch_npu
 
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    try:
+        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+            split_qkv_rmsnorm_rope,
+        )
+    except ImportError:
+        # older triton-ascend without language.extra.cann: fall back to the
+        # native path (split + qk_norm + rope) for decode as well
+        # (compat 27f21a588, ported onto 22fbf3146)
+        split_qkv_rmsnorm_rope = None
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
@@ -177,6 +185,12 @@ class Qwen3Attention(nn.Module):
                 f"got {pic_param!r}."
             )
 
+        # Which of q/k/v ordinary tokens switch to the gist projections when the
+        # per-token C2KV mask selects them (empty = never = base). Derived from
+        # --c2kv-gist-param ALONE: --c2kv-query-proj is only the per-request
+        # DEFAULT of the mask (D1), so a request that explicitly asks for the
+        # gist projection must still find the parts wired up here.
+        self.c2kv_query_proj_parts = frozenset()
         if get_global_server_args().enable_c2kv:
             c2kv_proj_name = "residual_qkv_proj" if pic_enabled else "gist_qkv_proj"
             c2kv_proj = QKVParallelLinear(
@@ -191,6 +205,15 @@ class Qwen3Attention(nn.Module):
                 prefix=add_prefix(c2kv_proj_name, prefix),
             )
             setattr(self, c2kv_proj_name, c2kv_proj)
+            if not pic_enabled:
+                # PIC/residual_qkv_proj is excluded by construction: there is no
+                # gist_qkv_proj to switch to.
+                _gist_param = str(
+                    getattr(get_global_server_args(), "c2kv_gist_param", "qkv") or ""
+                ).lower()
+                self.c2kv_query_proj_parts = frozenset(
+                    part for part in "qkv" if part in _gist_param
+                )
             if pic_enabled:
                 # Loading a base Qwen3 checkpoint with PIC enabled must initially
                 # preserve its QKV projections exactly.
@@ -245,26 +268,52 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def _c2kv_project_qkv(self, hidden_states, forward_batch):
+        """QKV projection honouring --c2kv-query-proj.
+
+        Training (python/models/qwen3/modeling_qwen3.py:242-246, :673) projects
+        every token of the main forward with gist_{q,k,v}_proj whenever gist KV
+        sits in the cache; the system prefix is prefilled separately with the
+        base projections. `forward_batch.c2kv_use_gist_projection` is the
+        per-token mask built in ForwardBatch from the request's EFFECTIVE mode
+        (explicit message-level ``c2kv_use_gist_projection`` if the client sent
+        one, otherwise ``ServerArgs.c2kv_query_proj``) gated by the absolute
+        position of the request's first gist segment; those rows take the gist
+        projection for the parts listed in `c2kv_query_proj_parts` (derived from
+        --c2kv-gist-param). Everything else, including repair KV extraction
+        (`generate_raw_repair_kv`, forward_batch=None), stays base.
+        """
         qkv, _ = self.qkv_proj(hidden_states)
-        gist_mask = getattr(
-            getattr(self, "_active_forward_batch", None),
-            "c2kv_use_gist_projection",
-            None,
+        parts = self.c2kv_query_proj_parts
+        if not parts or not hasattr(self, "gist_qkv_proj"):
+            return qkv
+        if os.environ.get("C2KV_USE_GIST_QUERY_PROJECTION", "1") == "0":
+            return qkv
+        mask = (
+            getattr(forward_batch, "c2kv_use_gist_projection", None)
+            if forward_batch is not None
+            else None
         )
-        if (
-            gist_mask is not None
-            and os.environ.get("C2KV_USE_GIST_QUERY_PROJECTION", "1") != "0"
-            and bool(gist_mask.any().item())
-            and hasattr(self, "gist_qkv_proj")
-        ):
-            gist_qkv, _ = self.gist_qkv_proj(hidden_states)
-            if gist_mask.ndim != 1 or gist_mask.shape[0] != qkv.shape[0]:
-                raise RuntimeError(
-                    "c2kv_use_gist_projection mask shape mismatch: "
-                    f"{tuple(gist_mask.shape)} != {(qkv.shape[0],)}"
-                )
-            qkv = torch.where(gist_mask.to(qkv.device).view(-1, 1), gist_qkv, qkv)
+        if mask is None or not bool(mask.any().item()):
+            return qkv
+        if mask.ndim != 1 or mask.shape[0] != qkv.shape[0]:
+            raise RuntimeError(
+                "c2kv_use_gist_projection mask shape mismatch: "
+                f"{tuple(mask.shape)} != {(qkv.shape[0],)}"
+            )
+        qkv_gist, _ = self.gist_qkv_proj(hidden_states)
+        sizes = [self.q_size, self.kv_size, self.kv_size]
+        base_parts = qkv.split(sizes, dim=-1)
+        gist_parts = qkv_gist.split(sizes, dim=-1)
+        sel = mask.to(qkv.device).view(-1, 1)
+        merged = [
+            torch.where(sel, gist_t, base_t) if name in parts else base_t
+            for name, base_t, gist_t in zip("qkv", base_parts, gist_parts)
+        ]
+        return torch.cat(merged, dim=-1)
+
+    def forward_prepare_native(self, positions, hidden_states, forward_batch=None):
+        qkv = self._c2kv_project_qkv(hidden_states, forward_batch)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
             q=q,
@@ -373,7 +422,13 @@ class Qwen3Attention(nn.Module):
             entry["layers"].append(layer_score.detach().cpu())
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
-        qkv, _ = self.qkv_proj(hidden_states)
+        if split_qkv_rmsnorm_rope is None:
+            # compat fallback (27f21a588 port): repair_extract calls this
+            # path directly, bypassing the forward dispatch guard
+            return self.forward_prepare_native(
+                positions, hidden_states, forward_batch=forward_batch
+            )
+        qkv = self._c2kv_project_qkv(hidden_states, forward_batch)
 
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -480,16 +535,14 @@ class Qwen3Attention(nn.Module):
             getattr(forward_batch, "c2kv_use_gist_projection", None) is not None
             or
             not _is_npu
+            or split_qkv_rmsnorm_rope is None
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         ):
-            self._active_forward_batch = forward_batch
-            try:
-                q, k, v = self.forward_prepare_native(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                )
-            finally:
-                self._active_forward_batch = None
+            q, k, v = self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
         else:
             q, k, v = self.forward_prepare_npu(
                 positions=positions,
@@ -1326,11 +1379,25 @@ class Qwen3ForCausalLM(nn.Module):
     ):
         """Run a correctness-first full prefill and capture raw repair KV.
 
-        This is used by the C2KV repair endpoints. It intentionally captures
-        ordinary self-attention K/V, not gist/PIC K/V. In ``rotated`` mode the
-        returned K already carries native Full-prompt RoPE. In ``pre_rope`` mode
-        the returned K is captured after base QKV + QK norm but before RoPE; the
-        caller supplies the position IDs that will be used when it is injected.
+        Used by the C2KV repair endpoints. It intentionally captures ordinary
+        self-attention K/V with the frozen base projections, not gist/PIC K/V
+        (paper 2607.17715 section 3.3.2, original-token invariance: raw KV must
+        be what the base model computes in this exact context). The forward runs
+        at ``position_offset + i`` so the attention output, and therefore every
+        later layer's K/V, is the full-context one.
+
+        ``raw_kv_position_mode`` selects the STORED form of K, independently of
+        where the entry is later placed:
+
+        * ``rotated``  - K carries native Full-prompt RoPE (already_rotated=True)
+          and can only be re-injected at its original absolute positions.
+        * ``pre_rope`` - K is captured after base QKV + QK norm but before RoPE
+          (already_rotated=False); injection applies RoPE exactly once, either at
+          the recorded positions (in_place / append_keep_ledger) or at a fresh
+          tail position (append_tail, which requires this mode).
+
+        ``repair_position_ids`` records the positions to store with the entry.
+        See c2kv/c2kv_serving_semantics.md.
         """
 
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -1383,27 +1450,38 @@ class Qwen3ForCausalLM(nn.Module):
         for layer in self.model.layers:
             residual = hidden_states
             attn_input = layer.input_layernorm(hidden_states)
-            qkv, _ = layer.self_attn.qkv_proj(attn_input)
-            q, k_pre, v = qkv.split(
-                [layer.self_attn.q_size, layer.self_attn.kv_size, layer.self_attn.kv_size],
-                dim=-1,
-            )
-            q, k_pre = apply_qk_norm(
+            # Normal SGLang prefill/extend on Ascend takes the native
+            # QK-norm/RoPE preparation path before entering the Ascend
+            # attention backend.  Repair KV must be captured from that same
+            # Full-prefill path; using the decode-oriented NPU fused prepare
+            # changes the raw K/V slightly and breaks raw-all replacement
+            # equivalence on sensitive BFCL trajectories.
+            # Same ops as forward_prepare_native (qkv_proj -> qk_norm -> rope),
+            # split so the span's K can be captured pre-RoPE. Base projections
+            # only (self.qkv_proj, never gist_qkv_proj): paper 3.3.2
+            # original-token invariance.
+            attn = layer.self_attn
+            qkv, _ = attn.qkv_proj(attn_input)
+            q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+            q, k = apply_qk_norm(
                 q=q,
-                k=k_pre,
-                q_norm=layer.self_attn.q_norm,
-                k_norm=layer.self_attn.k_norm,
-                head_dim=layer.self_attn.head_dim,
-                alt_stream=layer.self_attn.alt_stream,
+                k=k,
+                q_norm=attn.q_norm,
+                k_norm=attn.k_norm,
+                head_dim=attn.head_dim,
+                alt_stream=attn.alt_stream,
             )
-            q, k = layer.self_attn.rotary_emb(positions, q, k_pre)
-            repair_k = k_pre if raw_kv_position_mode == "pre_rope" else k
-            raw_key_values.append(
-                (
-                    repair_k[span_start:span_end].contiguous().clone(),
-                    v[span_start:span_end].contiguous().clone(),
-                )
+            # Clone BEFORE rope: rotary_emb may rotate k in place, so a pre_rope
+            # capture taken after the call would silently be rotated.
+            k_pre_rope = k[span_start:span_end].contiguous().clone()
+            v_span = v[span_start:span_end].contiguous().clone()
+            q, k = attn.rotary_emb(positions, q, k)
+            repair_k_span = (
+                k_pre_rope
+                if raw_kv_position_mode == "pre_rope"
+                else k[span_start:span_end].contiguous().clone()
             )
+            raw_key_values.append((repair_k_span, v_span))
 
             q = q.view(1, seq_len, layer.self_attn.num_heads, layer.self_attn.head_dim)
             k_attn = k.view(

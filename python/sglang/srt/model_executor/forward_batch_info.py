@@ -430,6 +430,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For C2KV extraction
     c2kv_position_corrections: Optional[torch.Tensor] = None  # (batch_size,) int64
+    # C2KV query-projection mask (see ServerArgs.c2kv_query_proj): per token,
+    # True when the token comes at or after the first injected gist KV of its
+    # request and must be projected with gist_{q,k,v}_proj instead of the base
+    # projection.
     c2kv_use_gist_projection: Optional[torch.Tensor] = None  # (num_tokens,) bool
     c2kv_gist_projection_start_positions: Optional[torch.Tensor] = None
     c2kv_history_kv_eviction_configs: Optional[List[Optional[Dict[str, Any]]]] = None
@@ -607,6 +611,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 per_token_corr = torch.repeat_interleave(corr, ext_lens)
                 ret.positions = ret.positions + per_token_corr
 
+        # C2KV query-projection mask (see ServerArgs.c2kv_query_proj). The
+        # per-request flag is already the EFFECTIVE mode (explicit message field
+        # if the client sent one, otherwise the server flag); the start position
+        # keeps the pre-gist prologue on the base projection.
         if batch.c2kv_use_gist_projection is not None:
             req_flags = torch.tensor(
                 batch.c2kv_use_gist_projection, dtype=torch.bool, device=device
@@ -630,7 +638,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.c2kv_use_gist_projection = token_flags & (
                     ret.positions.reshape(-1).to(dtype=torch.int64) >= token_starts
                 )
-
 
         # ---------------------------------------------------------
         # C2KV runtime position debug
