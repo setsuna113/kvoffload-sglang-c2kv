@@ -31,6 +31,8 @@ import sys
 import urllib.error
 import urllib.request
 
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 SYSTEM = "You are a helpful assistant."
 TOOLS = [
     {
@@ -68,7 +70,7 @@ def post(base_url: str, path: str, payload: dict, timeout: int = 600) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with OPENER.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -91,7 +93,7 @@ def post_allow_error(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with OPENER.open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
             status = resp.status
     except urllib.error.HTTPError as exc:
