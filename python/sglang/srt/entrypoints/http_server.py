@@ -1725,7 +1725,13 @@ async def v1_c2kv_repair_extract(
                 )
             )
             position_offset = 0
-            if cacheblend_cfg is not None and not cacheblend_cfg.get("chunk_bounds"):
+            if (
+                cacheblend_cfg is not None
+                and not cacheblend_cfg.get("chunk_bounds")
+                and not cacheblend_cfg.get("chunk_tokens")
+            ):
+                # one chunk per message; an explicit grid (chunk_tokens) or
+                # explicit bounds win over the message boundaries
                 cacheblend_cfg["chunk_bounds"] = chunk_bounds
             # a multi-message span is only ever re-placed at its own positions
             raw_kv_position_mode = "rotated"
