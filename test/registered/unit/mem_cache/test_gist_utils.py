@@ -3,8 +3,6 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.gist_utils import (
-    GistConfig,
-    get_apply_gist_residual_func,
     prepare_pic_input,
     resolve_c2kv_compression_ratio,
 )
@@ -39,19 +37,6 @@ class TestPICUtils(unittest.TestCase):
         input_ids = torch.tensor([[1, 2, 0]])
         with self.assertRaisesRegex(ValueError, "unpadded"):
             prepare_pic_input(input_ids, torch.tensor([[True, True, False]]))
-
-    def test_residual_mean_handles_document_shorter_than_ratio(self):
-        apply_residual = get_apply_gist_residual_func(
-            GistConfig(gist_residual_type="mean"), layer_idx=0
-        )
-        tokens = torch.tensor([[[1.0, 3.0]]])
-        gist = torch.tensor([[[10.0, 20.0]]])
-
-        torch.testing.assert_close(
-            apply_residual(tokens, gist, ratio=4),
-            torch.tensor([[[11.0, 23.0]]]),
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

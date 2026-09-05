@@ -72,7 +72,8 @@ def get_prepare_gist_input_func(gist_cfg: GistConfig) -> Callable:
 
     Attention mask layout (True = attend):
         input tokens see each other causally; cannot see gist tokens.
-        gist tokens attend all input tokens; see each other causally.
+        gist tokens attend their own input chunk plus the first-ratio sink;
+        they see gist tokens causally.
 
     Each gist token attends to its own chunk plus `gist_overlap` preceding
     tokens (clamped to 0), i.e. [max(j*ratio - gist_overlap, 0), (j+1)*ratio).
@@ -182,14 +183,9 @@ def _apply_gist_residual_interleave(
     batch_size, seq_length, hidden_size = tokens_tensor.shape
     pad_length = seq_length % ratio
     nopad_length = seq_length - pad_length
-    if nopad_length:
-        mean_tensor = tokens_tensor[:, :nopad_length].reshape(
-            batch_size, nopad_length // ratio, ratio, hidden_size
-        ).mean(dim=2)
-    else:
-        # ``reshape(batch, -1, ratio, hidden)`` cannot infer the empty chunk
-        # dimension when the document is shorter than one compression block.
-        mean_tensor = tokens_tensor.new_empty((batch_size, 0, hidden_size))
+    mean_tensor = tokens_tensor[:, :nopad_length].reshape(
+        batch_size, -1, ratio, hidden_size
+    ).mean(dim=2)
     if pad_length != 0:
         pad_mean = tokens_tensor[:, nopad_length:].mean(dim=1, keepdim=True)
         mean_tensor = torch.cat([mean_tensor, pad_mean], dim=1)
