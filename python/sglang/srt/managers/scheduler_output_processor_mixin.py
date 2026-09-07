@@ -161,11 +161,14 @@ class SchedulerOutputProcessorMixin:
             else:
                 stats["c2kv_query_proj_effective"] = "base"
                 stats["c2kv_query_proj_source"] = "none"
-            # Graph captures do not own the dynamic projection mask. All graph
-            # runners therefore reject a batch whose effective mode needs that
-            # mask and let it run eagerly. This makes the reported mode valid
-            # for decode as well as prefill.
-            graph_eligible = stats["c2kv_query_proj_effective"] != "gist"
+            # CUDA and NPU full-graph runners own a dynamic projection-mask
+            # buffer. CPU and piecewise runners still fall back to eager for a
+            # request that uses the gist projection.
+            device = str(getattr(server_args, "device", "")).lower()
+            graph_eligible = (
+                stats["c2kv_query_proj_effective"] != "gist"
+                or device in {"cuda", "npu"}
+            )
             stats["c2kv_query_proj_graph_eligible"] = graph_eligible
             stats["c2kv_query_proj_decode_verified"] = True
         if req is not None:

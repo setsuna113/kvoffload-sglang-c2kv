@@ -147,15 +147,8 @@ def test_any_projection_mask_forces_eager_execution():
     )
 
 
-@pytest.mark.parametrize(
-    "runner",
-    [
-        "cuda_graph_runner.py",
-        "cpu_graph_runner.py",
-        "piecewise_cuda_graph_runner.py",
-    ],
-)
-def test_every_graph_runner_applies_the_c2kv_compatibility_gate(runner):
+@pytest.mark.parametrize("runner", ["cpu_graph_runner.py", "piecewise_cuda_graph_runner.py"])
+def test_graph_runners_without_projection_buffers_apply_the_compatibility_gate(runner):
     path = os.path.normpath(
         os.path.join(
             _HERE,
@@ -172,3 +165,23 @@ def test_every_graph_runner_applies_the_c2kv_compatibility_gate(runner):
     with open(path, encoding="utf-8") as source_file:
         source = source_file.read()
     assert "if not is_c2kv_graph_compatible(forward_batch):" in source
+
+
+def test_full_cuda_graph_runner_owns_the_dynamic_projection_mask():
+    path = os.path.normpath(
+        os.path.join(
+            _HERE,
+            "..",
+            "..",
+            "..",
+            "python",
+            "sglang",
+            "srt",
+            "model_executor",
+            "cuda_graph_runner.py",
+        )
+    )
+    with open(path, encoding="utf-8") as source_file:
+        source = source_file.read()
+    assert "def update_c2kv_gist_projection_mask(" in source
+    assert "if not is_c2kv_graph_compatible(forward_batch):" not in source

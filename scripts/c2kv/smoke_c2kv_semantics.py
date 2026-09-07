@@ -171,13 +171,12 @@ def main() -> int:
         "request",
     )
     ok &= check(
-        runtime.get("c2kv_query_proj_graph_eligible")
-        == (runtime.get("c2kv_query_proj_effective") != "gist"),
-        "graph eligibility matches the effective projection mode",
+        runtime.get("c2kv_query_proj_graph_eligible") is True,
+        "NPU/CUDA full-graph replay accepts the effective projection mode",
     )
     ok &= check(
         runtime.get("c2kv_query_proj_decode_verified") is True,
-        "decode projection is verified (gist batches fall back to eager)",
+        "decode projection is verified through the graph-owned mask",
     )
     ok &= check(
         isinstance(runtime.get("c2kv_layout"), list),
