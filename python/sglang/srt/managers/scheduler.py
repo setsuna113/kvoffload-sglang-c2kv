@@ -2625,6 +2625,7 @@ class Scheduler(
                 selected_relative_indices=repair_metadata.get(
                     "selected_relative_indices"
                 ),
+                history_selection_metadata=repair_metadata.get("history_selection_metadata"),
                 already_rotated=bool(existing.already_rotated),
                 kv_reuse_method=kv_reuse_method,
                 cacheblend=cached_cacheblend,
@@ -2837,6 +2838,7 @@ class Scheduler(
                 repair_mode=recv_req.repair_mode,
                 source_doc_index=recv_req.source_doc_index,
                 repair_metadata={
+                    "history_selection_metadata": dict(history_meta) if isinstance(history_meta, dict) else None,
                     "selected_relative_indices": (
                         list(history_meta.get("selected_relative_indices") or [])
                         if isinstance(history_meta, dict)
@@ -2921,28 +2923,20 @@ class Scheduler(
             ),
             kv_reuse_method=kv_reuse_method,
             cacheblend=cacheblend_meta,
+            history_selection_metadata=history_meta if isinstance(history_meta, dict) else None,
         )
 
     def _init_c2kv_kv_memory_report(self, req: "Req", hint) -> None:
+        from sglang.srt.managers.c2kv_kv_accounting import (
+            initialize_c2kv_kv_memory_report,
+        )
+
         if not isinstance(hint, dict):
             hint = {}
-        report = dict(hint)
+        report = initialize_c2kv_kv_memory_report(hint)
         history_eviction = hint.get("history_kv_eviction")
         if isinstance(history_eviction, dict):
             req.history_kv_eviction = dict(history_eviction)
-        for key in (
-            "full_equivalent_history_tokens",
-            "active_history_kv_tokens",
-            "active_c2kv_gist_tokens",
-            "active_raw_repair_tokens",
-            "active_recomputed_raw_tokens",
-            "active_full_raw_tokens",
-        ):
-            try:
-                report[key] = int(report.get(key) or 0)
-            except Exception:
-                report[key] = 0
-        report["source"] = "sglang_c2kv_runtime_injection"
         req.c2kv_kv_memory_hint = dict(hint)
         req.kv_memory_report = report
 
@@ -3084,6 +3078,9 @@ class Scheduler(
                 )
                 report["active_history_kv_tokens"] = result.kept_history_tokens
                 report["active_full_raw_tokens"] = result.kept_history_tokens
+                report["active_history_kv_tokens_source"] = (
+                    "physical_eviction_measured"
+                )
                 report["history_kv_runtime_status"] = runtime_status
                 report["physical_slots_freed"] = result.freed_physical_slots
                 report["logical_total_len"] = result.next_rope_position_after
@@ -3291,35 +3288,19 @@ class Scheduler(
         tokens: int,
         original_tokens: int = 0,
     ) -> None:
+        from sglang.srt.managers.c2kv_kv_accounting import (
+            add_c2kv_kv_memory_tokens,
+        )
+
         report = getattr(req, "kv_memory_report", None)
         if not isinstance(report, dict):
             return
-        tokens = max(0, int(tokens or 0))
-        original_tokens = max(0, int(original_tokens or 0))
-        report["active_history_kv_tokens"] = (
-            int(report.get("active_history_kv_tokens") or 0) + tokens
+        add_c2kv_kv_memory_tokens(
+            report,
+            kind=kind,
+            tokens=tokens,
+            original_tokens=original_tokens,
         )
-        if original_tokens and not report.get("full_equivalent_history_tokens"):
-            report["full_equivalent_history_tokens"] = (
-                int(report.get("full_equivalent_history_tokens") or 0)
-                + original_tokens
-            )
-        if kind == "gist":
-            report["active_c2kv_gist_tokens"] = (
-                int(report.get("active_c2kv_gist_tokens") or 0) + tokens
-            )
-        elif kind == "repair":
-            report["active_raw_repair_tokens"] = (
-                int(report.get("active_raw_repair_tokens") or 0) + tokens
-            )
-        elif kind == "recomputed":
-            report["active_recomputed_raw_tokens"] = (
-                int(report.get("active_recomputed_raw_tokens") or 0) + tokens
-            )
-        elif kind == "full":
-            report["active_full_raw_tokens"] = (
-                int(report.get("active_full_raw_tokens") or 0) + tokens
-            )
 
     def _build_c2kv_prefill_rounds(self, req: "Req") -> Optional[str]:
         if not req.c2kv_segments:

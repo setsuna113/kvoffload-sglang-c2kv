@@ -1650,6 +1650,7 @@ class C2KVRepairExtractResponse(BaseModel):
     requested_span_tokens: int = 0
     selected_token_count: int = 0
     selected_relative_indices: Optional[List[int]] = None
+    history_selection_metadata: Optional[Dict[str, Any]] = None
     # CacheBlend echo: the method actually applied and its accounting
     # (chunk_count, chunk_bounds, recomputed_tokens,
     # recomputed_relative_indices, effective_recomp_ratio, config).

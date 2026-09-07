@@ -2138,6 +2138,7 @@ class C2KVRepairExtractReqOutput(BaseReq):
     requested_span_tokens: int = 0
     selected_token_count: int = 0
     selected_relative_indices: Optional[List[int]] = None
+    history_selection_metadata: Optional[Dict[str, Any]] = None
     # CacheBlend accounting (kv_reuse_method == "cacheblend"): chunk_count,
     # chunk_bounds, recomputed_tokens, recomputed_relative_indices,
     # effective_recomp_ratio, deviation stats, config echo.

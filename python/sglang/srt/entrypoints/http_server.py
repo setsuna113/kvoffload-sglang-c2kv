@@ -1836,6 +1836,7 @@ async def v1_c2kv_repair_extract(
             requested_span_tokens=result.requested_span_tokens,
             selected_token_count=result.selected_token_count,
             selected_relative_indices=result.selected_relative_indices,
+            history_selection_metadata=getattr(result, "history_selection_metadata", None),
             kv_reuse_method=getattr(result, "kv_reuse_method", None),
             cacheblend=getattr(result, "cacheblend", None),
             already_rotated=bool(getattr(result, "already_rotated", False)),
