@@ -582,6 +582,9 @@ class ServerArgs:
     # Lowercase qkv checkpoints from the paper/reference path use base query
     # projections. "gist" remains an explicit local-fork A/B extension.
     c2kv_query_proj: str = "base"
+    # Decoder-layer output exposed as event-native prompt_last. Negative values
+    # use Python indexing; None leaves intermediate capture disabled.
+    c2kv_shadow_feature_layer: Optional[int] = None
     # How tool schemas are serialized into the chat template. "full" =
     # `model_dump()`, i.e. pydantic defaults such as `"strict": false` are
     # emitted (+4 tokens per tool with the Qwen3 template); this is what every
@@ -784,6 +787,14 @@ class ServerArgs:
             raise ValueError("--c2kv-max-tokens must be greater than 0.")
         if self.c2kv_query_proj not in ("base", "gist"):
             raise ValueError("--c2kv-query-proj must be 'base' or 'gist'.")
+        if (
+            self.c2kv_shadow_feature_layer is not None
+            and not self.enable_return_hidden_states
+        ):
+            raise ValueError(
+                "--c2kv-shadow-feature-layer requires "
+                "--enable-return-hidden-states."
+            )
         from sglang.srt.mem_cache.c2kv_semantics import validate_gist_param
 
         self.c2kv_gist_param = validate_gist_param(self.c2kv_gist_param)
@@ -5288,6 +5299,15 @@ class ServerArgs:
             "default; 'gist' is an explicit local-fork A/B mode. Tokens before "
             "the first C2KV segment always use base. See "
             "c2kv/c2kv_serving_semantics.md.",
+        )
+        parser.add_argument(
+            "--c2kv-shadow-feature-layer",
+            type=int,
+            default=ServerArgs.c2kv_shadow_feature_layer,
+            help=(
+                "Decoder-layer output returned as the event-native prompt_last "
+                "shadow feature. Negative values use Python layer indexing."
+            ),
         )
         parser.add_argument(
             "--c2kv-tools-dump",

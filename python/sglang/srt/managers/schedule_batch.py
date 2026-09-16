@@ -594,6 +594,7 @@ class Req(ReqDllmMixin):
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
+        c2kv_prompt_last_hidden_only: bool = False,
         return_routed_experts: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -673,6 +674,7 @@ class Req(ReqDllmMixin):
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        self.c2kv_prompt_last_hidden_only = c2kv_prompt_last_hidden_only
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -2640,17 +2642,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             hicache_consumer_index=self.hicache_consumer_index,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL
-                if self.return_hidden_states
-                else (
-                    getattr(
-                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-                    )
-                    if self.spec_info
-                    else CaptureHiddenMode.NULL
-                )
-            ),
+            capture_hidden_mode=self.get_capture_hidden_mode(),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
@@ -2669,6 +2661,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             c2kv_history_kv_eviction_configs=c2kv_history_kv_eviction_configs,
         )
 
+    def get_capture_hidden_mode(self) -> CaptureHiddenMode:
+        """Return the mode passed from this scheduler batch to the model worker."""
+        if self.return_hidden_states:
+            if self.reqs and all(
+                getattr(req, "c2kv_prompt_last_hidden_only", False)
+                for req in self.reqs
+            ):
+                return (
+                    CaptureHiddenMode.LAST
+                    if self.forward_mode.is_extend()
+                    else CaptureHiddenMode.NULL
+                )
+            return CaptureHiddenMode.FULL
+
+        if self.spec_info:
+            return getattr(
+                self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+            )
+        return CaptureHiddenMode.NULL
+
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
         # Shallow-copy the reqs list so that in-place mutations (filter_batch,
@@ -2681,6 +2693,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
+            return_hidden_states=self.return_hidden_states,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             global_num_tokens=self.global_num_tokens,
