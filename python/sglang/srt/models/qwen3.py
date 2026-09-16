@@ -212,7 +212,11 @@ class Qwen3Attention(nn.Module):
                 self.total_num_heads,
                 self.total_num_kv_heads,
                 bias=attention_bias,
-                quant_config=quant_config,
+                # C1000 was trained with FP32 gist parameters.  Keep the
+                # checkpoint values in FP32 and cast only for the base model's
+                # mixed-precision compute, matching the native HF runtime.
+                params_dtype=(torch.float32 if not pic_enabled else None),
+                quant_config=(None if not pic_enabled else quant_config),
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
                 prefix=add_prefix(c2kv_proj_name, prefix),
@@ -314,7 +318,7 @@ class Qwen3Attention(nn.Module):
                 "c2kv_use_gist_projection mask shape mismatch: "
                 f"{tuple(mask.shape)} != {(qkv.shape[0],)}"
             )
-        qkv_gist, _ = self.gist_qkv_proj(hidden_states)
+        qkv_gist, _ = self._c2kv_project_gist_qkv(hidden_states)
         sizes = [self.q_size, self.kv_size, self.kv_size]
         base_parts = qkv.split(sizes, dim=-1)
         gist_parts = qkv_gist.split(sizes, dim=-1)
@@ -324,6 +328,18 @@ class Qwen3Attention(nn.Module):
             for name, base_t, gist_t in zip("qkv", base_parts, gist_parts)
         ]
         return torch.cat(merged, dim=-1)
+
+    def _c2kv_project_gist_qkv(self, hidden_states):
+        """Apply FP32-stored gist weights in the base compute dtype."""
+
+        projection = self.gist_qkv_proj
+        if projection.weight.dtype == hidden_states.dtype:
+            return projection(hidden_states)
+        with torch.autocast(
+            device_type=hidden_states.device.type,
+            dtype=hidden_states.dtype,
+        ):
+            return projection(hidden_states)
 
     def forward_prepare_native(self, positions, hidden_states, forward_batch=None):
         qkv = self._c2kv_project_qkv(hidden_states, forward_batch)
@@ -818,7 +834,7 @@ class Qwen3Attention(nn.Module):
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
 
-        qkv_gist, _ = self.gist_qkv_proj(gist_hidden)
+        qkv_gist, _ = self._c2kv_project_gist_qkv(gist_hidden)
         q_gist, k_gist, v_gist = qkv_gist.split(
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
@@ -1140,7 +1156,9 @@ class Qwen3Model(Qwen2Model):
             attention_bias=getattr(config, "attention_bias", False),
         )
         self.gist_embed_tokens = nn.Embedding(
-            gist_cfg.gist_extra_embed_num, config.hidden_size
+            gist_cfg.gist_extra_embed_num,
+            config.hidden_size,
+            dtype=torch.float32,
         )
         self.prepare_gist_input = get_prepare_gist_input_func(gist_cfg)
         return gist_cfg
@@ -1215,6 +1233,28 @@ class Qwen3ForCausalLM(nn.Module):
                 )
             else:
                 self.gist_cfg = self.model._init_c2kv(config, _server_args)
+            shadow_layer = getattr(_server_args, "c2kv_shadow_feature_layer", None)
+            if shadow_layer is not None:
+                num_layers = int(config.num_hidden_layers)
+                normalized_layer = (
+                    shadow_layer if shadow_layer >= 0 else num_layers + shadow_layer
+                )
+                # The fused residual path exposes the complete output of layer L
+                # immediately before layer L+1. D3 requests -2, which therefore
+                # maps to the final layer's input capture point.
+                if not 0 <= normalized_layer < num_layers - 1:
+                    raise ValueError(
+                        "--c2kv-shadow-feature-layer must resolve before the final "
+                        f"decoder layer; got {shadow_layer} for {num_layers} layers"
+                    )
+                if not self.pp_group.is_last_rank:
+                    raise ValueError(
+                        "C2KV native shadow feature capture does not support "
+                        "pipeline parallel serving"
+                    )
+                self.capture_aux_hidden_states = True
+                self.model.layers_to_capture = [normalized_layer + 1]
+                self.c2kv_shadow_feature_layer = normalized_layer
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
@@ -1320,6 +1360,22 @@ class Qwen3ForCausalLM(nn.Module):
             gist_mask:       (1, gist_len) bool
             gist_position_ids: (1, gist_len) int64
         """
+        autocast_active = bool(kwargs.pop("_c2kv_fp32_autocast_active", False))
+        base_dtype = self.model.embed_tokens.weight.dtype
+        gist_dtype = self.model.gist_embed_tokens.weight.dtype
+        if gist_dtype != base_dtype and not autocast_active:
+            with torch.autocast(
+                device_type=input_ids.device.type,
+                dtype=base_dtype,
+            ):
+                return self.generate_gist(
+                    input_ids,
+                    attention_mask,
+                    ratio=ratio,
+                    _c2kv_fp32_autocast_active=True,
+                    **kwargs,
+                )
+
         block_mask, gist_mask, position_ids = self.model.prepare_gist_input(
             input_ids, attention_mask, ratio=ratio
         )
@@ -1328,7 +1384,7 @@ class Qwen3ForCausalLM(nn.Module):
 
         gist_embed = self.model.gist_embed_tokens(
             torch.zeros((1, gist_len), dtype=torch.long, device=device)
-        )
+        ).to(dtype=self.model.embed_tokens.weight.dtype)
         inputs_embeds = torch.cat(
             [self.model.embed_tokens(input_ids), gist_embed], dim=1
         )

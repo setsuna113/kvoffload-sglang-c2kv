@@ -1907,6 +1907,7 @@ class Scheduler(
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
+                c2kv_prompt_last_hidden_only=recv_req.c2kv_prompt_last_hidden_only,
                 return_routed_experts=recv_req.return_routed_experts,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -2254,6 +2255,17 @@ class Scheduler(
                 key_hash=key_hash,
                 gist_len=existing.gist_len,
                 original_seq_len=existing.original_seq_len,
+                cache_hit=True,
+            )
+
+        if not recv_req.allow_cache_miss:
+            return C2KVExtractReqOutput(
+                key_hash=key_hash,
+                error=(
+                    "C2KV_EXTRACTION_BUDGET_EXHAUSTED: the exact chunk is not "
+                    "cached and this request may not schedule another encoder pass"
+                ),
+                success=False,
             )
 
         expected_gist_len = (

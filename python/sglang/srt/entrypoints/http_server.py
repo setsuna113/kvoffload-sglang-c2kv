@@ -81,6 +81,7 @@ from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.protocol import (
     C2KVExtractRequest,
     C2KVExtractResponse,
+    C2KVNativePackedGenerateRequest,
     C2KVRepairExtractRequest,
     C2KVRepairExtractResponse,
     ChatCompletionRequest,
@@ -115,6 +116,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
+    C2KVSegmentInfo,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -149,6 +151,15 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
+)
+from sglang.srt.mem_cache.c2kv_native_packed import (
+    NATIVE_PACKED_CAPABILITY_SCHEMA,
+    NATIVE_PACKED_RESPONSE_SCHEMA,
+    PACKING_VERSION as C2KV_NATIVE_PACKING_VERSION,
+    RAW_LAYOUT_PROFILE as C2KV_NATIVE_RAW_LAYOUT_PROFILE,
+    canonical_model_binding,
+    float16_roundtrip,
+    plan_native_packed_request,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -581,6 +592,7 @@ async def model_info():
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "c2kv_native_packed": _c2kv_native_capability(),
         # "hf_config": model_config.hf_config.to_dict(),
     }
     return result
@@ -697,6 +709,358 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+
+
+def _c2kv_dtype_nbytes(dtype_name: str) -> int:
+    normalized = str(dtype_name).replace("torch.", "").lower()
+    if normalized in {"float64", "int64"}:
+        return 8
+    if normalized in {"float32", "int32"}:
+        return 4
+    if normalized in {"float16", "bfloat16", "int16"}:
+        return 2
+    if normalized in {
+        "float8_e4m3fn",
+        "float8_e5m2",
+        "fp8_e4m3",
+        "fp8_e5m2",
+        "int8",
+        "uint8",
+    }:
+        return 1
+    raise ValueError(f"Unsupported C2KV KV dtype for accounting: {dtype_name!r}")
+
+
+def _c2kv_native_capability() -> Dict[str, Any]:
+    tokenizer_manager = _global_state.tokenizer_manager
+    server_args = tokenizer_manager.server_args
+    model_config = tokenizer_manager.model_config
+    hf_config = getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", None
+    )
+    dtype_name = str(getattr(model_config, "dtype", server_args.dtype)).replace(
+        "torch.", ""
+    )
+    configured_kv_dtype = str(getattr(server_args, "kv_cache_dtype", "auto"))
+    effective_kv_dtype = (
+        dtype_name if configured_kv_dtype in {"", "auto", "None"} else configured_kv_dtype
+    )
+    shadow_layer = getattr(server_args, "c2kv_shadow_feature_layer", None)
+    num_layers = int(getattr(model_config, "num_hidden_layers", 0))
+    normalized_shadow_layer = None
+    if shadow_layer is not None:
+        normalized_shadow_layer = (
+            int(shadow_layer) if int(shadow_layer) >= 0 else num_layers + int(shadow_layer)
+        )
+    model_binding = canonical_model_binding(
+        model_path=tokenizer_manager.model_path,
+        tokenizer_path=getattr(server_args, "tokenizer_path", None),
+        weight_version=getattr(server_args, "weight_version", None),
+        dtype=dtype_name,
+        kv_cache_dtype=effective_kv_dtype,
+        gist_parameter_dtype="float32",
+        gist_compute_dtype=dtype_name,
+        gist_type=getattr(server_args, "c2kv_gist_type", "dynamic-interleave"),
+        gist_param=getattr(server_args, "c2kv_gist_param", "qkv"),
+        gist_extra_embed_num=getattr(hf_config, "gist_extra_embed_num", 1),
+        gist_residual_type=getattr(hf_config, "gist_residual_type", "none"),
+        gist_overlap=getattr(hf_config, "gist_overlap", 0),
+        pic_enabled=bool(getattr(hf_config, "pic_enabled", False)),
+        pic_param=getattr(hf_config, "pic_param", "qkv"),
+        # The event-native endpoint always selects the frozen C1000 base-query
+        # path independently of the generic chat endpoint's server default.
+        query_projection="base",
+    )
+    num_kv_heads = int(getattr(model_config, "num_key_value_heads", 0))
+    head_dim = int(getattr(model_config, "head_dim", 0))
+    value_head_dim = int(getattr(model_config, "v_head_dim", head_dim))
+    kv_bytes_per_token = (
+        num_layers
+        * num_kv_heads
+        * (head_dim + value_head_dim)
+        * _c2kv_dtype_nbytes(effective_kv_dtype)
+    )
+    return {
+        "schema": NATIVE_PACKED_CAPABILITY_SCHEMA,
+        "enabled": bool(getattr(server_args, "enable_c2kv", False)),
+        "endpoint": "/v1/c2kv/native_generate",
+        "packing_version": C2KV_NATIVE_PACKING_VERSION,
+        "raw_layout_profile": C2KV_NATIVE_RAW_LAYOUT_PROFILE,
+        "model_binding": model_binding,
+        "parameter_version": model_binding["weight_version"],
+        "kv_bytes_per_token": kv_bytes_per_token,
+        "num_hidden_layers": num_layers,
+        "num_key_value_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "value_head_dim": value_head_dim,
+        "shadow_feature_layer": normalized_shadow_layer,
+        "shadow_feature_readout": "decoder_layer_output",
+        "shadow_feature_stored_dtype": "float16",
+        "gist_parameter_dtype": "float32",
+        "gist_compute_dtype": dtype_name,
+        "base_query_enforced": True,
+        "server_default_query_projection": getattr(
+            server_args, "c2kv_query_proj", "base"
+        ),
+    }
+
+
+@app.post("/v1/c2kv/native_generate", response_class=SGLangORJSONResponse)
+async def v1_c2kv_native_generate(
+    request: C2KVNativePackedGenerateRequest, raw_request: Request
+):
+    """Generate from exact event-native token IDs and cached gist chunks."""
+
+    try:
+        tokenizer_manager = _global_state.tokenizer_manager
+        capability = _c2kv_native_capability()
+        if not capability["enabled"]:
+            raise ValueError("C2KV native packed generation requires --enable-c2kv")
+        if capability["model_binding"]["pic_enabled"]:
+            raise ValueError(
+                "C2KV native packed generation requires gist compression, not PIC"
+            )
+        if request.max_extraction_calls < 0:
+            raise ValueError("max_extraction_calls must be nonnegative")
+        sampling_params = dict(request.sampling_params)
+        if sampling_params.get("n", 1) != 1:
+            raise ValueError("C2KV native packed generation supports only n=1")
+        if sampling_params.get("max_new_tokens", 0) <= 0:
+            raise ValueError("sampling_params.max_new_tokens must be positive")
+        sampling_params.setdefault("temperature", 0.0)
+        if float(sampling_params["temperature"]) != 0.0:
+            raise ValueError("C2KV native packed generation requires greedy decoding")
+
+        shadow_request = request.shadow_features
+        shadow_enabled = bool(
+            shadow_request is not None and shadow_request.get("enabled", True)
+        )
+        normalized_shadow_layer = capability["shadow_feature_layer"]
+        if shadow_enabled:
+            requested_layer = shadow_request.get("prefill_layer")
+            if type(requested_layer) is not int:
+                raise ValueError(
+                    "shadow_features.prefill_layer must be an integer when enabled"
+                )
+            num_layers = capability["num_hidden_layers"]
+            requested_normalized = (
+                requested_layer
+                if requested_layer >= 0
+                else num_layers + requested_layer
+            )
+            if requested_normalized != normalized_shadow_layer:
+                raise ValueError(
+                    "C2KV_NATIVE_SHADOW_LAYER_MISMATCH: requested layer "
+                    f"{requested_layer} resolves to {requested_normalized}, but "
+                    f"the server captures {normalized_shadow_layer}"
+                )
+
+        encoder_chunks = [chunk.model_dump() for chunk in request.encoder_chunks]
+        compression_chunks = [
+            chunk.model_dump() for chunk in request.compression_chunks
+        ]
+        plan = plan_native_packed_request(
+            system_input_ids=request.system_input_ids,
+            workspace_input_ids=request.workspace_input_ids,
+            encoder_chunks=encoder_chunks,
+            compression_chunks=compression_chunks,
+            model_binding=capability["model_binding"],
+            packing_version=request.packing_version,
+            raw_layout_profile=request.raw_layout_profile,
+            encoding_scope=request.encoding_scope,
+            compression_ratio=request.compression_ratio,
+        )
+
+        resolved: Dict[str, Dict[str, Any]] = {}
+        cache_hits = 0
+        cache_misses = 0
+        materialized_encoder_tokens = 0
+        scope_reused_encoder_tokens = 0
+        base_rid = request.rid or f"c2kv-native-{time.time_ns()}"
+        for index, chunk in enumerate(plan.unique_chunks):
+            result = await tokenizer_manager.c2kv_extract(
+                input_ids=list(chunk["token_ids"]),
+                input_text="",
+                compression_ratio=request.compression_ratio,
+                rid=f"{base_rid}:extract:{index}",
+                allow_cache_miss=cache_misses < request.max_extraction_calls,
+            )
+            if not result.success:
+                raise ValueError(result.error)
+            if result.original_seq_len != len(chunk["token_ids"]):
+                raise ValueError(
+                    "C2KV native extraction returned an inconsistent source length: "
+                    f"{result.original_seq_len} != {len(chunk['token_ids'])}"
+                )
+            cache_hit = bool(result.cache_hit)
+            if cache_hit:
+                cache_hits += 1
+                scope_reused_encoder_tokens += len(chunk["token_ids"])
+            else:
+                cache_misses += 1
+                materialized_encoder_tokens += len(chunk["token_ids"])
+            resolved[chunk["handle"]] = {
+                "chunk_id": chunk["chunk_id"],
+                "handle": chunk["handle"],
+                "cache_key": result.key_hash,
+                "cache_hit": cache_hit,
+                "gist_len": result.gist_len,
+                "original_seq_len": result.original_seq_len,
+            }
+
+        segments = []
+        for handle, (token_start, token_end) in zip(
+            plan.selected_handles, plan.segment_boundaries
+        ):
+            segments.append(
+                C2KVSegmentInfo(
+                    key_hash=resolved[handle]["cache_key"],
+                    token_start=token_start,
+                    token_end=token_end,
+                    use_gist_projection=False,
+                )
+            )
+
+        generation_request = GenerateReqInput(
+            rid=base_rid,
+            input_ids=list(plan.logical_input_ids),
+            sampling_params=sampling_params,
+            return_logprob=True,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            return_hidden_states=shadow_enabled,
+            c2kv_prompt_last_hidden_only=shadow_enabled,
+            c2kv_segments=segments,
+            c2kv_kv_memory_hint={},
+            # The selected C1000 checkpoint contract uses ordinary/base query
+            # projections after injected gist KV.
+            c2kv_use_gist_projection=False,
+        )
+        generated = await tokenizer_manager.generate_request(
+            generation_request, raw_request
+        ).__anext__()
+        meta_info = generated.get("meta_info") or {}
+        output_ids = list(generated.get("output_ids") or [])
+        raw_logprobs = list(meta_info.get("output_token_logprobs") or [])
+        token_logprobs = [
+            None if row is None else float(row[0]) for row in raw_logprobs
+        ]
+        if len(token_logprobs) != len(output_ids):
+            raise ValueError(
+                "C2KV native generation returned misaligned token logprobs: "
+                f"{len(token_logprobs)} != {len(output_ids)}"
+            )
+
+        shadow_features = None
+        if shadow_enabled:
+            hidden_steps = meta_info.get("hidden_states") or []
+            if not hidden_steps:
+                raise ValueError(
+                    "C2KV native generation did not return the configured shadow feature"
+                )
+            prefill_state = hidden_steps[0]
+            if prefill_state and isinstance(prefill_state[0], list):
+                prefill_state = prefill_state[-1]
+            if not isinstance(prefill_state, list) or not prefill_state:
+                raise ValueError("C2KV native prompt_last hidden state is malformed")
+            logical_position = (
+                len(request.system_input_ids)
+                + sum(len(chunk.token_ids) for chunk in request.encoder_chunks)
+                + len(request.workspace_input_ids)
+                - 1
+            )
+            shadow_features = {
+                "schema": "event-native-shadow-features-v1",
+                "status": "captured",
+                "bindings": {
+                    "model": capability["model_binding"],
+                    "layer_indexing": "zero_based_decoder_layer_output",
+                },
+                "prefill": {
+                    "status": "captured",
+                    "reason": None,
+                    "layer": normalized_shadow_layer,
+                    "position": {
+                        "kind": "prompt_last",
+                        "logical_position": logical_position,
+                    },
+                    "readout": "decoder_layer_output",
+                    "stored_dtype": "float16",
+                    "hidden": float16_roundtrip(prefill_state),
+                },
+                "memgen": {
+                    "status": "disabled",
+                    "layer": None,
+                    "hidden": None,
+                },
+                "capture_errors": [],
+            }
+
+        kv_bytes_per_token = capability["kv_bytes_per_token"]
+        costs = dict(plan.costs)
+        costs.update(
+            {
+                "materialized_encoder_tokens": materialized_encoder_tokens,
+                "scope_reused_encoder_tokens": scope_reused_encoder_tokens,
+                "system_prefix_kv_logical_bytes": (
+                    costs["system_tokens"] * kv_bytes_per_token
+                ),
+                "gist_prefix_kv_logical_bytes": (
+                    costs["gist_prefix_kv_tokens"] * kv_bytes_per_token
+                ),
+                "raw_workspace_kv_logical_bytes": (
+                    costs["raw_workspace_kv_tokens"] * kv_bytes_per_token
+                ),
+                "resident_kv_logical_bytes": (
+                    costs["resident_kv_tokens"] * kv_bytes_per_token
+                ),
+                "kv_bytes_per_token": kv_bytes_per_token,
+            }
+        )
+        finish_reason_detail = meta_info.get("finish_reason")
+        finish_reason = (
+            finish_reason_detail.get("type")
+            if isinstance(finish_reason_detail, dict)
+            else finish_reason_detail
+        )
+
+        return orjson_response(
+            {
+                "schema": NATIVE_PACKED_RESPONSE_SCHEMA,
+                "rid": base_rid,
+                "session_id": request.session_id,
+                "generation_id": request.generation_id,
+                "output_ids": output_ids,
+                "text": generated.get("text", ""),
+                "token_logprobs": token_logprobs,
+                "finish_reason": finish_reason,
+                "finish_reason_detail": finish_reason_detail,
+                "encoder_chunks": [
+                    resolved[handle] for handle in plan.selected_handles
+                ],
+                "compression_chunks": [
+                    resolved[handle] for handle in plan.compression_handles
+                ],
+                "extraction": {
+                    "requested_chunks": len(request.encoder_chunks)
+                    + len(request.compression_chunks),
+                    "unique_chunks": len(plan.unique_chunks),
+                    "cache_hits": cache_hits,
+                    "cache_misses": cache_misses,
+                    "model_calls": cache_misses,
+                    "max_extraction_calls": request.max_extraction_calls,
+                },
+                "costs": costs,
+                "shadow_features": shadow_features,
+                "allocator": meta_info.get("kv_memory_report"),
+                "sglang_runtime": meta_info.get("sglang_runtime"),
+            }
+        )
+    except ValueError as error:
+        logger.error("[c2kv-native] request rejected: %s", error)
+        return _create_error_response(error)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])

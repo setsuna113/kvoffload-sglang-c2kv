@@ -411,6 +411,7 @@ class TokenizerCommunicatorMixin:
         input_text: str,
         compression_ratio: int = 4,
         rid: Optional[str] = None,
+        allow_cache_miss: bool = True,
     ) -> C2KVExtractReqOutput:
         """Run C2KV gist extraction via the scheduler."""
         import uuid
@@ -421,6 +422,7 @@ class TokenizerCommunicatorMixin:
             input_ids=input_ids,
             input_text=input_text,
             compression_ratio=compression_ratio,
+            allow_cache_miss=allow_cache_miss,
         )
         return (await self.c2kv_extract_communicator(req))[0]
 
