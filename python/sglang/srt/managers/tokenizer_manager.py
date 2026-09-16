@@ -992,6 +992,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 c2kv_use_gist_projection=getattr(
                     obj, "c2kv_use_gist_projection", None
                 ),
+                c2kv_prompt_last_hidden_only=getattr(
+                    obj, "c2kv_prompt_last_hidden_only", False
+                ),
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

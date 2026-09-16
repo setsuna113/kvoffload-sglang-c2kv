@@ -614,16 +614,25 @@ class SchedulerOutputProcessorMixin:
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
-                        req.hidden_states.append(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
+                        prompt_last_only = getattr(
+                            req, "c2kv_prompt_last_hidden_only", False
+                        )
+                        if prompt_last_only and batch.get_capture_hidden_mode().is_last():
+                            selected_hidden_states = logits_output.hidden_states[
+                                i : i + 1
                             ]
-                            .cpu()
-                            .clone()
-                            .tolist()
+                        else:
+                            hidden_state_end = hidden_state_offset + len(
+                                req.origin_input_ids
+                            )
+                            selected_hidden_states = logits_output.hidden_states[
+                                hidden_state_offset:hidden_state_end
+                            ]
+                            hidden_state_offset = hidden_state_end
+                            if prompt_last_only:
+                                selected_hidden_states = selected_hidden_states[-1:]
+                        req.hidden_states.append(
+                            selected_hidden_states.cpu().clone().tolist()
                         )
 
                     if req.grammar is not None:
@@ -828,7 +837,11 @@ class SchedulerOutputProcessorMixin:
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
                 self._handle_finished_req(req, i, logits_output)
-                if req.return_hidden_states and logits_output.hidden_states is not None:
+                if (
+                    req.return_hidden_states
+                    and not getattr(req, "c2kv_prompt_last_hidden_only", False)
+                    and logits_output.hidden_states is not None
+                ):
                     req.hidden_states.append(
                         logits_output.hidden_states[i].cpu().clone().tolist()
                     )
@@ -886,7 +899,11 @@ class SchedulerOutputProcessorMixin:
                             logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                         )
 
-            if req.return_hidden_states and logits_output.hidden_states is not None:
+            if (
+                req.return_hidden_states
+                and not getattr(req, "c2kv_prompt_last_hidden_only", False)
+                and logits_output.hidden_states is not None
+            ):
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
@@ -1384,6 +1401,13 @@ class SchedulerOutputProcessorMixin:
 
         for req in reqs:
             if req is skip_req:
+                continue
+            if getattr(req, "c2kv_requeued", False):
+                # An intermediate C2KV prefill round has no committed output
+                # token. Sending its empty output would nevertheless advance
+                # send_output_token_logprobs_offset to one via the generic
+                # prefill-only path below, dropping the first real generation
+                # logprob after the final round.
                 continue
 
             if req.finished():
