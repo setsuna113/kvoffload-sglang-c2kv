@@ -11,7 +11,7 @@ it deliberately bypasses fused serving attention when active.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -111,30 +111,68 @@ class CommitKVServingState:
         if normalized == self.event_signature:
             return
         previous_indices = {item[0] for item in self.event_signature}
+        new_events = [item for item in normalized if item[0] not in previous_indices]
         new_tools = [
             item
-            for item in normalized
-            if item[0] not in previous_indices
-            and (item[1].lower() == "tool" or item[2].lower() == "tool")
+            for item in new_events
+            if item[1].lower() == "tool" or item[2].lower() == "tool"
         ]
-        if new_tools:
+        if new_events:
+            # The next request starts a new agent turn. A short previous turn
+            # cannot finish its post window using queries after this input.
             if self.pending_commit_id is not None or self.policy.pending is not None:
-                raise RuntimeError("COMMITKV_OVERLAPPING_TRANSITIONS_UNSUPPORTED")
-            if self.pre_window is None:
-                raise RuntimeError("COMMITKV_PRE_WINDOW_UNAVAILABLE")
+                self.receipts.append(
+                    self.policy.record_incomplete_post(
+                        self.pending_commit_id,
+                        observed_query_count=sum(
+                            item.shape[0] for item in self.post_queries
+                        ),
+                    )
+                )
+                self.pending_commit_id = None
+                self.post_queries.clear()
+                self.post_positions.clear()
+        if new_tools:
             commit_id = new_tools[-1][0]
-            receipt = self.policy.record_pre(
-                commit_id,
-                self.pre_pages,
-                self.pre_window,
-                self.pre_window.key_positions,
-                total_budget=self.target_tokens,
+            observed = (
+                int(self.pre_window.query_positions.numel())
+                if self.pre_window is not None
+                else 0
             )
-            receipt.update(self.pre_scan_metadata)
+            if observed == self.policy.config.window_size:
+                receipt = self.policy.record_pre(
+                    commit_id,
+                    self.pre_pages,
+                    self.pre_window,
+                    self.pre_window.key_positions,
+                    total_budget=self.target_tokens,
+                )
+                receipt.update(self.pre_scan_metadata)
+                self.pending_commit_id = commit_id
+            else:
+                # Missing/short pre evidence must not reuse the prior action's
+                # queries or become a partial-window lifecycle decision.
+                receipt = {
+                    "commit_id": commit_id,
+                    "measurement_phase": "pre_commit_unavailable",
+                    "measurement_layer_id": self.policy.config.measurement_layer_id,
+                    "reason": "turn_ended_before_window",
+                    "observed_query_count": observed,
+                    "required_query_count": self.policy.config.window_size,
+                    "incomplete_transition_policy": (
+                        "full_window_or_unclassified_project_convention"
+                    ),
+                    "accepted_page_ids": [],
+                }
             self.receipts.append(receipt)
-            self.pending_commit_id = commit_id
-            self.post_queries.clear()
-            self.post_positions.clear()
+        if new_events:
+            # Query windows must stay within one generated segment. In
+            # particular a zero-decode response must not retain a stale pre.
+            self.pre_window = None
+            self.pre_pages = ()
+            self.pre_queries.clear()
+            self.pre_positions.clear()
+            self.pre_scan_metadata.clear()
 
         pages = []
         for index, role, phase, start, end in normalized:

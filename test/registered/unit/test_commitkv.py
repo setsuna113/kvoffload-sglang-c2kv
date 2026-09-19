@@ -10,7 +10,6 @@ import sys
 import pytest
 import torch
 
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PATH = os.path.normpath(
     os.path.join(
@@ -352,6 +351,102 @@ def test_runtime_state_pairs_windows_retires_jointly_and_builds_checkpoint():
     )
     assert all(0 not in row.tolist() for layer in selected2 for row in layer)
     assert metadata2["retired_page_count"] == 1
+
+
+@pytest.mark.parametrize("observed_query_count", [0, 7])
+def test_incomplete_post_releases_protection_without_retiring_pages(
+    observed_query_count,
+):
+    state = commitkv.CommitKVRuntimeState(
+        commitkv.CommitKVConfig(
+            measurement_layer_id=0,
+            window_size=8,
+            page_size=1,
+            pending_fraction=0.5,
+        )
+    )
+    retired_page = commitkv.EventPage("retired", 0, 0, 1)
+    state.retired_pages[retired_page.page_id] = retired_page
+    pending_page = commitkv.EventPage("pending", 0, 1, 2)
+    state.record_pre(
+        "commit",
+        [pending_page],
+        _EffectWindow({frozenset({1}): 0.2}),
+        range(4),
+        total_budget=2,
+    )
+    protected, protected_meta = state.checkpoint(
+        [3, 2, 1, 0], range(4), target_tokens=2, num_layers=1, num_kv_heads=1
+    )
+    assert protected[0][0].tolist() == [1, 3]
+    assert protected_meta["protected_pending_page_count"] == 1
+
+    receipt = state.record_incomplete_post(
+        "commit", observed_query_count=observed_query_count
+    )
+
+    assert receipt["commit_id"] == "commit"
+    assert receipt["measurement_phase"] == "post_commit_unavailable"
+    assert receipt["reason"] == "next_turn_ended_before_window"
+    assert receipt["observed_query_count"] == observed_query_count
+    assert receipt["required_query_count"] == 8
+    assert receipt["accepted_page_ids"] == []
+    assert receipt["incomplete_transition_policy"] == (
+        "full_window_or_unclassified_project_convention"
+    )
+    assert state.pending is None
+    assert state.retired_pages == {retired_page.page_id: retired_page}
+    assert state.completed_transitions == 0
+    assert state.incomplete_transitions == 1
+
+    selected, metadata = state.checkpoint(
+        [3, 2, 1, 0], range(4), target_tokens=2, num_layers=1, num_kv_heads=1
+    )
+    assert selected[0][0].tolist() == [2, 3]
+    assert metadata["protected_pending_page_count"] == 0
+    assert metadata["retired_page_count"] == 1
+    assert metadata["completed_transitions"] == 0
+    assert metadata["incomplete_transitions"] == 1
+    assert metadata["incomplete_transition_policy"] == (
+        "full_window_or_unclassified_project_convention"
+    )
+
+
+def test_incomplete_post_rejects_wrong_commit_and_invalid_window_without_mutation():
+    state = commitkv.CommitKVRuntimeState(
+        commitkv.CommitKVConfig(
+            measurement_layer_id=0,
+            window_size=8,
+            page_size=1,
+            pending_fraction=0.5,
+        )
+    )
+    page = commitkv.EventPage("pending", 0, 1, 2)
+    state.record_pre(
+        "commit",
+        [page],
+        _EffectWindow({frozenset({1}): 0.2}),
+        range(4),
+        total_budget=2,
+    )
+    pending = state.pending
+
+    with pytest.raises(RuntimeError):
+        state.record_incomplete_post("other", observed_query_count=1)
+    with pytest.raises(ValueError):
+        state.record_incomplete_post("commit", observed_query_count=8)
+    with pytest.raises(ValueError):
+        state.record_incomplete_post("commit", observed_query_count=-1)
+
+    assert state.pending is pending
+    assert state.retired_pages == {}
+    assert state.completed_transitions == 0
+    assert state.incomplete_transitions == 0
+    selected, metadata = state.checkpoint(
+        [3, 2, 1, 0], range(4), target_tokens=2, num_layers=1, num_kv_heads=1
+    )
+    assert selected[0][0].tolist() == [1, 3]
+    assert metadata["protected_pending_page_count"] == 1
 
 
 def test_runtime_state_requires_explicit_layer_and_preserves_pending_page():

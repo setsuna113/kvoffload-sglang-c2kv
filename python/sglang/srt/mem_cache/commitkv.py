@@ -121,10 +121,9 @@ class CommitKVRuntimeState:
 
     config: CommitKVConfig
     pending: PendingCommit | None = None
-    retired_pages: Dict[tuple[Hashable, int], EventPage] = field(
-        default_factory=dict
-    )
+    retired_pages: Dict[tuple[Hashable, int], EventPage] = field(default_factory=dict)
     completed_transitions: int = 0
+    incomplete_transitions: int = 0
 
     def __post_init__(self) -> None:
         if self.config.measurement_layer_id is None:
@@ -243,6 +242,39 @@ class CommitKVRuntimeState:
             "retired_page_count": len(self.retired_pages),
         }
 
+    def record_incomplete_post(
+        self, commit_id: Hashable, *, observed_query_count: int
+    ) -> dict[str, object]:
+        """Close an unmeasurable next-turn window without retiring any page.
+
+        The serving convention requires the full W generated queries in the
+        immediately following turn. A later observation must not supply the
+        missing queries. Once that turn ends, its temporary protection can be
+        released; ordinary budget selection still applies to those pages.
+        """
+
+        pending = self.pending
+        if pending is None or pending.commit_id != commit_id:
+            raise RuntimeError("CommitKV incomplete post does not match pending commit")
+        if not 0 <= observed_query_count < self.config.window_size:
+            raise ValueError("incomplete CommitKV post requires fewer than W queries")
+        self.pending = None
+        self.incomplete_transitions += 1
+        return {
+            "commit_id": commit_id,
+            "measurement_phase": "post_commit_unavailable",
+            "measurement_layer_id": self.config.measurement_layer_id,
+            "reason": "next_turn_ended_before_window",
+            "observed_query_count": observed_query_count,
+            "required_query_count": self.config.window_size,
+            "incomplete_transition_policy": (
+                "full_window_or_unclassified_project_convention"
+            ),
+            "accepted_page_ids": [],
+            "released_pending_page_count": len(pending.protected_page_ids),
+            "retired_page_count": len(self.retired_pages),
+        }
+
     def checkpoint(
         self,
         baseline_indices: Iterable[int],
@@ -281,9 +313,7 @@ class CommitKVRuntimeState:
         if self.pending is not None:
             if target_tokens != self.pending.total_budget:
                 raise ValueError("CommitKV total budget changed during a transition")
-            pending_by_id = {
-                page.page_id: page for page in self.pending.pages
-            }
+            pending_by_id = {page.page_id: page for page in self.pending.pages}
             for page_id in self.pending.protected_page_ids:
                 page = pending_by_id[page_id]
                 try:
@@ -321,6 +351,10 @@ class CommitKVRuntimeState:
                 "max_pending_pages": self.config.max_pending_pages,
                 "checkpoint_interval": self.config.checkpoint_interval,
                 "completed_transitions": self.completed_transitions,
+                "incomplete_transitions": self.incomplete_transitions,
+                "incomplete_transition_policy": (
+                    "full_window_or_unclassified_project_convention"
+                ),
                 "retired_page_count": len(self.retired_pages),
                 "protected_pending_page_count": pending_page_count,
             }

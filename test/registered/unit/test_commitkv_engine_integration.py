@@ -12,7 +12,6 @@ from typing import List
 import torch
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "python"))
 
@@ -134,25 +133,6 @@ def _resolved_commitkv_hint(history_tokens: int, *, total_budget: int = 2048):
     )
     SERVING_RESOLVE_RANGE(owner, request, completed_ids + [history_tokens + 1])
     return hint
-
-
-def test_new_transition_is_not_consumed_while_previous_post_window_is_pending():
-    policy = SimpleNamespace(
-        pending=object(), config=SimpleNamespace(page_size=16)
-    )
-    state = CommitKVServingState(
-        policy=policy,
-        target_tokens=128,
-        event_signature=((1, "tool", "tool", 16, 32),),
-        pending_commit_id=1,
-    )
-    next_spans = [
-        {"message_index": 1, "role": "tool", "phase": "tool", "start": 16, "end": 32},
-        {"message_index": 2, "role": "tool", "phase": "tool", "start": 32, "end": 48},
-    ]
-    with pytest.raises(RuntimeError, match="OVERLAPPING_TRANSITIONS_UNSUPPORTED"):
-        state.configure_events(next_spans)
-    assert state.event_signature == ((1, "tool", "tool", 16, 32),)
 
 
 def test_long_history_scans_latest_fully_resident_pages_under_project_cap():
@@ -378,9 +358,147 @@ def test_qwen_commitkv_capture_excludes_prompt_and_pairs_cross_turn_windows():
     assert torch.cat(state.pre_positions).tolist() == [7, 8]
 
 
+@pytest.mark.parametrize("short_queries", [0, 1, 5, 7])
+def test_qwen_short_turn_is_unmeasured_and_later_full_turns_still_complete(
+    short_queries,
+):
+    """ACE-style short actions must not crash or borrow another turn's Qs."""
+
+    policy = CommitKVRuntimeState(
+        CommitKVConfig(measurement_layer_id=0, window_size=8, page_size=1)
+    )
+    state = CommitKVServingState(policy=policy, target_tokens=32)
+    attention = _fake_attention()
+    req_to_token = torch.arange(128).view(1, -1)
+    key = torch.ones(128, 1, 1)
+    kv_pool = _KVPool([key], [torch.arange(128).float().view(128, 1, 1)])
+    config = {
+        "method": "commitkv",
+        "event_token_spans": [
+            {
+                "message_index": 0,
+                "role": "assistant",
+                "phase": "act",
+                "start": 0,
+                "end": 1,
+            }
+        ],
+    }
+
+    def capture(mode, positions):
+        positions, batch = _forward_batch(
+            mode=mode,
+            config=config,
+            state=state,
+            position=positions,
+            seq_len=max(positions) + 1,
+            req_to_token=req_to_token,
+            kv_pool=kv_pool,
+        )
+        q = torch.ones(len(positions), 1)
+        attention._capture_history_kv_runtime_queries(q, q, q, positions, batch)
+
+    def observe(index, start):
+        config["event_token_spans"].append(
+            {
+                "message_index": index,
+                "role": "tool",
+                "phase": "tool",
+                "start": start,
+                "end": start + 2,
+            }
+        )
+        capture("extend", [start, start + 1])
+
+    capture("extend", [0, 1, 2])
+    for pos in range(3, 11):
+        capture("decode", [pos])
+    observe(1, 11)
+    assert policy.pending.commit_id == 1
+    assert state.pre_window is None
+    assert state.pre_queries == []
+
+    for pos in range(13, 13 + short_queries):
+        capture("decode", [pos])
+    boundary = 13 + short_queries
+    observe(2, boundary)
+    assert policy.pending is None
+    assert state.pending_commit_id is None
+    assert policy.completed_transitions == 0
+    assert policy.incomplete_transitions == 1
+    assert policy.retired_pages == {}
+    assert state.post_queries == state.pre_queries == []
+    assert state.pre_window is None
+    assert [r["measurement_phase"] for r in state.receipts] == [
+        "pre_commit",
+        "post_commit_unavailable",
+        "pre_commit_unavailable",
+    ]
+    assert state.receipts[-2]["observed_query_count"] == short_queries
+    assert state.receipts[-1]["observed_query_count"] == short_queries
+    assert state.event_signature[-1][0] == 2
+
+    # A repeated prefill chunk is idempotent and cannot consume the event twice.
+    before = list(state.receipts)
+    capture("extend", [boundary, boundary + 1])
+    assert state.receipts == before
+
+    # The next full segment supplies only its own queries for a fresh pre.
+    start = boundary + 2
+    for pos in range(start, start + 8):
+        capture("decode", [pos])
+    assert state.pre_window.query_positions.tolist() == list(range(start, start + 8))
+    observe(3, start + 8)
+    assert policy.pending.commit_id == 3
+    for pos in range(start + 10, start + 18):
+        capture("decode", [pos])
+    assert policy.completed_transitions == 1
+    assert policy.incomplete_transitions == 1
+    assert policy.pending is None
+    assert state.receipts[-1]["measurement_phase"] == "post_commit"
+
+
+def test_batched_tool_observations_share_one_transition():
+    policy = CommitKVRuntimeState(CommitKVConfig(measurement_layer_id=0))
+    state = CommitKVServingState(policy=policy, target_tokens=128)
+    state.pre_window = _FixedEffectWindow(list(range(16)))
+    spans = [
+        {"message_index": i, "role": "tool", "phase": "tool", "start": i, "end": i + 1}
+        for i in (1, 2)
+    ]
+    state.configure_events(spans)
+    state.configure_events(spans)
+    assert policy.pending.commit_id == 2
+    assert len(state.receipts) == 1
+    assert len(state.event_pages) == 2
+
+
+def test_new_user_input_closes_pending_without_creating_a_tool_commit():
+    policy = CommitKVRuntimeState(CommitKVConfig(measurement_layer_id=0))
+    state = CommitKVServingState(policy=policy, target_tokens=128)
+    state.pre_window = _FixedEffectWindow(list(range(16)))
+    spans = [
+        {"message_index": 1, "role": "tool", "phase": "tool", "start": 16, "end": 20}
+    ]
+    state.configure_events(spans)
+    spans.append(
+        {"message_index": 2, "role": "user", "phase": "others", "start": 20, "end": 24}
+    )
+    state.configure_events(spans)
+    assert policy.pending is None
+    assert state.pending_commit_id is None
+    assert policy.incomplete_transitions == 1
+    assert policy.completed_transitions == 0
+    assert [r["measurement_phase"] for r in state.receipts] == [
+        "pre_commit",
+        "post_commit_unavailable",
+    ]
+
+
 class _FixedEffectWindow:
     def __init__(self, key_positions: list[int]):
         self.key_positions = torch.tensor(key_positions, dtype=torch.long)
+        self.query_positions = torch.tensor(key_positions[-8:], dtype=torch.long)
 
     def effect(self, indices):
         return torch.tensor(0.5 + 0.01 * len(tuple(indices)))
