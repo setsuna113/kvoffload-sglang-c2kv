@@ -3,6 +3,7 @@
 import ast
 import json
 import logging
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -60,6 +61,104 @@ def test_timeout_waits_for_running_streaming_request():
     active.finished = lambda: True
     reap(controller, 4.0)
     assert closed == ["session"]
+
+
+def test_rejected_concurrent_streaming_turn_is_returned_without_prefill():
+    class AbortReason:
+        def __init__(self, message):
+            self.message = message
+
+        def to_json(self):
+            return {"type": "abort", "message": self.message}
+
+    class Req:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.req_pool_idx = None
+            self.finished_reason = None
+            self.to_finish = None
+
+        def set_finish_with_abort(self, message):
+            self.origin_input_ids = [0]
+            self.return_logprob = False
+            self.to_finish = AbortReason(message)
+
+        def check_finished(self):
+            self.finished_reason = self.to_finish
+            self.to_finish = None
+
+    class Input(SimpleNamespace):
+        def __getattr__(self, name):
+            return None
+
+    create_req = _method(
+        ROOT / "python/sglang/srt/managers/session_controller.py",
+        "Session",
+        "create_req",
+        {
+            "Req": Req,
+            "TokenizedGenerateReqInput": object,
+            "time": time,
+            "logging": logging,
+        },
+    )
+    handle = _method(
+        ROOT / "python/sglang/srt/managers/scheduler.py",
+        "Scheduler",
+        "handle_generate_request",
+        {
+            "paper_telemetry": SimpleNamespace(start_request=lambda **_: None),
+            "FINISH_ABORT": AbortReason,
+            "TokenizedGenerateReqInput": object,
+        },
+    )
+    prior = SimpleNamespace(finished=lambda: False)
+    session = SimpleNamespace(
+        session_id="session",
+        streaming=True,
+        last_active_time=0.0,
+        req_nodes={"prior": SimpleNamespace(req=prior)},
+    )
+    prior.session = session
+    session.create_req = lambda *args, **kwargs: create_req(session, *args, **kwargs)
+    recv_req = Input(
+        rid="rejected",
+        input_ids=[42],
+        session_params=SimpleNamespace(
+            id="session", replace=False, drop_previous_output=False, offset=0
+        ),
+        sampling_params=SimpleNamespace(),
+        return_logprob=False,
+        time_stats=SimpleNamespace(),
+    )
+    sent = []
+    scheduler = SimpleNamespace(
+        session_controller={"session": session},
+        tokenizer=None,
+        model_config=SimpleNamespace(vocab_size=100, hf_eos_token_id=None),
+        enable_metrics=False,
+        init_req_max_new_tokens=lambda req: None,
+        stream_output=lambda reqs, return_logprob: sent.append(
+            (reqs[0], return_logprob)
+        ),
+        _add_request_to_queue=lambda req: (_ for _ in ()).throw(
+            AssertionError("An aborted request must not allocate KV")
+        ),
+    )
+
+    handle(scheduler, recv_req)
+
+    assert len(sent) == 1
+    rejected, return_logprob = sent[0]
+    assert rejected.finished_reason.to_json() == {
+        "type": "abort",
+        "message": "Streaming session previous request has not finished.",
+    }
+    assert return_logprob is False
+    assert rejected.origin_input_ids == [0]
+    assert rejected.req_pool_idx is None
+    assert session.req_nodes["prior"].req is prior
+    assert prior.session is session
 
 
 def test_explicit_close_passes_active_request_for_ownership_transfer():

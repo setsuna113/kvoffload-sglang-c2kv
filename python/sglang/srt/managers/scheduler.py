@@ -2044,7 +2044,7 @@ class Scheduler(
                 req.time_stats.set_metrics_collector(self.metrics_collector)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
+                self.stream_output([req], req.return_logprob)
                 return
 
         else:
