@@ -594,4 +594,6 @@ def reference_sdpa(
             attn_mask=mask, dropout_p=0.0, scale=float(scale)
         )
         outputs.append(output.squeeze(0).transpose(0, 1))
+    if len(outputs) == 1:
+        return outputs[0].contiguous()
     return torch.cat(outputs, dim=0).contiguous()
