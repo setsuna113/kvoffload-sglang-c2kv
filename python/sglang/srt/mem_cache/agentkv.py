@@ -226,20 +226,34 @@ class AgentKVQueryRing:
         layer = int(layer_id)
         queries = self._queries.setdefault(layer, {})
         saved_positions = self._positions.setdefault(layer, {})
-        normalized_stages = stage_ids.to(torch.long)
-        invalid = normalized_stages[
-            (normalized_stages >= self.num_stages) | (normalized_stages < -1)
-        ]
-        if invalid.numel():
-            raise ValueError(f"invalid AgentKV query stages: {invalid.tolist()}")
-        for stage in range(self.num_stages):
-            selected = torch.nonzero(
-                normalized_stages == stage, as_tuple=False
-            ).flatten()
-            if selected.numel() == 0:
-                continue
-            new_query = query.index_select(0, selected)
-            new_positions = positions.index_select(0, selected)
+        if tokens == 1:
+            # Decode is one token per layer. A single stage scalar avoids four
+            # shape-dependent GPU nonzero synchronizations for every token.
+            stage = int(stage_ids[0].item())
+            if stage < -1 or stage >= self.num_stages:
+                raise ValueError(f"invalid AgentKV query stages: [{stage}]")
+            stage_batches = [(stage, query, positions)] if stage >= 0 else []
+        else:
+            normalized_stages = stage_ids.to(torch.long)
+            invalid = normalized_stages[
+                (normalized_stages >= self.num_stages) | (normalized_stages < -1)
+            ]
+            if invalid.numel():
+                raise ValueError(f"invalid AgentKV query stages: {invalid.tolist()}")
+            stage_batches = []
+            for stage in range(self.num_stages):
+                selected = torch.nonzero(
+                    normalized_stages == stage, as_tuple=False
+                ).flatten()
+                if selected.numel():
+                    stage_batches.append(
+                        (
+                            stage,
+                            query.index_select(0, selected),
+                            positions.index_select(0, selected),
+                        )
+                    )
+        for stage, new_query, new_positions in stage_batches:
             if stage in queries:
                 if queries[stage].shape[1:] != new_query.shape[1:]:
                     raise ValueError("AgentKV query head shape changed within one ring")

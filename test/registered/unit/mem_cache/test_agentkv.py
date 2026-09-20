@@ -151,6 +151,27 @@ def test_query_ring_keeps_last_eight_queries_per_stage() -> None:
     ]
 
 
+def test_query_ring_single_token_writes_match_batched_stage_contents() -> None:
+    positions = torch.arange(45, dtype=torch.long)
+    stages = torch.tensor([i % 5 - 1 for i in range(45)], dtype=torch.int32)
+    query = positions.float().view(45, 1, 1)
+    batched = AgentKVQueryRing()
+    batched.write_layer(
+        layer_id=0, query=query, positions=positions, stage_ids=stages
+    )
+    sequential = AgentKVQueryRing()
+    for index in range(len(positions)):
+        sequential.write_layer(
+            layer_id=0,
+            query=query[index : index + 1],
+            positions=positions[index : index + 1],
+            stage_ids=stages[index : index + 1],
+        )
+    assert sequential.rows_by_stage(0) == batched.rows_by_stage(0)
+    for actual, expected in zip(sequential.read_layer(0), batched.read_layer(0)):
+        torch.testing.assert_close(actual, expected)
+
+
 def test_layer_selector_matches_stageq_snapkv_gqa_mean_equation() -> None:
     key = torch.zeros((6, 2, 2), dtype=torch.float32)
     key[1:5, 0] = torch.tensor([[2.0, 0.0], [0.0, 2.0], [1.0, 1.0], [-1.0, 0.0]])

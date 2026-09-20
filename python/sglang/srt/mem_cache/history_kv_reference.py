@@ -17,6 +17,11 @@ import torch
 import torch.nn.functional as F
 
 
+# A headwise causal mask needs Hq * Q * K bytes. Keep its peak bounded across
+# long extend requests without changing which keys any query can attend to.
+REFERENCE_SDPA_MAX_MASK_BYTES = 16 * 1024 * 1024
+
+
 @dataclass
 class ReferenceLayerKV:
     """One layer's headwise history, with already-rotated keys."""
@@ -554,6 +559,8 @@ def reference_sdpa(
         raise ValueError("query heads must be divisible by KV heads")
     if normal_positions.shape != (normal_len,) or query_positions.shape != (q_len,):
         raise ValueError("reference attention position lengths mismatch")
+    if q_len == 0:
+        return query.new_empty((0, q_heads, dim))
 
     normal_k = normal_key.transpose(0, 1)
     normal_v = normal_value.transpose(0, 1)
@@ -567,10 +574,24 @@ def reference_sdpa(
     key_pos = key_pos.repeat_interleave(groups, dim=0)
     # SDPA's fused CUDA implementations expect [B,H,Q,D]. A rank-3 tensor
     # sends this reference route through a slower fallback on every layer.
-    q = query.transpose(0, 1).unsqueeze(0)
-    mask = (key_pos.unsqueeze(1) <= query_positions.view(1, -1, 1)).unsqueeze(0)
-    output = F.scaled_dot_product_attention(
-        q, key.unsqueeze(0), value.unsqueeze(0),
-        attn_mask=mask, dropout_p=0.0, scale=float(scale)
+    query_chunk = max(
+        1,
+        min(
+            q_len,
+            REFERENCE_SDPA_MAX_MASK_BYTES // max(1, q_heads * key.shape[1]),
+        ),
     )
-    return output.squeeze(0).transpose(0, 1).contiguous()
+    outputs = []
+    for start in range(0, q_len, query_chunk):
+        stop = min(start + query_chunk, q_len)
+        q = query[start:stop].transpose(0, 1).unsqueeze(0)
+        mask = (
+            key_pos.unsqueeze(1)
+            <= query_positions[start:stop].view(1, -1, 1)
+        ).unsqueeze(0)
+        output = F.scaled_dot_product_attention(
+            q, key.unsqueeze(0), value.unsqueeze(0),
+            attn_mask=mask, dropout_p=0.0, scale=float(scale)
+        )
+        outputs.append(output.squeeze(0).transpose(0, 1))
+    return torch.cat(outputs, dim=0).contiguous()

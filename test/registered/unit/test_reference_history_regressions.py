@@ -64,6 +64,54 @@ def test_reference_attention_uses_four_dimensional_sdpa(monkeypatch):
     assert observed == [(4, 4, 4, 4)]
 
 
+def test_reference_attention_chunks_headwise_mask_without_changing_values(monkeypatch):
+    torch.manual_seed(20260920)
+    history = ReferenceLayerKV(
+        key=torch.randn(2, 5, 4),
+        value=torch.randn(2, 5, 4),
+        positions=torch.tensor([[0, 2, 4, 6, 8], [1, 3, 5, 7, 9]]),
+    )
+    query = torch.randn(7, 4, 4)
+    normal_key = torch.randn(3, 2, 4)
+    normal_value = torch.randn(3, 2, 4)
+    normal_positions = torch.tensor([10, 11, 12])
+    query_positions = torch.tensor([4, 5, 6, 7, 8, 10, 12])
+    original = reference_module.F.scaled_dot_product_attention
+    mask_shapes = []
+
+    def checked(q, k, v, **kwargs):
+        mask_shapes.append(tuple(kwargs["attn_mask"].shape))
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(reference_module.F, "scaled_dot_product_attention", checked)
+    monkeypatch.setattr(reference_module, "REFERENCE_SDPA_MAX_MASK_BYTES", 4 * 2 * 8)
+    actual = reference_sdpa(
+        query,
+        history,
+        normal_key,
+        normal_value,
+        normal_positions,
+        query_positions,
+        scale=0.5,
+    )
+    assert mask_shapes == [(1, 4, 2, 8)] * 3 + [(1, 4, 1, 8)]
+
+    expected = []
+    for head in range(4):
+        kv_head = head // 2
+        keys = torch.cat([history.key[kv_head], normal_key[:, kv_head]])
+        values = torch.cat([history.value[kv_head], normal_value[:, kv_head]])
+        key_positions = torch.cat([history.positions[kv_head], normal_positions])
+        logits = query[:, head] @ keys.T * 0.5
+        logits = logits.masked_fill(
+            key_positions[None, :] > query_positions[:, None], float("-inf")
+        )
+        expected.append(torch.softmax(logits, dim=-1) @ values)
+    torch.testing.assert_close(
+        actual, torch.stack(expected, dim=1), atol=1e-5, rtol=1e-5
+    )
+
+
 def test_two_turn_append_only_uses_previous_resident_kv_and_new_delta():
     source_key = torch.arange(6 * 2, dtype=torch.float32).reshape(6, 2, 1)
     source_value = source_key + 100
