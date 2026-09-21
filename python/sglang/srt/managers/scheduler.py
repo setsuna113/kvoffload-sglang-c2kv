@@ -97,6 +97,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CloseSessionReqOutput,
     ContinueGenerationReqInput,
     CreateRecoveryCheckpointReqInput,
     CreateRecoveryCheckpointReqOutput,
@@ -7555,7 +7556,11 @@ class Scheduler(
         return self.session_controller.open(recv_req)
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        self.session_controller.close(recv_req)
+        success = self.session_controller.close(recv_req)
+        return CloseSessionReqOutput(
+            session_id=recv_req.session_id,
+            success=success,
+        )
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

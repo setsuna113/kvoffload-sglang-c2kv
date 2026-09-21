@@ -1938,6 +1938,31 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
     try:
+        if obj.wait_for_completion:
+            try:
+                result = await _global_state.tokenizer_manager.abort_request_and_wait(
+                    rid=obj.rid,
+                    session_id=obj.session_id,
+                    close_session=obj.close_session,
+                    timeout=(
+                        30.0 if obj.timeout is None else float(obj.timeout)
+                    ),
+                )
+            except asyncio.TimeoutError:
+                return ORJSONResponse(
+                    content={
+                        "rid": obj.rid,
+                        "session_id": obj.session_id,
+                        "request_status": "cleanup_timeout",
+                        "session_status": "unknown",
+                    },
+                    status_code=504,
+                )
+            if obj.close_session and obj.session_id:
+                serving_chat = getattr(request.app.state, "openai_serving_chat", None)
+                if serving_chat is not None:
+                    serving_chat.release_persistent_history_session(obj.session_id)
+            return ORJSONResponse(content=result, status_code=200)
         _global_state.tokenizer_manager.abort_request(
             rid=obj.rid, abort_all=obj.abort_all
         )

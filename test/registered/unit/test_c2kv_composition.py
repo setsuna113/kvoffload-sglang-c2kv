@@ -232,6 +232,7 @@ def test_exact_session_commit_maps_computed_source_horizon_to_rendered_prefix(mo
     result = [{"output_ids": [50, 51], "text": "ok", "meta_info": {
         "kv_memory_report": {"persistent_session_computed_logical_horizon": 21}
     }}]
+    chat._persistent_history_requests = {("session", id(request)): request}
     chat._commit_persistent_history_session(request, result)
     assert len(chat._persistent_history_sessions["session"]) == 14
     assert chat._persistent_history_computed_prefixes["session"] == 13

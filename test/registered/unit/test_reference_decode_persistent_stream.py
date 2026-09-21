@@ -242,6 +242,7 @@ def test_checkpoint_finish_and_next_turn_append_reuse_only_exact_resident_stream
             "meta_info": {"kv_memory_report": last_req.kv_memory_report},
         }
     ]
+    serving._persistent_history_requests = {("s", id(adapted)): adapted}
     commit(serving, adapted, ret)
     receipt = ret[0]["meta_info"]["persistent_history_session"]
     assert receipt["continuation_mode"] == "exact_generated_prefix"

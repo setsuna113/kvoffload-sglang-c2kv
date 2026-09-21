@@ -1605,6 +1605,12 @@ class AbortReq(BaseReq):
     # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
     abort_message: Optional[str] = None
+    # HTTP-only lifecycle options. Scheduler workers ignore these fields; the
+    # tokenizer manager uses them to provide acknowledged timeout cleanup.
+    wait_for_completion: bool = False
+    close_session: bool = False
+    session_id: Optional[str] = None
+    timeout: Optional[float] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
@@ -1717,6 +1723,12 @@ class OpenSessionReqInput(BaseReq):
 @dataclass
 class CloseSessionReqInput(BaseReq):
     session_id: str
+
+
+@dataclass
+class CloseSessionReqOutput(BaseReq):
+    session_id: str
+    success: bool
 
 
 @dataclass

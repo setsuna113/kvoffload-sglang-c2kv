@@ -321,12 +321,14 @@ class SessionController:
             )
             return OpenSessionReqOutput(session_id, True)
 
-    def close(self, recv_req: CloseSessionReqInput):
+    def close(self, recv_req: CloseSessionReqInput) -> bool:
         session_id = recv_req.session_id
         if session_id not in self.sessions:
             logger.warning(f"session id {session_id} does not exist, cannot delete.")
+            return False
         else:
             self._close(session_id)
+            return True
 
     def _close(self, session_id: str):
         session = self.sessions[session_id]

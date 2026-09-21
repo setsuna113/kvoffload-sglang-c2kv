@@ -800,6 +800,8 @@ def test_paper_history_boundary_uses_server_tokens_and_accepts_first_turn():
         _c2kv_first_message_start_offset=lambda request, message, tools: 0,
     )
     config = {"history_start_message_count": 1, "history_message_count": 2}
+    contextual = method(path, "OpenAIServingChat", "_c2kv_contextual_prefix_ids", {"List": list})
+    self._c2kv_contextual_prefix_ids = lambda *args: contextual(self, *args)
     req = SimpleNamespace(
         messages=[object(), object(), object()],
         c2kv_kv_memory_hint={"paper_measurement": config},

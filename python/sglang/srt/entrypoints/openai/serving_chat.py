@@ -6,6 +6,7 @@ import logging
 import math
 import time
 import uuid
+import weakref
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -134,6 +135,11 @@ class OpenAIServingChat(OpenAIServingBase):
         self._persistent_history_exact_output: Dict[str, bool] = {}
         self._persistent_history_tool_segments: Dict[str, List[Dict[str, Any]]] = {}
         self._persistent_history_tool_source_digests: Dict[str, str] = {}
+        self._persistent_history_requests = weakref.WeakValueDictionary()
+
+    def _track_persistent_history_request(self, request) -> None:
+        key = (request._persistent_history_session_id, id(request))
+        self._persistent_history_requests[key] = request
 
     def release_persistent_history_session(self, session_id: str) -> None:
         self._persistent_history_sessions.pop(session_id, None)
@@ -143,6 +149,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self._persistent_history_exact_output.pop(session_id, None)
         self._persistent_history_tool_segments.pop(session_id, None)
         self._persistent_history_tool_source_digests.pop(session_id, None)
+        for key in list(self._persistent_history_requests):
+            if key[0] == session_id:
+                self._persistent_history_requests.pop(key, None)
 
     @staticmethod
     def _is_persistent_history_request(request: ChatCompletionRequest) -> bool:
@@ -450,10 +459,20 @@ class OpenAIServingChat(OpenAIServingBase):
         ret: List[Dict[str, Any]],
     ) -> None:
         session_id = getattr(adapted_request, "_persistent_history_session_id", None)
+        if getattr(adapted_request, "_lifecycle_cancel_requested", False):
+            if session_id:
+                self.release_persistent_history_session(session_id)
+            return
         canonical_prompt_ids = getattr(
             adapted_request, "_persistent_history_canonical_prompt_ids", None
         )
         if not session_id or not isinstance(canonical_prompt_ids, list) or not ret:
+            return
+        # Scheduler completion can precede the HTTP response consumer. A close
+        # invalidates every live request even when rid_to_state is already gone.
+        # Weak ownership also removes abandoned requests without tombstones.
+        key = (session_id, id(adapted_request))
+        if self._persistent_history_requests.pop(key, None) is not adapted_request:
             return
         output_ids = ret[0].get("output_ids") or []
         if not isinstance(output_ids, list):
@@ -548,8 +567,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         If continue_final_message is enabled and the last message is from assistant,
         extract its content and remove it from the message list.
-        If continue_final_message is False and the last message is from assistant,
-        convert it to a user message to ensure the last message is always from user.
+        If continue_final_message is False, retain completed assistant tool
+        calls; convert a plain assistant text tail to the legacy user prefix.
 
         Only processes text-based content (strings), ignoring multimodal content (lists).
 
@@ -571,8 +590,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Extract content and remove the assistant message
                     assistant_prefix = last_content
                     messages = messages[:-1]
-                else:
+                elif not messages[-1].get("tool_calls"):
                     # Convert the last assistant message to user message
+                    # only for the legacy text-prefix path. A completed tool
+                    # call is conversation history, not an assistant prefix.
                     messages[-1] = {"role": "user", "content": last_content}
         return messages, assistant_prefix
 
@@ -1073,6 +1094,7 @@ class OpenAIServingChat(OpenAIServingBase):
             raise ValueError("TOOL_KV_CONTINUE_FINAL_MESSAGE_UNSUPPORTED")
         tokenizer = self.tokenizer_manager.tokenizer
         messages = self._openai_messages_for_chat_template(list(request.messages))
+        messages, _ = self._handle_last_assistant_message(messages, request)
         rendered = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -1189,6 +1211,37 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
             reference_config["agentkv_marker_stage_sequences"] = resolved_markers
 
+    def _c2kv_contextual_prefix_ids(
+        self, request, count: int, tools, prompt_ids: List[int]
+    ) -> List[int]:
+        """Resolve a message prefix without closing an ongoing tool group."""
+        messages = list(request.messages[:count])
+        ids = self._c2kv_chat_template_input_ids(request, messages, tools)
+        if prompt_ids[: len(ids)] == ids:
+            return ids
+        if not (
+            0 < count < len(request.messages)
+            and request.messages[count - 1].role == "tool"
+            and request.messages[count].role == "tool"
+        ):
+            return ids
+        # Chat templates can wrap consecutive tool results in one message.
+        # Rendering a truncated group appends EOS and whitespace that are
+        # absent at this boundary in the complete prompt. Remove only that
+        # trailer, and accept it only when every preceding token matches.
+        tokenizer = self.tokenizer_manager.tokenizer
+        eos_id = tokenizer.eos_token_id
+        end = len(ids)
+        while end and ids[end - 1] != eos_id:
+            if not tokenizer.decode([ids[end - 1]]).isspace():
+                return ids
+            end -= 1
+        if end and ids[end - 1] == eos_id:
+            contextual = ids[: end - 1]
+            if contextual and prompt_ids[: len(contextual)] == contextual:
+                return contextual
+        return ids
+
     def _resolve_paper_history_token_count(
         self,
         request: "ChatCompletionRequest",
@@ -1223,7 +1276,9 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = self._chat_template_tools(request)
         completed = list(request.messages[:count])
         protected = list(request.messages[:start_count])
-        completed_ids = self._c2kv_chat_template_input_ids(request, completed, tools)
+        completed_ids = self._c2kv_contextual_prefix_ids(
+            request, count, tools, prompt_ids
+        )
         prefix_start = 0
         if prompt_ids[: len(completed_ids)] != completed_ids:
             prefix_start = self._find_token_subsequence(prompt_ids, completed_ids)
@@ -1232,8 +1287,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 "Paper measurement history prefix is absent from the final prompt"
             )
         if protected:
-            protected_ids = self._c2kv_chat_template_input_ids(
-                request, protected, tools
+            protected_ids = self._c2kv_contextual_prefix_ids(
+                request, start_count, tools, prompt_ids
             )
             if completed_ids[: len(protected_ids)] != protected_ids:
                 raise ValueError(
@@ -1485,6 +1540,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if persistent_session_id is not None:
             adapted_request._persistent_history_session_id = persistent_session_id
             adapted_request._persistent_history_canonical_prompt_ids = canonical_prompt_ids
+            self._track_persistent_history_request(adapted_request)
             # Derive the removable suffix from the same template and options.
             # A client may request a recovery append, but cannot nominate raw
             # history tokens to truncate or replay.

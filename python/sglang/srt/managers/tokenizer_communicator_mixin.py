@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CloseSessionReqOutput,
     CreateRecoveryCheckpointReqInput,
     CreateRecoveryCheckpointReqOutput,
     DestroyWeightsUpdateGroupReqInput,
@@ -1177,8 +1178,26 @@ class TokenizerCommunicatorMixin:
         self: TokenizerManager,
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
+        timeout: Optional[float] = 30.0,
     ):
-        await self.send_to_scheduler.send_pyobj(obj)
+        existing = self.session_close_futures.get(obj.session_id)
+        if existing is not None:
+            result: CloseSessionReqOutput = await asyncio.wait_for(
+                asyncio.shield(existing), timeout=timeout
+            )
+            return result.success
+
+        future = asyncio.get_running_loop().create_future()
+        self.session_close_futures[obj.session_id] = future
+        try:
+            await self.send_to_scheduler.send_pyobj(obj)
+            result: CloseSessionReqOutput = await asyncio.wait_for(
+                asyncio.shield(future), timeout=timeout
+            )
+            return result.success
+        finally:
+            if self.session_close_futures.get(obj.session_id) is future:
+                del self.session_close_futures[obj.session_id]
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]

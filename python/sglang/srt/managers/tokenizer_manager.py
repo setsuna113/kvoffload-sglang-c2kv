@@ -18,12 +18,14 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 import os
 import pickle
 import signal
 import socket
 import sys
 import threading
+import weakref
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -53,6 +55,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    CloseSessionReqInput,
+    CloseSessionReqOutput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     EmbeddingReqInput,
@@ -134,6 +138,10 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    # A separate terminal event lets lifecycle cleanup wait independently of
+    # the response consumer, which clears the ordinary event between outputs.
+    terminal_event: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    terminal_finish_reason: Optional[Dict[str, Any]] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -330,6 +338,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # Terminal states remain discoverable only while their original HTTP
+        # consumer still owns them. This closes the completion/cancel race
+        # without retaining large outputs or accumulating tombstones.
+        self.terminal_request_states = weakref.WeakValueDictionary()
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -340,6 +352,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+        self.session_close_futures = {}  # session_id -> close acknowledgement
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -460,6 +473,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 ),
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (CloseSessionReqOutput, self._handle_close_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
@@ -1408,6 +1422,84 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 self.metrics_collector.labels
             )
 
+    async def abort_request_and_wait(
+        self,
+        rid: str,
+        *,
+        session_id: Optional[str] = None,
+        close_session: bool = False,
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
+        """Abort one request and optionally close its session with acknowledgements.
+
+        The terminal request event arrives only after the scheduler has run its
+        finish path, including KV release or transfer. The close acknowledgement
+        arrives only after the session cache has released its ownership.
+        """
+        if not rid:
+            raise ValueError("A non-empty rid is required for acknowledged abort.")
+        if close_session and not session_id:
+            raise ValueError("session_id is required when close_session is true.")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be finite and positive.")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        state = self.rid_to_state.get(rid)
+        request_was_active = state is not None
+        if state is None:
+            state = self.terminal_request_states.get(rid)
+        finish_reason = None
+        if state is None:
+            request_status = "not_found"
+        else:
+            request_session_id = (
+                (getattr(state.obj, "session_params", None) or {}).get("id")
+            )
+            if session_id is not None and request_session_id != session_id:
+                raise ValueError(
+                    "rid belongs to a different session: "
+                    f"expected={session_id}, actual={request_session_id}"
+                )
+            # A lost response must not later recreate tokenizer-side session
+            # tracking after the acknowledged close.
+            state.obj._lifecycle_cancel_requested = True
+            if request_was_active:
+                self.abort_request(rid)
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await asyncio.wait_for(
+                    state.terminal_event.wait(), timeout=remaining
+                )
+            finish_reason = state.terminal_finish_reason
+            request_status = (
+                "aborted"
+                if isinstance(finish_reason, dict)
+                and finish_reason.get("type") == "abort"
+                else "completed"
+            )
+
+        session_status = "not_requested"
+        if close_session:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            closed = await self.close_session(
+                CloseSessionReqInput(session_id=session_id),
+                request=None,
+                timeout=remaining,
+            )
+            session_status = "closed" if closed else "not_found"
+
+        return {
+            "rid": rid,
+            "session_id": session_id,
+            "request_status": request_status,
+            "session_status": session_status,
+            "finish_reason": finish_reason,
+        }
+
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
@@ -1719,7 +1811,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
-                del self.rid_to_state[rid]
+                state.terminal_finish_reason = meta_info["finish_reason"]
+                self.terminal_request_states[rid] = state
+                if self.rid_to_state.get(rid) is state:
+                    del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
                 if self.server_args.enable_lora and state.obj.lora_path:
@@ -1727,6 +1822,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
             state.out_list.append(out_dict)
             state.event.set()
+            if state.finished:
+                state.terminal_event.set()
 
             # Log metrics and dump
             if self.enable_metrics and state.obj.log_metrics:
@@ -2215,7 +2312,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            return
         state.finished = True
         state.time_stats.set_finished_time()
 
@@ -2254,6 +2353,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         }
         state.out_list.append(out)
         state.event.set()
+        state.terminal_finish_reason = finish_reason
+        state.terminal_event.set()
+        self.terminal_request_states[recv_obj.rid] = state
+        if self.rid_to_state.get(recv_obj.rid) is state:
+            del self.rid_to_state[recv_obj.rid]
+
+    def _handle_close_session_req_output(self, recv_obj: CloseSessionReqOutput):
+        future = self.session_close_futures.get(recv_obj.session_id)
+        if future is not None and not future.done():
+            future.set_result(recv_obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.send_to_scheduler.send_pyobj(ranks)
