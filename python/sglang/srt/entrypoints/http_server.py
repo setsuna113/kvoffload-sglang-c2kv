@@ -840,7 +840,7 @@ def _c2kv_native_capability() -> Dict[str, Any]:
         "shadow_feature_stored_dtype": "float16",
         "racer_persistent": {
             "schema": "racer-persistent-transaction-v1",
-            "methods": ["commitkv", "h2o", "snapkv_persistent", "streamingllm"],
+            "methods": ["commitkv", "h2o", "snapkv_persistent", "pyramidkv", "streamingllm"],
             "device": getattr(server_args, "device", None),
             "overlap_disabled": bool(getattr(server_args, "disable_overlap_schedule", False)),
             "source_replacement": "normal_exact_reference_union_columns",

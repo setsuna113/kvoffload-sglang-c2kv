@@ -57,11 +57,13 @@ def run_method(args, method):
                       "history_kv_kernel_size": 3, "history_kv_pooling": "avgpool",
                       "history_kv_h2o_recent_fraction": 0.25, "persistent_session": True}
             hint = {"persistent_history_session": persistent, "history_kv_eviction": config,
-                    "history_kv_method": method, "history_kv_backend": "reference_attention" if method == "commitkv" else "physical_eviction",
+                    "history_kv_method": method, "history_kv_backend": "reference_attention" if method in {"commitkv", "pyramidkv"} else "physical_eviction",
                     "history_kv_event_messages": [{"message_index": i, "role": message["role"], "phase": "act" if i == 1 else "tool" if i == 2 else "others"} for i, message in enumerate(messages)]}
-            if method == "commitkv":
-                hint["history_kv_reference_config"] = {"method": method, "target_tokens": 128,
-                                                       "commitkv": {"checkpoint_interval": 4, "window_size": 2, "measurement_layer_id": 0}}
+            if method in {"commitkv", "pyramidkv"}:
+                hint["history_kv_reference_config"] = {"method": method, "target_tokens": 128}
+                if method == "commitkv":
+                    hint["history_kv_reference_config"]["commitkv"] = {
+                        "checkpoint_interval": 4, "window_size": 2, "measurement_layer_id": 0}
             if args.shadow_layer is not None:
                 hint["shadow_features"] = {"enabled": True, "prefill_layer": args.shadow_layer}
             payload = {"model": args.model, "messages": messages, "temperature": 0, "max_tokens": 16, "min_tokens": 8,
@@ -100,7 +102,7 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--shadow-layer", type=int)
-    parser.add_argument("--methods", nargs="+", choices=["commitkv", "h2o", "snapkv_persistent", "streamingllm"], default=["commitkv", "h2o", "snapkv_persistent", "streamingllm"])
+    parser.add_argument("--methods", nargs="+", choices=["commitkv", "h2o", "snapkv_persistent", "pyramidkv", "streamingllm"], default=["commitkv", "h2o", "snapkv_persistent", "pyramidkv", "streamingllm"])
     args = parser.parse_args()
     model_info = request(args.base_url, "/get_model_info")
     capability = (model_info.get("c2kv_native_packed") or {}).get("racer_persistent") or {}
