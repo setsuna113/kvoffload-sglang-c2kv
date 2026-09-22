@@ -2306,7 +2306,40 @@ class Scheduler(
             and req.req_pool_idx is not None
             and not req.kv_committed_freed
         ):
+            if SessionAwareCache._is_persistent_history_req(req):
+                # A turn aborted between rounds is incomplete: roll the session
+                # back to its previous turn instead of saving a partial ledger.
+                req.persistent_history_eviction_failed = True
             release_kv_cache(req, self.tree_cache, is_insert=False)
+
+    def _abort_chunked_c2kv_request(self, req: "Req") -> bool:
+        """Finish an aborted multi-round C2KV request at a chunk boundary.
+
+        Between chunks the request is neither queued nor running, so an abort
+        would otherwise wait for its whole prefill. With the overlap scheduler
+        off, the previous chunk's forward has completed; the request takes the
+        release path of a mid-prefill C2KV failure (a persistent turn rolls
+        back to the session's previous turn) and the tokenizer receives the
+        abort finish. Other chunked requests keep the upstream behavior.
+        """
+        if (
+            req.c2kv_rounds is None
+            or self.enable_overlap
+            or not isinstance(req.to_finish, FINISH_ABORT)
+        ):
+            return False
+        if SessionAwareCache._is_persistent_history_req(req):
+            req.persistent_history_eviction_failed = True
+        req.check_finished()
+        committed = req.kv_committed_len
+        self._release_c2kv_pins(req)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        self.stream_output([req], req.return_logprob)
+        logger.info(
+            "C2KV chunked prefill aborted at chunk boundary: rid=%s, "
+            "kv_committed_len=%s", req.rid, committed,
+        )
+        return True
 
     @paper_telemetry.measure_synchronous_request("c2kv_extract", "extraction")
     def handle_extract_request(self, recv_req: "TokenizedExtractReqInput"):
@@ -6171,6 +6204,8 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
+            if self._abort_chunked_c2kv_request(self.chunked_req):
+                self.chunked_req = None
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
@@ -7437,6 +7472,19 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+
+        # A chunked multi-round C2KV request sits between forwards in
+        # self.chunked_req; get_next_batch_to_run finishes it at the next
+        # chunk boundary (_abort_chunked_c2kv_request).
+        chunked = self.chunked_req
+        if (
+            chunked is not None
+            and chunked.c2kv_rounds is not None
+            and not chunked.finished()
+            and (recv_req.abort_all or chunked.rid.startswith(recv_req.rid))
+        ):
+            logger.debug(f"Abort chunked C2KV request. {chunked.rid=}")
+            chunked.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
