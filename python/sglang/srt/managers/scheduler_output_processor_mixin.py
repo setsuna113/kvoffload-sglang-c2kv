@@ -714,6 +714,10 @@ class SchedulerOutputProcessorMixin:
                         req, normal_kv_tokens=int(batch.seq_lens_cpu[i].item())
                     )
 
+                    from sglang.srt.mem_cache.racer_transaction import checkpoint_generation
+
+                    checkpoint_generation(req)
+
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
 

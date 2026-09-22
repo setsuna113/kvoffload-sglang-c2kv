@@ -959,6 +959,8 @@ class Scheduler(
 
         if isinstance(self.tree_cache, SessionAwareCache):
             self.tree_cache.c2kv_pool = self.c2kv_pool
+            if self.c2kv_pool is not None:
+                self.tree_cache.c2kv_tool_rope_cache = self.tp_worker.model_runner.model.model.layers[0].self_attn.rotary_emb.cos_sin_cache
 
         paper_telemetry.configure(
             self.token_to_kv_pool_allocator,
@@ -3900,6 +3902,7 @@ class Scheduler(
             baseline,
             resident_positions,
             target_tokens=serving_state.target_tokens,
+            capacity_tokens=(reference_config.get("racer_effective_target_tokens") if isinstance(reference_config, dict) else None),
             num_layers=len(layer_ids),
             num_kv_heads=num_kv_heads,
             device=first_key.device,
@@ -4404,7 +4407,8 @@ class Scheduler(
             "history_start": history_start,
             "history_end": old_len,
             "target_tokens": int(
-                reference_config.get("target_tokens")
+                reference_config.get("racer_effective_target_tokens")
+                or reference_config.get("target_tokens")
                 or base_config.get("target_tokens")
                 or 2048
             ),

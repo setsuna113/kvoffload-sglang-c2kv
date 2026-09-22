@@ -6,6 +6,12 @@ from __future__ import annotations
 def remap_message_metadata(hint, removed, message_count):
     """Remove carrier rows from boundary counts and event metadata together."""
     removed = set(removed)
+    recovery = (hint.get("persistent_history_session") or {}).get("recovery_append")
+    if isinstance(recovery, dict) and "source_message_indices" in recovery:
+        indices = list(recovery["source_message_indices"])
+        if any(type(index) is not int or not 0 <= index < message_count or index in removed for index in indices):
+            raise ValueError("RACER_SOURCE_REPLACEMENT_MESSAGE_INVALID")
+        recovery["source_message_indices"] = [index - sum(previous < index for previous in removed) for index in indices]
     for name in ("history_kv_eviction", "history_kv_reference_config"):
         config = hint.get(name)
         if not isinstance(config, dict):

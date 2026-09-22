@@ -268,6 +268,7 @@ class Session:
             eos_token_ids=eos_token_ids,
             require_reasoning=req.require_reasoning,
             return_hidden_states=req.return_hidden_states,
+            c2kv_prompt_last_hidden_only=getattr(req, "c2kv_prompt_last_hidden_only", False),
             return_routed_experts=req.return_routed_experts,
             priority=req.priority,
             routing_key=req.routing_key,

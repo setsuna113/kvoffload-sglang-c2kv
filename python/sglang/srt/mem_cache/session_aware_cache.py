@@ -62,6 +62,8 @@ class SessionSlot:
     history_kv_reference_state: Any = None
     history_kv_reference_config: Any = None
     history_kv_runtime_state: Any = None
+    racer_held_generation: Any = None
+    racer_ephemeral_spans: Any = None
     c2kv_tool_source_spans: Any = None
     c2kv_tool_kv_accounting: Any = None
     c2kv_tool_view: Any = None
@@ -101,8 +103,13 @@ class SessionSlot:
         self.history_kv_runtime_state = getattr(
             req, "history_kv_runtime_state", None
         )
+        self.racer_held_generation = getattr(req, "racer_held_generation", None)
+        req.racer_held_generation = None
         self.c2kv_tool_source_spans = list(getattr(req, "c2kv_tool_source_spans", []) or [])
         hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
+        ephemeral = hint.get("racer_ephemeral_source_span")
+        if ephemeral is not None and tuple(ephemeral) not in (self.racer_ephemeral_spans or []):
+            self.racer_ephemeral_spans = list(self.racer_ephemeral_spans or []) + [tuple(ephemeral)]
         tool_segments = hint.get("tool_memory_segments") or []
         if tool_segments:
             self.c2kv_tool_view = [dict(item) for item in tool_segments]
@@ -189,6 +196,7 @@ class SessionAwareCache(BasePrefixCache):
         self.inner = inner
         self.slots: Dict[str, SessionSlot] = {}
         self.c2kv_pool = None
+        self.c2kv_tool_rope_cache = None
 
     # -- Forward PrefixCacheTrait properties to inner cache --
 
@@ -298,8 +306,12 @@ class SessionAwareCache(BasePrefixCache):
         drop_generation_prefix = int(
             hint.get("persistent_session_drop_generation_prefix_tokens") or 0
         )
+        if getattr(slot, "racer_held_generation", None) is not None or (hint.get("persistent_history_session") or {}).get("transaction"):
+            self._resolve_racer_transaction(slot, req)
         if drop_generation_prefix:
             self._trim_persistent_generation_prefix(slot, req)
+        if hint.get("racer_replacement_source_spans") and not getattr(req, "racer_source_replacement_applied", False):
+            self._replace_racer_sources(slot, req)
 
         if isinstance(config, dict) and config.get("persistent_continuation_pending"):
             # A timed-out generation can finish on the server after its caller
@@ -509,49 +521,199 @@ class SessionAwareCache(BasePrefixCache):
             cache_protected_len=slot.cache_protected_len,
         )
 
+    def _resolve_racer_transaction(self, slot: SessionSlot, req: Req) -> None:
+        """Promote a held decode, or restore its untouched resident prompt."""
+        from sglang.srt.mem_cache.racer_transaction import transaction_config
+
+        transaction = transaction_config(getattr(req, "c2kv_kv_memory_hint", None) or {})
+        held = getattr(slot, "racer_held_generation", None)
+        report = getattr(req, "kv_memory_report", None)
+        if getattr(req, "racer_previous_resolution_applied", False):
+            return
+        if held is None:
+            if transaction and transaction.get("resolution"):
+                raise RuntimeError("RACER_TRANSACTION_CHECKPOINT_MISSING")
+            return
+        if transaction is None or not transaction.get("resolution"):
+            raise RuntimeError("RACER_TRANSACTION_PREVIOUS_RESOLUTION_REQUIRED")
+        resolution = transaction["resolution"]
+        if transaction["phase"] == "regenerate" and (
+            resolution != "discard" or held.decision_id != transaction["decision_id"]
+        ):
+            raise RuntimeError("RACER_TRANSACTION_REGENERATION_MISMATCH")
+        if resolution == "discard":
+            row = self.req_to_token_pool.req_to_token[slot.req_pool_idx]
+            old_len = int(slot.kv_allocated_len)
+            if old_len < held.prompt_len:
+                raise RuntimeError("RACER_TRANSACTION_PROTECTED_PROMPT_LOST")
+            keep = row[:held.prompt_len].long()
+            tail = row[held.prompt_len:old_len].long()
+            keep_pages = torch.unique(keep[keep > 0] // self.page_size)
+            tail_pages = torch.unique(tail[tail > 0] // self.page_size)
+            free_pages = tail_pages[~torch.isin(tail_pages, keep_pages)]
+            if free_pages.numel():
+                self.token_to_kv_pool_allocator.free(free_pages * self.page_size)
+            row[held.prompt_len:old_len] = 0
+            slot.kv_committed_len = slot.kv_allocated_len = held.prompt_len
+            slot.c2kv_position_correction = held.position_correction
+            slot.history_kv_resident_positions = list(held.resident_positions)
+            slot.history_kv_reference_state = held.reference_state
+            slot.history_kv_runtime_state = held.runtime_state
+            slot.history_kv_score_state = held.score_state
+            if isinstance(report, dict):
+                report["racer_previous_resolution"] = {
+                    "decision_id": held.decision_id, "resolution": resolution,
+                    "restored_prompt_tokens": held.prompt_len,
+                    "freed_normal_page_tokens": int(free_pages.numel()) * self.page_size,
+                    "restored_algorithm_statistics": True,
+                    "discarded_draft_executed": False,
+                    "full_history_reprefill_performed": False,
+                }
+        elif isinstance(report, dict):
+            report["racer_previous_resolution"] = {
+                "decision_id": held.decision_id, "resolution": resolution,
+                "promoted_algorithm_statistics": True,
+                "full_history_reprefill_performed": False,
+            }
+        recovery = ((getattr(req, "c2kv_kv_memory_hint", None) or {}).get("persistent_history_session") or {}).get("recovery_append") or {}
+        if transaction["decision_id"] != held.decision_id or recovery.get("replace_previous_evidence"):
+            self._expire_racer_evidence(slot, req)
+        slot.racer_held_generation = None
+        req.racer_previous_resolution_applied = True
+
+    def _expire_racer_evidence(self, slot: SessionSlot, req: Req) -> None:
+        """Forget recovery evidence without rebasing any retained RoPE position."""
+        spans = list(getattr(slot, "racer_ephemeral_spans", None) or [])
+        if not spans:
+            return
+        from sglang.srt.mem_cache.history_kv_eviction import PhysicalHistoryKVEvictor
+
+        state = getattr(slot, "history_kv_reference_state", None)
+        if state is not None:
+            for layer in state.layers.values():
+                if any(bool(((layer.positions >= start) & (layer.positions < end)).any()) for start, end in spans):
+                    raise RuntimeError("RACER_EVIDENCE_MUST_REMAIN_NATIVE_TAIL")
+        positions = list(slot.history_kv_resident_positions)
+        keep = [i for i, p in enumerate(positions) if not any(start <= p < end for start, end in spans)]
+        old_len = len(positions)
+        if len(keep) != old_len:
+            result = PhysicalHistoryKVEvictor(self.req_to_token_pool, self.token_to_kv_pool_allocator).evict(
+                slot, method="racer_evidence_expiry", history_start=0,
+                history_end=old_len, target_tokens=len(keep), selected_history_indices=keep,
+            )
+            if not result.success:
+                raise RuntimeError("RACER_EVIDENCE_EXPIRY_FAILED: " + result.error)
+            for field in ("origin_input_ids", "origin_input_ids_unpadded", "c2kv_virtual_input_ids"):
+                ids = getattr(req, field, None)
+                if ids is not None:
+                    setattr(req, field, [ids[i] for i in keep] + list(ids[old_len:]))
+            slot.history_kv_resident_positions = [positions[i] for i in keep]
+            resident = set(slot.history_kv_resident_positions)
+            slot.history_kv_score_state = {
+                layer: {p: score for p, score in scores.items() if p in resident}
+                for layer, scores in (slot.history_kv_score_state or {}).items()
+            }
+        report = getattr(req, "kv_memory_report", None)
+        if isinstance(report, dict):
+            report["racer_evidence_expiry"] = {
+                "source_spans": spans, "expired_native_tokens": old_len - len(keep),
+                "retained_original_tokens": len(keep), "canonical_ledger_preserved": True,
+                "full_history_reprefill_performed": False,
+                "trigger": "recovery_replacement" if (((getattr(req, "c2kv_kv_memory_hint", None) or {}).get("persistent_history_session") or {}).get("recovery_append") or {}).get("replace_previous_evidence") else "next_decision",
+            }
+        slot.racer_ephemeral_spans = []
+
+    def _replace_racer_sources(self, slot: SessionSlot, req: Req) -> None:
+        from sglang.srt.mem_cache.history_kv_eviction import PhysicalHistoryKVEvictor
+        from sglang.srt.mem_cache.racer_transaction import replace_reference_sources, interrupt_replaced_commit_window
+
+        spans = req.c2kv_kv_memory_hint["racer_replacement_source_spans"]
+        reference, reference_receipt = replace_reference_sources(slot.history_kv_reference_state, spans)
+        positions = list(slot.history_kv_resident_positions)
+        keep = [index for index, p in enumerate(positions) if not any(start <= p < end for start, end in spans)]
+        old_len = len(positions)
+        if len(keep) < old_len:
+            result = PhysicalHistoryKVEvictor(self.req_to_token_pool, self.token_to_kv_pool_allocator).evict(
+                slot, method="racer_source_replacement", history_start=0, history_end=old_len,
+                target_tokens=len(keep), selected_history_indices=keep,
+            )
+            if not result.success:
+                raise RuntimeError("RACER_SOURCE_REPLACEMENT_FAILED: " + result.error)
+            for field in ("origin_input_ids", "origin_input_ids_unpadded", "c2kv_virtual_input_ids"):
+                ids = getattr(req, field, None)
+                if ids is not None:
+                    setattr(req, field, [ids[i] for i in keep] + list(ids[old_len:]))
+        slot.history_kv_resident_positions = [positions[i] for i in keep]
+        resident = set(slot.history_kv_resident_positions)
+        slot.history_kv_score_state = {layer: {p: score for p, score in values.items() if p in resident} for layer, values in (slot.history_kv_score_state or {}).items()}
+        slot.history_kv_reference_state = reference
+        removed = [p for index, p in enumerate(positions) if index not in set(keep)]
+        for layer in reference_receipt["layers"]:
+            for name in ("source_positions", "collateral_positions"):
+                removed.extend(p for head in layer[name] for p in head)
+        lifecycle = interrupt_replaced_commit_window(getattr(slot, "history_kv_runtime_state", None), removed)
+        req.racer_source_replacement_applied = True
+        report = getattr(req, "kv_memory_report", None)
+        if isinstance(report, dict):
+            report["racer_source_replacement"] = {
+                "source_spans": spans, "removed_normal_positions": [p for index, p in enumerate(positions) if index not in set(keep)],
+                "reference": reference_receipt, "reference_deletion_policy": "union_columns",
+                "interrupted_lifecycle_measurement": lifecycle,
+                "full_history_reprefill_performed": False,
+            }
+
     def _refresh_persistent_tool_prefix(self, slot: SessionSlot, req: Req) -> None:
+        hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
+        refresh = hint.get("persistent_tool_refresh")
+        if not refresh:
+            return
+        old = refresh.get("previous_segments") or [refresh["previous_segment"]]
+        new = refresh.get("new_segments") or [refresh["new_segment"]]
+        if len(old) != len(new):
+            raise RuntimeError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+        for index, (previous, current) in enumerate(zip(old, new)):
+            if previous != current:
+                self._refresh_persistent_tool_segment(slot, req, {
+                    "source_protocol_token_sha256": refresh["source_protocol_token_sha256"],
+                    "previous_segment": previous, "new_segment": current,
+                }, index)
+
+    def _refresh_persistent_tool_segment(self, slot: SessionSlot, req: Req, refresh: dict, segment_index: int) -> None:
         """Replace the tool view while preserving existing reference history.
 
         Paged allocators own whole pages: rebuild the normal row on fresh
         pages, then release the old row, including its partially used pages.
         """
-        hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
-        refresh = hint.get("persistent_tool_refresh")
-        if not refresh:
-            return
         old_view = refresh["previous_segment"]
         new_view = refresh["new_segment"]
-        if slot.c2kv_tool_view == [new_view]:
+        if slot.c2kv_tool_view[segment_index] == new_view:
             return  # match_prefix may retry this same request.
         if (
-            slot.c2kv_tool_view != [old_view]
+            slot.c2kv_tool_view[segment_index] != old_view
             or slot.c2kv_tool_source_digest
             != refresh["source_protocol_token_sha256"]
-            or len(slot.c2kv_tool_source_spans or []) != 1
+            or segment_index >= len(slot.c2kv_tool_source_spans or [])
         ):
             raise RuntimeError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
-        if old_view.get("key_hash") or new_view.get("key_hash"):
-            raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_GIST_UNSUPPORTED")
-        keys = new_view.get("repair_key_hashes") or []
-        if len(keys) != 1 or self.c2kv_pool is None:
+        keys = ([new_view["key_hash"]] if new_view.get("key_hash") else []) + list(new_view.get("repair_key_hashes") or [])
+        if not keys or self.c2kv_pool is None:
             raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_ENTRY_UNSUPPORTED")
         key = keys[0]
-        if not self.c2kv_pool.pin_many([key]):
+        if not self.c2kv_pool.pin_many(keys):
             raise RuntimeError("C2KV_CACHE_MISS: persistent tool refresh entry")
         try:
-            entry = self.c2kv_pool.get(key)
-            if entry is None or entry.entry_type != "repair" or not entry.already_rotated:
+            entries = [self.c2kv_pool.get(key) for key in keys]
+            if any(entry is None for entry in entries):
                 raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_ENTRY_UNSUPPORTED")
-            source_start, source_end = slot.c2kv_tool_source_spans[0]
+            source_start, source_end = slot.c2kv_tool_source_spans[segment_index]
             if (
                 int(new_view["source_tokens"]) != source_end - source_start
-                or int(new_view["token_start"]) != source_start
             ):
                 raise RuntimeError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
-            new_positions = [
-                int(position)
-                for position in self.c2kv_pool.get_position_ids(entry).tolist()
-            ]
+            entry_positions = [self.c2kv_pool.get_position_ids(entry) + (source_start if entry.entry_type == "gist" else 0) for entry in entries]
+            new_positions = torch.cat(entry_positions).tolist()
+            order = sorted(range(len(new_positions)), key=new_positions.__getitem__)
+            new_positions = [int(new_positions[index]) for index in order]
             if (
                 not new_positions
                 or
@@ -572,6 +734,11 @@ class SessionAwareCache(BasePrefixCache):
             old_len = int(slot.kv_committed_len)
             old_width = len(indices)
             new_width = len(new_positions)
+            old_gist = self.c2kv_pool.get(old_view["key_hash"]) if old_view.get("key_hash") else None
+            if old_view.get("key_hash") and old_gist is None and old_view.get("repair_key_hashes"):
+                raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_OLD_ACCOUNTING_UNAVAILABLE")
+            old_gist_tokens = int(old_gist.gist_len) if old_gist is not None else (old_width if old_view.get("key_hash") else 0)
+            new_gist_tokens = sum(int(entry.gist_len) for entry in entries if entry.entry_type == "gist")
             delta = new_width - old_width
             page_size = int(getattr(self.token_to_kv_pool_allocator, "page_size", 1))
             rebuild_row = page_size > 1
@@ -621,7 +788,21 @@ class SessionAwareCache(BasePrefixCache):
                     key_buffer, value_buffer = kv_cache.get_kv_buffer(layer_id)
                     dest_key = key_buffer.reshape(-1, *key_buffer.shape[-2:])
                     dest_value = value_buffer.reshape(-1, *value_buffer.shape[-2:])
-                    new_key, new_value = self.c2kv_pool.get_layer_kv(entry, layer_idx)
+                    all_keys, all_values = [], []
+                    for entry, positions in zip(entries, entry_positions):
+                        stored_key, stored_value = self.c2kv_pool.get_layer_kv(entry, layer_idx)
+                        if not entry.already_rotated:
+                            from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+
+                            rope = self.c2kv_tool_rope_cache
+                            if rope is None or bool(((positions < 0) | (positions >= rope.shape[0])).any()):
+                                raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_ROPE_UNAVAILABLE")
+                            half = rope.shape[-1] // 2
+                            stored_key = apply_rotary_emb(stored_key, rope[positions, :half], rope[positions, half:], True)
+                        all_keys.append(stored_key)
+                        all_values.append(stored_value)
+                    new_key = torch.cat(all_keys)[order]
+                    new_value = torch.cat(all_values)[order]
                     if (
                         new_key.shape != dest_key[new_loc].shape
                         or new_value.shape != dest_value[new_loc].shape
@@ -663,14 +844,19 @@ class SessionAwareCache(BasePrefixCache):
                 for layer, scores in (slot.history_kv_score_state or {}).items()
             }
             req.history_kv_score_state = slot.history_kv_score_state
-            slot.c2kv_tool_view = [dict(new_view)]
-            for name in ("active_tool_kv_tokens", "active_tool_repair_tokens"):
-                if name in (slot.c2kv_tool_kv_accounting or {}):
-                    slot.c2kv_tool_kv_accounting[name] += delta
+            slot.c2kv_tool_view[segment_index] = dict(new_view)
+            accounting = slot.c2kv_tool_kv_accounting or {}
+            for name, change in (
+                ("active_tool_kv_tokens", delta),
+                ("active_tool_gist_tokens", new_gist_tokens - old_gist_tokens),
+                ("active_tool_repair_tokens", delta - new_gist_tokens + old_gist_tokens),
+            ):
+                if name in accounting:
+                    accounting[name] += change
             pinned = getattr(req, "c2kv_pinned_keys", None)
             if pinned is None:
                 req.c2kv_pinned_keys = pinned = []
-            pinned.append(key)
+            pinned.extend(keys)
             report = getattr(req, "kv_memory_report", None)
             if isinstance(report, dict):
                 report["persistent_tool_kv_refreshed"] = True
@@ -682,7 +868,7 @@ class SessionAwareCache(BasePrefixCache):
                 report["persistent_tool_kv_refresh_page_size"] = page_size
                 report.update(slot.c2kv_tool_kv_accounting or {})
         except Exception:
-            self.c2kv_pool.unpin_many([key])
+            self.c2kv_pool.unpin_many(keys)
             raise
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
@@ -720,6 +906,14 @@ class SessionAwareCache(BasePrefixCache):
                 raise RuntimeError("PERSISTENT_HISTORY_SESSION_FINISHED_LEDGER_MISMATCH")
             self._discard_persistent_decode_suffix(req)
             positions = list(req.history_kv_resident_positions or [])
+            old_slot = self.slots.get(req.session.session_id)
+            evidence_spans = list(getattr(old_slot, "racer_ephemeral_spans", None) or [])
+            if hint.get("racer_ephemeral_source_span") is not None:
+                evidence_spans.append(tuple(hint["racer_ephemeral_source_span"]))
+            if isinstance(getattr(req, "kv_memory_report", None), dict) and evidence_spans:
+                native_evidence = sum(any(start <= p < end for start, end in evidence_spans) for p in positions)
+                req.kv_memory_report["racer_native_evidence_tokens"] = native_evidence
+                req.kv_memory_report["racer_history_and_evidence_tokens"] = int(req.kv_memory_report.get("active_history_kv_tokens", 0)) + native_evidence
             # Ordinary persistent methods discard every decode KV token before
             # saving the session. The validated resident ledger is therefore
             # all prompt, even if overlap advanced the mutable decode length.
@@ -763,6 +957,7 @@ class SessionAwareCache(BasePrefixCache):
                 event.update({
                     **{k: hint.get(k) for k in ("episode_id", "turn_id", "step_id")},
                     "event": "session_prompt_saved", "session_id": req.session.session_id,
+                    "history_kv_method": str(hint.get("history_kv_method") or reference_method or (getattr(req, "history_kv_eviction", None) or {}).get("method") or ""),
                     "history_kv_backend": (
                         "reference_attention"
                         if reference_method in {"pyramid", "pyramidkv", "agentkv", "commitkv"}

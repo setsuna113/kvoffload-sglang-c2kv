@@ -549,12 +549,13 @@ def test_persistent_match_rejects_resident_prefix_beyond_refreshed_active_input(
 
 @pytest.mark.parametrize("new_positions", [[2, 4, 5], [4]])
 @pytest.mark.parametrize("page_size", [1, 128])
+@pytest.mark.parametrize("entry_kind", ["repair", "gist"])
 def test_persistent_tool_refresh_replaces_only_tool_kv_and_preserves_reference_state(
-    monkeypatch, new_positions, page_size,
+    monkeypatch, new_positions, page_size, entry_kind,
 ):
     Cache = extract_class(
         "mem_cache/session_aware_cache.py", "SessionAwareCache",
-        {"_refresh_persistent_tool_prefix"}, extra={"SessionSlot": object, "Req": object},
+        {"_refresh_persistent_tool_prefix", "_refresh_persistent_tool_segment"}, extra={"SessionSlot": object, "Req": object},
     )
     monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.c2kv_pool",
                         SimpleNamespace(c2kv_gist_token_ids=lambda key, count: [-50 - i for i in range(count)]))
@@ -562,10 +563,23 @@ def test_persistent_tool_refresh_replaces_only_tool_kv_and_preserves_reference_s
     old_view = {"token_start": 2, "token_end": 2, "source_tokens": 6,
                 "key_hash": "", "repair_key_hashes": ["old"]}
     new_view = {**old_view, "repair_key_hashes": ["new"]}
-    entry = SimpleNamespace(entry_type="repair", already_rotated=True)
+    if entry_kind == "gist":
+        new_view.update(key_hash="new", repair_key_hashes=[])
+    entry = SimpleNamespace(entry_type=entry_kind, already_rotated=entry_kind == "repair", gist_len=len(new_positions))
     new_width = len(new_positions)
     source_k = torch.arange(new_width * 2, dtype=torch.float32).reshape(new_width, 1, 2) + 300
     source_v = source_k + 100
+    expected_key = source_k
+    if entry_kind == "gist":
+        rotary_path = SRT / "layers/rotary_embedding/utils.py"
+        node = next(item for item in ast.parse(rotary_path.read_text(encoding="utf-8")).body if isinstance(item, ast.FunctionDef) and item.name == "apply_rotary_emb")
+        namespace = {"torch": torch}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(rotary_path), "exec"), namespace)
+        rotary = namespace["apply_rotary_emb"]
+        monkeypatch.setitem(sys.modules, "sglang.srt.layers.rotary_embedding.utils", SimpleNamespace(apply_rotary_emb=rotary))
+        angles = torch.arange(16, dtype=torch.float32)
+        cache.c2kv_tool_rope_cache = torch.stack((angles.cos(), angles.sin()), dim=-1)
+        expected_key = rotary(source_k, angles[new_positions].cos().unsqueeze(-1), angles[new_positions].sin().unsqueeze(-1), True)
     target_k = torch.zeros(512, 1, 2)
     target_v = torch.zeros(512, 1, 2)
     old_start = 10 if page_size == 1 else 128
@@ -579,7 +593,7 @@ def test_persistent_tool_refresh_replaces_only_tool_kv_and_preserves_reference_s
     frees = []
     cache.c2kv_pool = SimpleNamespace(
         pin_many=lambda keys: True, unpin_many=lambda keys: None,
-        get=lambda key: entry, get_position_ids=lambda item: torch.tensor(new_positions),
+        get=lambda key: entry, get_position_ids=lambda item: torch.tensor(new_positions) - (2 if entry_kind == "gist" else 0),
         get_layer_kv=lambda item, layer: (source_k, source_v), num_layers=1,
         start_layer=0,
     )
@@ -603,6 +617,7 @@ def test_persistent_tool_refresh_replaces_only_tool_kv_and_preserves_reference_s
         kv_committed_len=7, kv_allocated_len=7, c2kv_position_correction=5,
         cache_protected_len=0,
         c2kv_tool_kv_accounting={"active_tool_kv_tokens": 2,
+                                 "active_tool_gist_tokens": 0,
                                  "active_tool_repair_tokens": 2},
     )
     old_ids = [1, 2, -1, -2, 5, 6, 7, 8]
@@ -621,14 +636,15 @@ def test_persistent_tool_refresh_replaces_only_tool_kv_and_preserves_reference_s
     expected_freed = old_row[2:4] if page_size == 1 else old_row
     assert frees == [expected_freed]
     new_tool_rows = expected_row[2:2 + new_width]
-    assert torch.equal(target_k[new_tool_rows], source_k)
+    assert torch.equal(target_k[new_tool_rows], expected_key)
     assert torch.equal(target_v[new_tool_rows], source_v)
     assert torch.equal(target_k[expected_row[:2] + expected_row[2 + new_width:]], old_non_tool)
     assert slot.history_kv_reference_state is req.history_kv_reference_state is state
     assert slot.history_kv_resident_positions == [0, 1] + new_positions + [8, 10, 11]
     assert slot.kv_committed_len + slot.c2kv_position_correction == 12
     assert req.origin_input_ids == [1, 2] + [-50 - i for i in range(new_width)] + [5, 6, 7, 8]
-    assert req.kv_memory_report["active_tool_repair_tokens"] == new_width
+    assert req.kv_memory_report["active_tool_repair_tokens"] == (new_width if entry_kind == "repair" else 0)
+    assert req.kv_memory_report["active_tool_gist_tokens"] == (new_width if entry_kind == "gist" else 0)
     assert req.kv_memory_report["persistent_tool_kv_refreshed"] is True
     cache._refresh_persistent_tool_prefix(slot, req)
     assert frees == [expected_freed]

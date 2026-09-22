@@ -135,6 +135,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self._persistent_history_exact_output: Dict[str, bool] = {}
         self._persistent_history_tool_segments: Dict[str, List[Dict[str, Any]]] = {}
         self._persistent_history_tool_source_digests: Dict[str, str] = {}
+        self._persistent_history_transactions: Dict[str, Dict[str, Any]] = {}
         self._persistent_history_requests = weakref.WeakValueDictionary()
 
     def _track_persistent_history_request(self, request) -> None:
@@ -149,6 +150,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self._persistent_history_exact_output.pop(session_id, None)
         self._persistent_history_tool_segments.pop(session_id, None)
         self._persistent_history_tool_source_digests.pop(session_id, None)
+        getattr(self, "_persistent_history_transactions", {}).pop(session_id, None)
         for key in list(self._persistent_history_requests):
             if key[0] == session_id:
                 self._persistent_history_requests.pop(key, None)
@@ -274,6 +276,11 @@ class OpenAIServingChat(OpenAIServingBase):
         # ordinary methods retain the canonical pre-decode prompt contract.
         previous = self._persistent_history_sessions.get(session_id)
         hint = request.c2kv_kv_memory_hint
+        transaction = (hint.get("persistent_history_session") or {}).get("transaction")
+        if transaction is not None:
+            from sglang.srt.mem_cache.racer_transaction import transaction_config
+
+            transaction = transaction_config(hint)
         config = hint.get("history_kv_eviction") if isinstance(hint, dict) else None
         recovery_append = (hint.get("persistent_history_session") or {}).get(
             "recovery_append"
@@ -283,7 +290,11 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         # This is server-owned state, never a caller-selected truncation length.
         hint.pop("persistent_session_drop_generation_prefix_tokens", None)
+        for key in ("racer_ephemeral_source_span", "racer_internal_source_spans", "racer_replacement_source_spans", "racer_active_ephemeral_source_spans"):
+            hint.pop(key, None)
         if previous is None:
+            if transaction and (transaction.get("resolution") or transaction["phase"] != "draft"):
+                raise ValueError("RACER_TRANSACTION_CHECKPOINT_MISSING")
             if recovery_append:
                 raise ValueError("PERSISTENT_HISTORY_RECOVERY_REQUIRES_RESIDENT_SESSION")
             if isinstance(config, dict):
@@ -301,6 +312,21 @@ class OpenAIServingChat(OpenAIServingBase):
         exact_output = bool(
             getattr(self, "_persistent_history_exact_output", {}).get(session_id)
         )
+        held = getattr(self, "_persistent_history_transactions", {}).get(session_id)
+        if held is not None:
+            if transaction is None or not transaction.get("resolution"):
+                raise ValueError("RACER_TRANSACTION_PREVIOUS_RESOLUTION_REQUIRED")
+            if transaction["phase"] == "regenerate":
+                if transaction["decision_id"] != held["decision_id"] or transaction["resolution"] != "discard":
+                    raise ValueError("RACER_TRANSACTION_REGENERATION_MISMATCH")
+                if hint.get("tool_memory_segments", []) != held.get("tool_memory_segments", []):
+                    raise ValueError("RACER_TRANSACTION_TOOL_PLAN_CHANGED")
+            if transaction["resolution"] == "discard":
+                previous = list(self._persistent_history_generation_bases[session_id])
+                logical_prefix = len(previous)
+                exact_output = False
+        elif transaction and transaction.get("resolution"):
+            raise ValueError("RACER_TRANSACTION_CHECKPOINT_MISSING")
         if recovery_append:
             if exact_output:
                 raise ValueError(
@@ -392,6 +418,22 @@ class OpenAIServingChat(OpenAIServingBase):
             config["persistent_canonical_history_end"] = history_end
             config["persistent_canonical_prompt_tokens"] = len(full_prompt_ids)
         self._translate_tool_session_coordinates(request, logical_prefix, len(full_prompt_ids))
+        if held is not None:
+            internal_spans = list(held.get("internal_source_spans") or [])
+            hint["racer_internal_source_spans"] = internal_spans
+            replace_evidence = bool(((hint.get("persistent_history_session") or {}).get("recovery_append") or {}).get("replace_previous_evidence"))
+            hint["racer_active_ephemeral_source_spans"] = list(held.get("active_ephemeral_source_spans") or []) if transaction["decision_id"] == held["decision_id"] and not replace_evidence else []
+            hint["history_kv_event_token_spans"] = [
+                item for item in hint.get("history_kv_event_token_spans", [])
+                if not any(int(item["start"]) < end and start < int(item["end"]) for start, end in internal_spans)
+            ]
+        recovery = (hint.get("persistent_history_session") or {}).get("recovery_append") or {}
+        if recovery.get("enabled") and recovery.get("source_message_indices"):
+            requested = set(recovery["source_message_indices"])
+            spans = [item for item in hint.get("history_kv_event_token_spans", []) if item.get("message_index") in requested]
+            if len(spans) != len(requested) or any(int(item["end"]) > int(hint["persistent_session_logical_prefix_tokens"]) for item in spans):
+                raise ValueError("RACER_SOURCE_REPLACEMENT_SPANS_UNAVAILABLE")
+            hint["racer_replacement_source_spans"] = [[int(item["start"]), int(item["end"])] for item in spans]
         return delta, session_id, full_prompt_ids
 
     def _translate_tool_session_coordinates(self, request, input_prefix, input_len):
@@ -418,9 +460,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 if not source_digest or source_digest != previous_digest:
                     raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
                 frame_keys = ("token_start", "token_end", "source_tokens")
-                same_frame = len(previous) == len(old_prefix) == 1 and all(
-                    previous[0].get(key) == old_prefix[0].get(key)
-                    for key in frame_keys
+                same_frame = len(previous) == len(old_prefix) and all(
+                    old.get(key) == new.get(key)
+                    for old, new in zip(previous, old_prefix) for key in frame_keys
                 )
                 if not same_frame:
                     raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
@@ -428,6 +470,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     "source_protocol_token_sha256": source_digest,
                     "previous_segment": dict(previous[0]),
                     "new_segment": dict(old_prefix[0]),
+                    "previous_segments": [dict(item) for item in previous],
+                    "new_segments": [dict(item) for item in old_prefix],
                 }
         elif previous != old_prefix and input_prefix:
             raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
@@ -478,6 +522,20 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(output_ids, list):
             raise ValueError("PERSISTENT_HISTORY_SESSION_OUTPUT_IDS_MISSING")
         hint = getattr(adapted_request, "c2kv_kv_memory_hint", None) or {}
+        transaction = (hint.get("persistent_history_session") or {}).get("transaction")
+        if transaction is not None:
+            from sglang.srt.mem_cache.racer_transaction import transaction_config
+
+            transaction = transaction_config(hint)
+        if transaction is not None:
+            if not hasattr(self, "_persistent_history_transactions"):
+                self._persistent_history_transactions = {}
+            self._persistent_history_transactions[session_id] = {
+                **transaction,
+                "tool_memory_segments": [dict(item) for item in hint.get("tool_memory_segments", [])],
+                "internal_source_spans": list(hint.get("racer_internal_source_spans") or []),
+                "active_ephemeral_source_spans": list(hint.get("racer_active_ephemeral_source_spans") or []),
+            }
         if hint.get("tool_memory_segments"):
             self._persistent_history_tool_segments[session_id] = [
                 dict(item) for item in hint["tool_memory_segments"]
@@ -554,7 +612,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 hint.get("persistent_session_retokenization_token_shift", 0)
             ),
             "generation_prefix_tokens": len(generation_prefix_ids or []),
-            "recovery_append_supported": not exact_output,
+            "recovery_append_supported": not exact_output or transaction is not None,
+            "transaction": ({**transaction, "status": "held"} if transaction else None),
         }
 
     def _handle_last_assistant_message(
@@ -1477,13 +1536,25 @@ class OpenAIServingChat(OpenAIServingBase):
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
+        hint = request.c2kv_kv_memory_hint or {}
+        transaction = (hint.get("persistent_history_session") or {}).get("transaction")
+        if transaction and not self.tokenizer_manager.server_args.disable_overlap_schedule:
+            raise ValueError("RACER_TRANSACTION_REQUIRES_DISABLE_OVERLAP_SCHEDULE")
+        shadow_enabled = False
+        if hint.get("shadow_features"):
+            from sglang.srt.entrypoints.http_server import _c2kv_native_capability
+            from sglang.srt.mem_cache.racer_features import validate_shadow_request
+
+            shadow_enabled = validate_shadow_request(hint["shadow_features"], _c2kv_native_capability())
+            if shadow_enabled and getattr(request, "c2kv_use_gist_projection", None) is not False:
+                raise ValueError("RACER_SHADOW_REQUIRES_EXPLICIT_BASE_QUERY")
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
-            return_logprob=request.logprobs,
+            return_logprob=request.logprobs or shadow_enabled or bool(transaction),
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
             stream=request.stream,
@@ -1495,7 +1566,8 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
-            return_hidden_states=request.return_hidden_states,
+            return_hidden_states=request.return_hidden_states or shadow_enabled,
+            c2kv_prompt_last_hidden_only=shadow_enabled,
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,
             c2kv_outer_request_id=(
@@ -1553,6 +1625,28 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             else:
                 adapted_request._persistent_history_generation_prefix_ids = []
+            persistent_config = request.c2kv_kv_memory_hint.get("persistent_history_session") or {}
+            if (persistent_config.get("recovery_append") or {}).get("enabled"):
+                from sglang.srt.mem_cache.c2kv_composition import source_boundary
+
+                prefix = adapted_request._persistent_history_generation_prefix_ids
+                if not prefix:
+                    raise ValueError("RACER_RECOVERY_GENERATION_PREFIX_UNAVAILABLE")
+                source_end = source_boundary(len(canonical_prompt_ids) - len(prefix), request.c2kv_kv_memory_hint.get("tool_memory_segments") or [])
+                source_start = int(request.c2kv_kv_memory_hint["persistent_session_logical_prefix_tokens"])
+                if persistent_config.get("transaction"):
+                    request.c2kv_kv_memory_hint["racer_ephemeral_source_span"] = [source_start, source_end]
+                    internal = request.c2kv_kv_memory_hint.setdefault("racer_internal_source_spans", [])
+                    internal.append([source_start, source_end])
+                    request.c2kv_kv_memory_hint.setdefault("racer_active_ephemeral_source_spans", []).append([source_start, source_end])
+                    request.c2kv_kv_memory_hint["history_kv_event_token_spans"] = [
+                        item for item in request.c2kv_kv_memory_hint.get("history_kv_event_token_spans", [])
+                        if not (int(item["start"]) < source_end and source_start < int(item["end"]))
+                    ]
+            if persistent_config.get("transaction"):
+                from sglang.srt.mem_cache.racer_transaction import enforce_request_budget
+
+                enforce_request_budget(request.c2kv_kv_memory_hint)
 
         if request.c2kv_kv_memory_hint:
             logger.info(
@@ -2317,6 +2411,50 @@ class OpenAIServingChat(OpenAIServingBase):
                 "persistent_history_session"
             ),
         }
+        shadow_request = (request.c2kv_kv_memory_hint or {}).get("shadow_features")
+        if shadow_request and shadow_request.get("enabled", True):
+            from sglang.srt.entrypoints.http_server import _c2kv_native_capability
+            from sglang.srt.mem_cache.racer_features import shadow_feature_receipt
+
+            meta = ret[0]["meta_info"]
+            hint = request.c2kv_kv_memory_hint or {}
+            metadata["shadow_features"] = shadow_feature_receipt(
+                meta, _c2kv_native_capability(), int(hint["persistent_session_canonical_prompt_tokens"]) - 1,
+            )
+            raw = meta.get("output_token_logprobs") or []
+            metadata["token_logprobs"] = [None if item is None else float(item[0]) for item in raw]
+            if len(metadata["token_logprobs"]) != len(ret[0].get("output_ids") or []):
+                raise ValueError("RACER_DRAFT_LOGPROB_ALIGNMENT_MISMATCH")
+        transaction = ((request.c2kv_kv_memory_hint or {}).get("persistent_history_session") or {}).get("transaction")
+        if transaction:
+            raw = ret[0]["meta_info"].get("output_token_logprobs") or []
+            output_ids = list(ret[0].get("output_ids") or [])
+            probabilities = [None if item is None else float(item[0]) for item in raw]
+            if len(probabilities) != len(output_ids):
+                raise ValueError("RACER_DRAFT_LOGPROB_ALIGNMENT_MISMATCH")
+            report = kv_memory_report or {}
+            held_receipt = report.get("racer_transaction") or {}
+            normal_prompt = held_receipt.get("checkpoint_prompt_tokens")
+            active_history = report.get("active_history_kv_tokens")
+            reference_tokens = int(active_history or 0) if report.get("reference_history_token_slots", 0) else 0
+            accounting = {
+                "resident_prompt_tokens": int(normal_prompt) + reference_tokens if normal_prompt is not None else None,
+                "normal_prompt_tokens": normal_prompt,
+                "active_history_tokens": active_history,
+                "native_evidence_tokens": int(report.get("racer_native_evidence_tokens", 0)),
+                "history_and_evidence_tokens": int(active_history or 0) + int(report.get("racer_native_evidence_tokens", 0)),
+                "generated_tokens": len(output_ids),
+                "canonical_delta_prefill_tokens": (report.get("history_kv_lifecycle") or {}).get("canonical_delta_prefill_tokens"),
+                "checkpoint_tensor_bytes": held_receipt.get("checkpoint_tensor_bytes"),
+                "full_history_reprefill_performed": False,
+                "source": "scheduler_resident_state",
+            }
+            metadata["racer_generation"] = {
+                "output_token_ids": output_ids,
+                "output_token_logprobs": probabilities,
+                "shadow_features": metadata.get("shadow_features"),
+                "accounting": accounting,
+            }
         # A C2KV injection that fails mid-prefill ends as FINISH_ABORT with no
         # status_code, i.e. an HTTP 200 whose finish_reason.type is "abort";
         # the per-choice field above copies only finish_reason["type"], so the

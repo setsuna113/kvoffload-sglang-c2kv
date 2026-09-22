@@ -284,8 +284,13 @@ class CommitKVRuntimeState:
         num_layers: int,
         num_kv_heads: int,
         device: torch.device | str | None = None,
+        capacity_tokens: int | None = None,
     ) -> tuple[list[torch.Tensor], dict[str, object]]:
         """Build ``I_j`` from accumulated retirement and pending protection."""
+
+        capacity = target_tokens if capacity_tokens is None else int(capacity_tokens)
+        if not 0 <= capacity <= target_tokens:
+            raise ValueError("CommitKV active capacity must not exceed its total budget")
 
         positions = (
             [int(value) for value in resident_positions.tolist()]
@@ -329,7 +334,7 @@ class CommitKVRuntimeState:
         selected, metadata = select_commitkv_headwise(
             baseline_indices,
             resident_token_count=len(positions),
-            target_tokens=target_tokens,
+            target_tokens=capacity,
             retired_indices=retired_local,
             pending_indices=pending_local,
             num_layers=num_layers,
@@ -339,6 +344,7 @@ class CommitKVRuntimeState:
         metadata.update(
             {
                 "measurement_layer_id": self.config.measurement_layer_id,
+                "active_capacity_tokens": capacity,
                 "window_size": self.config.window_size,
                 "page_size": self.config.page_size,
                 "pending_fraction": self.config.pending_fraction,

@@ -153,6 +153,9 @@ class _PaperTelemetry:
                 state = getattr(owner, field, None)
                 if state is not None:
                     states[id(state)] = state
+            held = getattr(owner, "racer_held_generation", None)
+            if include_snapshots and held is not None and held.reference_state is not None:
+                states[id(held.reference_state)] = held.reference_state
         kv_tensors, position_tensors = [], []
         for state in states.values():
             for layer in state.layers.values():

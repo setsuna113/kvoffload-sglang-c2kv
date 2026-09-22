@@ -151,6 +151,9 @@ def test_closing_persistent_session_releases_tool_ledger():
         _persistent_history_computed_prefixes={"s": 1},
         _persistent_history_exact_output={"s": True},
         _persistent_history_tool_segments={"s": [{"key_hash": "old"}]},
+        _persistent_history_tool_source_digests={"s": "source"},
+        _persistent_history_transactions={"s": {"decision_id": "a"}},
+        _persistent_history_requests={},
     )
 
     release(serving, "s")
