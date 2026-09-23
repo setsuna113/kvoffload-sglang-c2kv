@@ -16,6 +16,9 @@ def validate_shadow_request(request, capability):
 
 
 def shadow_feature_receipt(meta_info, capability, logical_position):
+    finish = meta_info.get("finish_reason") or {}
+    if finish.get("type") == "abort":
+        raise ValueError(f"RACER_GENERATION_ABORTED: {finish.get('message') or 'engine aborted generation'}")
     hidden = meta_info.get("hidden_states") or []
     if not hidden:
         raise ValueError("RACER_SHADOW_PREFILL_HIDDEN_MISSING")

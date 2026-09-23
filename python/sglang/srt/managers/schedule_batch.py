@@ -1022,6 +1022,22 @@ class Req(ReqDllmMixin):
 
     def prepare_c2kv_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         """Build the transient fill_ids view for the active C2KV prefill round."""
+        # C2KV rounds bypass init_next_round_input(), including its streaming
+        # logprob normalization. The resident prompt can change width during
+        # tool refresh, so a stale absolute start must not select input tokens.
+        if (
+            self.session is not None
+            and self.session.streaming
+            and self.return_logprob
+            and self.logprob_start_len >= 0
+        ):
+            logger.warning(
+                "logprob_start_len=%d is not supported for streaming sessions "
+                "and will be ignored (rid=%s). Only new-token logprobs are returned.",
+                self.logprob_start_len,
+                self.rid,
+            )
+            self.logprob_start_len = -1
         if isinstance(self.history_kv_eviction, dict) and self.history_kv_eviction.get("persistent_continuation_pending"):
             # The multi-round path normally bypasses match_prefix entirely.
             # Restore session ownership BEFORE preparing the resident+delta

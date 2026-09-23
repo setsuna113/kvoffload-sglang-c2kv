@@ -21,7 +21,8 @@ def request(base, path, payload=None):
     data = None if payload is None else json.dumps(payload).encode()
     req = Request(base.rstrip("/") + path, data=data, headers={"Content-Type": "application/json"})
     with urlopen(req, timeout=120) as response:
-        return json.loads(response.read())
+        body = response.read()
+        return json.loads(body) if body else None
 
 
 def run_method(args, method):

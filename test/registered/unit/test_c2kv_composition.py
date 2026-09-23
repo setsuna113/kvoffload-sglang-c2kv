@@ -47,6 +47,63 @@ def extract_class(relative, name, methods=None, extra=None):
     return namespace[name]
 
 
+@pytest.mark.parametrize("streaming", [True, False])
+def test_refreshed_c2kv_round_keeps_streaming_logprobs_output_only(streaming):
+    Req = extract_class(
+        "managers/schedule_batch.py", "Req",
+        {"prepare_c2kv_round_input", "set_extend_input_len"},
+        extra={"BasePrefixCache": object},
+    )
+    req = Req()
+    req.rid = "refreshed-logprobs"
+    req.session = SimpleNamespace(streaming=streaming)
+    req.return_logprob = True
+    req.token_ids_logprob = None
+    req.logprob_start_len = 8  # Prompt length before a two-token tool refresh.
+    req.origin_input_ids = list(range(10))
+    req.c2kv_virtual_input_ids = list(range(10))
+    req.history_kv_eviction = {}
+    req.kv_committed_len = 8
+    req.prefix_indices = list(range(8))
+    req.last_node = req.last_host_node = None
+    req.c2kv_rounds = [SimpleNamespace(tokens=[8, 9])]
+    req.c2kv_round_idx = 0
+    req.c2kv_round_start_len = 8
+    req.fill_ids = []
+
+    req.prepare_c2kv_round_input()
+
+    assert req.extend_input_len == 2
+    assert req.extend_logprob_start_len == (2 if streaming else 0)
+    assert req.logprob_start_len == (-1 if streaming else 8)
+
+    if streaming:
+        OutputProcessor = extract_class(
+            "managers/scheduler_output_processor_mixin.py",
+            "SchedulerOutputProcessorMixin",
+            {"add_logprob_return_values", "_initialize_empty_logprob_containers"},
+            extra={"Scheduler": object, "Req": object,
+                   "LogitsProcessorOutput": object},
+        )
+        req.output_token_logprobs_val = []
+        req.output_token_logprobs_idx = []
+        req.top_logprobs_num = 0
+        for field in (
+            "input_token_logprobs_val", "input_token_logprobs_idx",
+            "input_top_logprobs_val", "input_top_logprobs_idx",
+            "input_token_ids_logprobs_val", "input_token_ids_logprobs_idx",
+        ):
+            setattr(req, field, None)
+        num_input = req.extend_input_len - req.extend_logprob_start_len
+        OutputProcessor().add_logprob_return_values(
+            0, req, 0, [42], num_input,
+            SimpleNamespace(next_token_logprobs=[-0.25]),
+        )
+        assert req.output_token_logprobs_val == [-0.25]
+        assert req.output_token_logprobs_idx == [42]
+        assert req.input_token_logprobs_val == []
+
+
 Round = extract_class("managers/schedule_batch.py", "C2KVPrefillRound")
 Scheduler = extract_class("managers/scheduler.py", "Scheduler", {
     "_build_c2kv_prefill_rounds", "_compose_c2kv_history_rounds",
@@ -382,6 +439,86 @@ def test_headwise_pyramid_excludes_tool_slots_from_reference_candidates(engine, 
     state = engine._build_pyramidkv_reference_state(req, config, score)
     assert not {4, 5} & set(state.layer(0).positions.flatten().tolist())
     assert state.layer(0).key.shape[1] == 2
+
+
+@pytest.mark.parametrize(
+    "effective_target, expected_layer_tokens",
+    [(8, [8, 8]), (4, [7, 1])],
+)
+def test_pyramid_builder_bounds_reference_only_recovery_state(
+    engine, monkeypatch, effective_target, expected_layer_tokens
+):
+    reference = load(
+        "test_reference_only_pyramid", "mem_cache/history_kv_reference.py"
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.mem_cache.history_kv_reference",
+        reference,
+    )
+    telemetry = SimpleNamespace(sample=lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.observability",
+        SimpleNamespace(paper_telemetry=telemetry),
+    )
+    keys = torch.arange(8, dtype=torch.float32).reshape(8, 1, 1)
+    kv_cache = SimpleNamespace(
+        get_kv_buffer=lambda layer: (keys, keys + 100)
+    )
+    engine.token_to_kv_pool_allocator = SimpleNamespace(
+        get_kvcache=lambda: kv_cache
+    )
+    engine.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.arange(8).reshape(1, 8)
+    )
+    req = SimpleNamespace(
+        req_pool_idx=0,
+        history_kv_resident_positions=list(range(8)),
+        history_kv_reference_state=None,
+    )
+    scores = {
+        "headwise_layers": [
+            torch.arange(1, 9, dtype=torch.float32).reshape(1, 8),
+            torch.arange(8, 0, -1, dtype=torch.float32).reshape(1, 8),
+        ],
+        "layer_ids": [0, 1],
+    }
+    initial = engine._build_pyramidkv_reference_state(
+        req,
+        {
+            "history_start": 0,
+            "history_end": 8,
+            "target_tokens": 8,
+            "history_kv_recent_window": 1,
+            "history_kv_kernel_size": 1,
+        },
+        scores,
+    )
+
+    req.history_kv_reference_state = initial
+    req.history_kv_resident_positions = []
+    engine.req_to_token_pool.req_to_token = torch.empty(
+        (1, 0), dtype=torch.long
+    )
+    state = engine._build_pyramidkv_reference_state(
+        req,
+        {
+            "history_start": 0,
+            "history_end": 0,
+            "target_tokens": effective_target,
+            "history_kv_recent_window": 1,
+            "history_kv_kernel_size": 1,
+        },
+        scores,
+    )
+
+    assert [
+        state.layer(layer_id).key.shape[1] for layer_id in (0, 1)
+    ] == expected_layer_tokens
+    assert state.selection_metadata["realized_full_token_equivalent"] <= (
+        effective_target
+    )
 
 
 def native_chunk(name, ids, start, ratio=4, tool=False):

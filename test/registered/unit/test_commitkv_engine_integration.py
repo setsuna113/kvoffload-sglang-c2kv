@@ -573,6 +573,71 @@ def test_scheduler_commitkv_builder_protects_pending_and_uses_common_indices():
     )
 
 
+@pytest.mark.parametrize("effective_target, expected_tokens", [(8, 8), (4, 4)])
+def test_commitkv_builder_bounds_reference_only_recovery_state(
+    effective_target, expected_tokens
+):
+    policy = CommitKVRuntimeState(
+        CommitKVConfig(measurement_layer_id=0, page_size=1)
+    )
+    serving_state = CommitKVServingState(policy=policy, target_tokens=8)
+    keys = torch.arange(8, dtype=torch.float32).view(8, 1, 1)
+    scheduler = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.arange(8, dtype=torch.long).view(1, -1)
+        ),
+        token_to_kv_pool_allocator=SimpleNamespace(
+            get_kvcache=lambda: _KVPool([keys], [keys + 100])
+        ),
+    )
+    scheduler._build_commitkv_reference_state = MethodType(
+        SCHEDULER_BUILD, scheduler
+    )
+    req = SimpleNamespace(
+        req_pool_idx=0,
+        history_kv_runtime_state=serving_state,
+        history_kv_reference_state=None,
+        history_kv_reference_config={
+            "method": "commitkv",
+            "target_tokens": 8,
+            "racer_effective_target_tokens": 8,
+        },
+        history_kv_resident_positions=list(range(8)),
+    )
+    initial = scheduler._build_commitkv_reference_state(
+        req,
+        {"history_start": 0, "history_end": 8, "target_tokens": 8},
+    )
+    assert initial.layers[0].key.shape[1] == 8
+
+    empty = keys[:0]
+    scheduler.req_to_token_pool.req_to_token = torch.empty(
+        (1, 0), dtype=torch.long
+    )
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+        get_kvcache=lambda: _KVPool([empty], [empty])
+    )
+    req.history_kv_reference_state = initial
+    req.history_kv_reference_config["racer_effective_target_tokens"] = (
+        effective_target
+    )
+    req.history_kv_resident_positions = []
+
+    state = scheduler._build_commitkv_reference_state(
+        req,
+        {
+            "history_start": 0,
+            "history_end": 0,
+            "target_tokens": effective_target,
+        },
+    )
+
+    assert state.layers[0].key.shape[1] == expected_tokens
+    assert state.selection_metadata["active_capacity_tokens"] == (
+        effective_target
+    )
+
+
 def test_commitkv_absolute_budget_survives_resolver_clamps_across_turns():
     hints = [_resolved_commitkv_hint(size) for size in (137, 274, 2100)]
     assert [hint["history_kv_eviction"]["target_tokens"] for hint in hints] == [

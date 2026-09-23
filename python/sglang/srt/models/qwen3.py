@@ -459,8 +459,26 @@ class Qwen3Attention(nn.Module):
             history_end = int(config.get("history_end") or 0)
             available_end = prefix_len + extend_len
             tool_kv_eviction = bool(config.get("tool_kv_eviction"))
-            if not (0 <= history_start < history_end) or (
+            reference_state = None
+            states = getattr(
+                forward_batch, "history_kv_reference_states", None
+            )
+            if (
+                states
+                and batch_idx < len(states)
+                and states[batch_idx] is not None
+            ):
+                reference_state = states[batch_idx].layer(
+                    self.attn.layer_id
+                )
+            reference_len = 0
+            if reference_state is not None:
+                reference_state.validate()
+                reference_len = int(reference_state.key.shape[1])
+            if not (0 <= history_start <= history_end) or (
                 not tool_kv_eviction and history_end > available_end
+            ) or (
+                history_start == history_end and reference_len == 0
             ):
                 continue
 
@@ -541,14 +559,6 @@ class Qwen3Attention(nn.Module):
                     device=flat_positions.device,
                 )
             k_req = k_req.transpose(0, 1).contiguous()
-            reference_state = None
-            states = getattr(forward_batch, "history_kv_reference_states", None)
-            if states and batch_idx < len(states) and states[batch_idx] is not None:
-                reference_state = states[batch_idx].layer(self.attn.layer_id)
-            reference_len = 0
-            if reference_state is not None:
-                reference_state.validate()
-                reference_len = int(reference_state.key.shape[1])
             groups = self.num_heads // self.num_kv_heads
 
             # The query may follow an already-cached history boundary. Include

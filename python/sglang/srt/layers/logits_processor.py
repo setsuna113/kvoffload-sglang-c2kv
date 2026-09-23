@@ -475,6 +475,10 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices_pt = 0
             input_logprob_indices = []
             pt, pruned_states_list, pruned_states_before_norm_list = 0, [], []
+            aux_pruned_states_lists = (
+                [[] for _ in aux_hidden_states]
+                if aux_hidden_states is not None else None
+            )
 
             for idx, (extend_logprob_start_len, extend_len) in enumerate(
                 zip(
@@ -499,6 +503,9 @@ class LogitsProcessor(nn.Module):
                     pruned_states_before_norm_list.append(
                         hidden_states_before_norm[pt + start_len : pt + extend_len]
                     )
+                if aux_pruned_states_lists is not None:
+                    for states, chunks in zip(aux_hidden_states, aux_pruned_states_lists):
+                        chunks.append(states[pt + start_len : pt + extend_len])
                 # Map each token to its sequence index, for chunked computation
                 # of input logprobs
                 token_to_seq_idx.extend([idx] * (extend_len - start_len))
@@ -518,6 +525,8 @@ class LogitsProcessor(nn.Module):
             pruned_states = torch.cat(pruned_states_list)
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = torch.cat(pruned_states_before_norm_list)
+            if aux_pruned_states_lists is not None:
+                aux_pruned_states = [torch.cat(chunks) for chunks in aux_pruned_states_lists]
             sample_indices = torch.tensor(
                 sample_indices, device=pruned_states.device, dtype=torch.int64
             )

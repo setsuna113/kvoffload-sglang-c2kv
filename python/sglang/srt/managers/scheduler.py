@@ -3599,7 +3599,7 @@ class Scheduler(
         history_start = int(config.get("history_start") or 0)
         history_end = int(config.get("history_end") or 0)
         history_len = history_end - history_start
-        if history_len <= 0:
+        if history_len < 0:
             raise RuntimeError("PYRAMIDKV_REFERENCE_HISTORY_EMPTY")
         existing_state = getattr(req, "history_kv_reference_state", None)
         ledger = list(getattr(req, "history_kv_resident_positions", None) or [])
@@ -3860,7 +3860,7 @@ class Scheduler(
         history_start = int(config.get("history_start") or 0)
         history_end = int(config.get("history_end") or 0)
         history_len = history_end - history_start
-        if history_len <= 0:
+        if history_len < 0:
             raise RuntimeError("COMMITKV_REFERENCE_HISTORY_EMPTY")
         ledger = list(getattr(req, "history_kv_resident_positions", None) or [])
         if len(ledger) < history_end:
@@ -4010,6 +4010,22 @@ class Scheduler(
             if isinstance(score_info, dict)
             else 0
         )
+        history_start = int(config.get("history_start") or 0)
+        history_end = int(config.get("history_end") or 0)
+        has_selectable_history = history_end > history_start
+        existing_reference_state = getattr(
+            req, "history_kv_reference_state", None
+        )
+        has_reference_history = bool(
+            existing_reference_state is not None
+            and any(
+                int(layer.key.shape[1]) > 0
+                for layer in existing_reference_state.layers.values()
+            )
+        )
+        has_history_candidates = (
+            has_selectable_history or has_reference_history
+        )
         try:
             from sglang.srt.mem_cache.history_kv_eviction import PhysicalHistoryKVEvictor
 
@@ -4025,7 +4041,8 @@ class Scheduler(
                 if config.get("tool_kv_eviction") and int(config.get("tool_keep_tokens") or 0) == 0:
                     expected_query_tokens = None
                 if (
-                    expected_query_tokens is not None
+                    has_history_candidates
+                    and expected_query_tokens is not None
                     and selection_query_tokens_observed != int(expected_query_tokens)
                 ):
                     raise RuntimeError(
@@ -4049,11 +4066,17 @@ class Scheduler(
                     )
                 selected = list(config["protected_history_indices"])
             elif method in {"pyramid", "pyramidkv"}:
-                if not isinstance(score_info, dict):
+                if not has_history_candidates:
+                    # RACER source replacement can remove every reference and
+                    # ordinary history token.  Preserve the valid zero-column
+                    # state; recovery/current tokens remain in the normal row.
+                    reference_state = existing_reference_state
+                elif not isinstance(score_info, dict):
                     raise RuntimeError("PYRAMIDKV_SELECTION_SCORES_UNAVAILABLE")
-                reference_state = self._build_pyramidkv_reference_state(
-                    req, config, score_info
-                )
+                else:
+                    reference_state = self._build_pyramidkv_reference_state(
+                        req, config, score_info
+                    )
                 # The headwise history now lives in method-owned tensors.  No
                 # shared history token may remain in req_to_token, or it would
                 # be counted and attended twice.
@@ -4064,17 +4087,20 @@ class Scheduler(
                 )
                 selected = []
             elif method == "commitkv":
-                reference_state = self._build_commitkv_reference_state(
-                    req, config
-                )
+                if has_history_candidates:
+                    reference_state = self._build_commitkv_reference_state(
+                        req, config
+                    )
+                else:
+                    reference_state = existing_reference_state
                 selected = []
             elif not isinstance(selected, list):
                 selected = self._select_history_kv_eviction_indices(req, config)
             result = evictor.evict(
                 req,
                 method=str(config.get("method") or ""),
-                history_start=int(config.get("history_start") or 0),
-                history_end=int(config.get("history_end") or 0),
+                history_start=history_start,
+                history_end=history_end,
                 target_tokens=int(config.get("target_tokens") or 0),
                 selected_history_indices=selected if isinstance(selected, list) else None,
             )

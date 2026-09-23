@@ -206,6 +206,65 @@ def test_grouped_score_respects_each_kv_heads_reference_positions():
     torch.testing.assert_close(scores["layers"][0], torch.tensor([5 / 3]))
 
 
+def test_pyramid_scores_reference_only_history_after_source_replacement():
+    collect = method(
+        ROOT / "python/sglang/srt/models/qwen3.py",
+        "Qwen3Attention",
+        "_collect_history_kv_eviction_scores",
+        {"torch": torch, "ForwardBatch": SimpleNamespace},
+    )
+    layer = SimpleNamespace(
+        key=torch.zeros(1, 2, 1),
+        positions=torch.tensor([[0, 1]]),
+        validate=lambda: None,
+    )
+    key_buffer = torch.zeros(8, 1, 1)
+    fb = SimpleNamespace(
+        c2kv_history_kv_eviction_configs=[{
+            "method": "pyramidkv",
+            "history_start": 0,
+            "history_end": 0,
+            "selection_query_start": 12,
+            "selection_query_end": 14,
+        }],
+        history_kv_reference_states=[SimpleNamespace(layer=lambda _: layer)],
+        history_kv_resident_positions=[[10, 11, 12, 13]],
+        forward_mode=SimpleNamespace(
+            is_extend_or_draft_extend_or_mixed=lambda: True
+        ),
+        extend_seq_lens_cpu=[2],
+        extend_prefix_lens_cpu=[2],
+        req_pool_indices=torch.tensor([0]),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.tensor([[1, 2]])
+        ),
+        token_to_kv_pool=SimpleNamespace(
+            _get_key_buffer=lambda _: key_buffer
+        ),
+    )
+    attention = SimpleNamespace(
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=1,
+        scaling=1.0,
+        attn=SimpleNamespace(layer_id=0),
+    )
+
+    collect(
+        attention,
+        torch.zeros(2, 4),
+        torch.zeros(2, 1),
+        torch.tensor([12, 13]),
+        fb,
+    )
+
+    scores = fb.c2kv_history_kv_selection_scores[0]
+    assert scores["query_tokens"] == 2
+    assert scores["layers"][0].numel() == 0
+    assert tuple(scores["headwise_layers"][0].shape) == (1, 2)
+    assert bool((scores["headwise_layers"][0] > 0).all())
+
+
 def test_overlap_processes_final_selection_round_before_decode_scheduling():
     path = ROOT / "python/sglang/srt/managers/scheduler.py"
     node = next(
@@ -1033,6 +1092,116 @@ def test_closed_persistent_session_aborts_before_physical_eviction(monkeypatch):
         ("sample", "history_kv_eviction_failed"),
         ("phase", "prefill"),
     ]
+
+
+@pytest.mark.parametrize("method_name", ["commitkv", "pyramidkv"])
+def test_reference_recovery_with_no_selectable_history_keeps_empty_state(
+    monkeypatch, method_name
+):
+    """Source replacement may leave only native recovery/current tokens."""
+
+    class Abort:
+        def __init__(self, message):
+            self.message = message
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.schedule_batch",
+        SimpleNamespace(FINISH_ABORT=Abort),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.mem_cache.history_kv_eviction",
+        eviction,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.mem_cache.history_kv_lifecycle",
+        ledger,
+    )
+    telemetry = SimpleNamespace(
+        set_phase=lambda *_: None,
+        sample=lambda *_: None,
+    )
+    apply_eviction = method(
+        ROOT / "python/sglang/srt/managers/scheduler.py",
+        "Scheduler",
+        "_apply_history_kv_eviction",
+        {
+            "_persistent_history_session_error": lambda *_: None,
+            "json": __import__("json"),
+            "logger": SimpleNamespace(
+                error=lambda *args, **kwargs: None,
+                info=lambda *args, **kwargs: None,
+            ),
+            "math": math,
+            "paper_telemetry": telemetry,
+        },
+    )
+    empty_layer = SimpleNamespace(
+        key=torch.empty(1, 0, 1),
+        value=torch.empty(1, 0, 1),
+        positions=torch.empty(1, 0, dtype=torch.long),
+    )
+    empty_state = SimpleNamespace(
+        layers={0: empty_layer},
+        resident_bytes=0,
+        selection_metadata={"method": method_name},
+    )
+    allocator = SimpleNamespace(
+        page_size=1,
+        get_kvcache=lambda: SimpleNamespace(),
+        available_size=lambda: 100,
+    )
+    owner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=allocator,
+        _bytes_per_kv_token=lambda: 8,
+        _build_pyramidkv_reference_state=lambda *_: pytest.fail(
+            "empty history must not rebuild PyramidKV state"
+        ),
+        _build_agentkv_reference_state=lambda *_: pytest.fail(
+            "empty history must not rebuild AgentKV state"
+        ),
+        _build_commitkv_reference_state=lambda *_: pytest.fail(
+            "empty history must not rebuild CommitKV state"
+        ),
+        _log_c2kv_token_usage=lambda *args, **kwargs: None,
+    )
+    req = SimpleNamespace(
+        rid="empty-reference-recovery",
+        history_kv_eviction={
+            "method": method_name,
+            "history_start": 0,
+            "history_end": 0,
+            "target_tokens": 8,
+            "selection_query_tokens": 16,
+            "persistent_session": True,
+            "persistent_canonical_history_end": 27,
+        },
+        history_kv_selection_scores=None,
+        history_kv_reference_state=empty_state,
+        history_kv_resident_positions=[27, 28],
+        kv_memory_report={},
+        kv_committed_len=2,
+        c2kv_position_correction=27,
+        c2kv_virtual_input_ids=[100, 101],
+        c2kv_kv_memory_hint={"persistent_session_delta_tokens": 2},
+        session=SimpleNamespace(session_id="recovery"),
+    )
+
+    assert apply_eviction(owner, req)
+    assert req.history_kv_reference_state is empty_state
+    assert req.history_kv_resident_positions == [27, 28]
+    assert req.c2kv_persistent_active_input_ids == [100, 101]
+    assert req.kv_memory_report["selection_query_tokens_observed"] == 0
+    assert req.kv_memory_report["active_history_kv_tokens"] == 0
+    assert req.kv_memory_report["history_kv_runtime_status"] == (
+        "reference_attention_ok"
+    )
+    assert req.kv_memory_report["history_kv_lifecycle"][
+        "history_kv_backend"
+    ] == "reference_attention"
 
 
 def test_closed_persistent_request_uses_ordinary_cache_cleanup():
