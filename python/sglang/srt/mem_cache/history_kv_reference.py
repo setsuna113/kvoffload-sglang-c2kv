@@ -88,6 +88,8 @@ class CommitKVServingState:
 
     policy: Any
     target_tokens: int
+    budget_policy: tuple[str, int | float] | None = None
+    budget_resolved: bool = False
     event_signature: tuple = ()
     event_pages: tuple = ()
     pre_window: Any = None
@@ -99,6 +101,82 @@ class CommitKVServingState:
     pre_positions: list[torch.Tensor] = field(default_factory=list)
     pre_scan_metadata: dict = field(default_factory=dict)
     receipts: list[dict] = field(default_factory=list)
+
+    def resolve_budget(
+        self, reference_config: dict, *, validate_only: bool = False
+    ) -> int:
+        """Keep the declared policy stable while resolving each full-history budget."""
+
+        kind = reference_config.get("budget_policy_kind")
+        if kind is None:
+            kind = (
+                "ratio"
+                if reference_config.get("retention_ratio") is not None
+                and (
+                    reference_config.get("target_tokens") is None
+                    or reference_config.get("target_tokens_source")
+                    == "server_tokenized_retention_ratio"
+                )
+                else "tokens"
+            )
+        if kind == "ratio":
+            value = float(
+                reference_config.get(
+                    "budget_policy_value", reference_config.get("retention_ratio")
+                )
+            )
+            if not 0.0 < value <= 1.0:
+                raise ValueError("Invalid CommitKV retention_ratio")
+            if (
+                reference_config.get("retention_ratio") is not None
+                and float(reference_config["retention_ratio"]) != value
+            ):
+                raise RuntimeError("COMMITKV_TOTAL_BUDGET_CHANGED: ratio metadata mismatch")
+        elif kind == "tokens":
+            value = int(
+                reference_config.get(
+                    "budget_policy_value",
+                    reference_config.get("target_tokens") or self.target_tokens,
+                )
+            )
+            if value < 1:
+                raise ValueError("CommitKV total budget must be positive")
+            if (
+                reference_config.get("target_tokens") is not None
+                and int(reference_config["target_tokens"]) != value
+            ):
+                raise RuntimeError("COMMITKV_TOTAL_BUDGET_CHANGED: token metadata mismatch")
+        else:
+            raise ValueError(f"Unsupported CommitKV budget policy: {kind!r}")
+        incoming = (kind, value)
+        if self.budget_policy is not None and self.budget_policy != incoming:
+            raise RuntimeError(
+                "COMMITKV_TOTAL_BUDGET_CHANGED: "
+                f"policy={self.budget_policy}, request={incoming}"
+            )
+
+        resolved = reference_config.get("target_tokens")
+        target_tokens = self.target_tokens
+        if kind == "tokens":
+            if value != target_tokens:
+                raise RuntimeError(
+                    "COMMITKV_TOTAL_BUDGET_CHANGED: "
+                    f"state={self.target_tokens}, request={value}"
+                )
+        elif resolved is not None:
+            target_tokens = int(resolved)
+            if target_tokens < 1:
+                raise ValueError("CommitKV resolved budget must be positive")
+            pending = self.policy.pending
+            if pending is not None and target_tokens < pending.total_budget:
+                raise ValueError("CommitKV total budget shrank during a transition")
+        if not validate_only:
+            self.target_tokens = target_tokens
+            self.budget_resolved = self.budget_resolved or (
+                kind == "ratio" and resolved is not None
+            )
+            self.budget_policy = incoming
+        return target_tokens
 
     def configure_events(self, spans: Sequence[dict]) -> None:
         from sglang.srt.mem_cache.commitkv import partition_event_span

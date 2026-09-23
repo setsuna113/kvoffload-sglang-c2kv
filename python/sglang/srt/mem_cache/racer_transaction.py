@@ -56,6 +56,8 @@ def enforce_request_budget(hint: dict) -> None:
             if name == "history_kv_reference_config" and str(config.get("method")) == "commitkv":
                 config["target_tokens"] = budget
                 config["racer_effective_target_tokens"] = min(target, available)
+                config["budget_policy_kind"] = "tokens"
+                config["budget_policy_value"] = budget
             else:
                 config["target_tokens"] = min(target, available)
     hint["racer_budget"] = {

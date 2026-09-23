@@ -316,8 +316,8 @@ class CommitKVRuntimeState:
         pending_local: list[int] = []
         pending_page_count = 0
         if self.pending is not None:
-            if target_tokens != self.pending.total_budget:
-                raise ValueError("CommitKV total budget changed during a transition")
+            if target_tokens < self.pending.total_budget:
+                raise ValueError("CommitKV total budget shrank during a transition")
             pending_by_id = {page.page_id: page for page in self.pending.pages}
             for page_id in self.pending.protected_page_ids:
                 page = pending_by_id[page_id]
@@ -363,6 +363,9 @@ class CommitKVRuntimeState:
                 ),
                 "retired_page_count": len(self.retired_pages),
                 "protected_pending_page_count": pending_page_count,
+                "pending_pre_total_budget_tokens": (
+                    self.pending.total_budget if self.pending is not None else None
+                ),
             }
         )
         return selected, metadata
