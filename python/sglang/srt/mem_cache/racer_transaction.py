@@ -243,7 +243,31 @@ def checkpoint_generation(req) -> None:
             "protected_pending_positions": protected_pending_positions(runtime),
             "temporary_residency_included_in_peak": os.environ.get("C2KV_PAPER_TELEMETRY", "").strip().lower() in {"1", "true", "yes", "on"},
             "full_history_reprefill_performed": False,
+            "regeneration_mandatory_history": regeneration_mandatory_history(runtime),
         }
+
+
+def regeneration_mandatory_history(runtime) -> dict:
+    """History a regeneration restored from this checkpoint must keep.
+
+    A regeneration discards the held decode and restores this runtime, so its
+    first selection still protects every CommitKV pending page (Eq. 12) and
+    fails when they exceed its effective target.  Replacing the source of a
+    protected page's message interrupts the transition first and releases the
+    protection (``interrupt_replaced_commit_window``).  Other methods report
+    nothing mandatory.
+    """
+    pending = getattr(getattr(runtime, "policy", None), "pending", None)
+    if pending is None:
+        return {"tokens": 0, "source_message_indices": [],
+                "release": "replaced_source_message"}
+    pages = {page.page_id: page for page in pending.pages}
+    protected = [pages[page_id] for page_id in pending.protected_page_ids]
+    return {
+        "tokens": len({index for page in protected for index in page.token_indices}),
+        "source_message_indices": sorted({page.event_id for page in protected}),
+        "release": "replaced_source_message",
+    }
 
 
 def replace_reference_sources(state, spans, protected_positions=()):

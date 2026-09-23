@@ -59,6 +59,18 @@ def test_pyramid_absolute_target_uses_largest_fitting_official_schedule():
     assert meta["requested_target_tokens"] == 320
     assert meta["nominal_schedule_target_tokens"] <= 320
     assert meta["realized_full_token_equivalent"] == realized
+    assert meta["flat_schedule_fallback"] is False
+
+
+def test_pyramid_one_token_target_keeps_the_hard_bound():
+    # RACER can leave one history token after charging recovered evidence; the
+    # funnel's two-token layer minimum must not abort the request.
+    scores = [torch.arange(300, dtype=torch.float32).expand(2, -1) for _ in range(36)]
+    selected, meta = select_pyramidkv_headwise(scores, target_tokens=1)
+    for indices in selected:
+        torch.testing.assert_close(indices, torch.tensor([[299], [299]]))
+    assert meta["flat_schedule_fallback"] is True
+    assert meta["realized_full_token_equivalent"] == 1
 
 
 def test_reference_attention_matches_explicit_headwise_attention():

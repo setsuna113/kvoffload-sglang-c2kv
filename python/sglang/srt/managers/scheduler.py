@@ -339,6 +339,20 @@ class EmbeddingBatchResult:
         self.copy_done.record()
 
 
+def _racer_reference_has_unprotected_source(reference_state, spans, pending_positions):
+    """A pending position protects its whole rectangular reference column."""
+    for layer in reference_state.layers.values():
+        protected_columns = torch.zeros(layer.positions.shape[1], dtype=torch.bool,
+                                        device=layer.positions.device)
+        for position in pending_positions:
+            protected_columns |= (layer.positions == position).any(dim=0)
+        for start, end in spans:
+            source = (layer.positions >= start) & (layer.positions < end)
+            if bool((source & ~protected_columns.unsqueeze(0)).any()):
+                return True
+    return False
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
@@ -4128,11 +4142,8 @@ class Scheduler(
                     "racer_initial_replaced_source_spans") or []
                 pending_positions = set((getattr(req, "c2kv_kv_memory_hint", None) or {}).get(
                     "racer_protected_pending_source_positions") or [])
-                if reference_state is not None and any(
-                    bool((((layer.positions >= start) & (layer.positions < end)) &
-                          ~sum((layer.positions == position for position in pending_positions),
-                               torch.zeros_like(layer.positions, dtype=torch.bool))).any())
-                    for layer in reference_state.layers.values() for start, end in spans
+                if reference_state is not None and _racer_reference_has_unprotected_source(
+                    reference_state, spans, pending_positions
                 ):
                     raise RuntimeError("RACER_INITIAL_S0_REFERENCE_SOURCE_RETAINED")
             result = evictor.evict(
