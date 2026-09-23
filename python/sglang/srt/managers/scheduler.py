@@ -3607,8 +3607,10 @@ class Scheduler(
             raise RuntimeError("PYRAMIDKV_RESIDENT_POSITION_LEDGER_INCOMPLETE")
         normal_positions = ledger[history_start:history_end]
         protected_indices = set(config.get("protected_history_indices") or [])
-        normal_indices = [index for index in range(history_len) if index not in protected_indices]
-        if protected_indices:
+        excluded_indices = set(config.get("racer_excluded_history_indices") or [])
+        normal_indices = [index for index in range(history_len)
+                          if index not in protected_indices and index not in excluded_indices]
+        if protected_indices or excluded_indices:
             normal_positions = [normal_positions[index] for index in normal_indices]
         expected_scores = []
         for layer_id, score in zip(layer_ids, headwise_scores):
@@ -3626,7 +3628,7 @@ class Scheduler(
                     "PYRAMIDKV_CANDIDATE_SCORE_LENGTH_MISMATCH: "
                     f"layer={layer_id}, observed={tuple(score.shape)}, expected={expected}"
                 )
-            if protected_indices:
+            if protected_indices or excluded_indices:
                 reference_len = expected - history_len
                 score = score[:, list(range(reference_len)) + [reference_len + index for index in normal_indices]]
             normal_position_tensor = torch.as_tensor(
@@ -3657,7 +3659,7 @@ class Scheduler(
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
         slots = req_row[history_start:history_end].long()
-        if protected_indices:
+        if protected_indices or excluded_indices:
             slots = slots[normal_indices]
         layers = {}
         for layer_id, indices in zip(layer_ids, selected):
@@ -3743,6 +3745,11 @@ class Scheduler(
         positions = ledger[history_start:history_end]
         req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
         slots = req_row[history_start:history_end].long()
+        excluded = set(config.get("racer_excluded_history_indices") or [])
+        if excluded:
+            candidates = [index for index in range(history_len) if index not in excluded]
+            positions = [positions[index] for index in candidates]
+            slots = slots[candidates]
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         existing_state = getattr(req, "history_kv_reference_state", None)
         layers = {}
@@ -3868,6 +3875,11 @@ class Scheduler(
         normal_positions = ledger[history_start:history_end]
         req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
         slots = req_row[history_start:history_end].long()
+        excluded = set(config.get("racer_excluded_history_indices") or [])
+        if excluded:
+            candidates = [index for index in range(history_len) if index not in excluded]
+            normal_positions = [normal_positions[index] for index in candidates]
+            slots = slots[candidates]
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         layer_ids = tuple(
             range(
@@ -4012,7 +4024,20 @@ class Scheduler(
         )
         history_start = int(config.get("history_start") or 0)
         history_end = int(config.get("history_end") or 0)
-        has_selectable_history = history_end > history_start
+        initial_spans = (getattr(req, "c2kv_kv_memory_hint", None) or {}).get(
+            "racer_initial_replaced_source_spans") or []
+        if initial_spans:
+            from sglang.srt.mem_cache.racer_transaction import excluded_resident_source_indices
+
+            positions = getattr(req, "history_kv_resident_positions", None)
+            if positions is None:
+                positions = list(range(len(getattr(req, "c2kv_virtual_input_ids", ()))))
+            config["racer_excluded_history_indices"] = excluded_resident_source_indices(
+                positions, history_start, history_end, initial_spans,
+                (getattr(req, "c2kv_kv_memory_hint", None) or {}).get(
+                    "racer_protected_pending_source_positions") or (),
+            )
+        has_selectable_history = history_end - history_start > len(config.get("racer_excluded_history_indices") or [])
         existing_reference_state = getattr(
             req, "history_kv_reference_state", None
         )
@@ -4082,9 +4107,8 @@ class Scheduler(
                 # be counted and attended twice.
                 selected = list(config.get("protected_history_indices") or [])
             elif method == "agentkv":
-                reference_state = self._build_agentkv_reference_state(
-                    req, config
-                )
+                reference_state = (self._build_agentkv_reference_state(req, config)
+                                   if has_history_candidates else existing_reference_state)
                 selected = []
             elif method == "commitkv":
                 if has_history_candidates:
@@ -4096,6 +4120,21 @@ class Scheduler(
                 selected = []
             elif not isinstance(selected, list):
                 selected = self._select_history_kv_eviction_indices(req, config)
+            excluded = set(config.get("racer_excluded_history_indices") or [])
+            if excluded:
+                if not isinstance(selected, list) or excluded.intersection(selected):
+                    raise RuntimeError("RACER_INITIAL_S0_SOURCE_EXCLUSION_FAILED")
+                spans = (getattr(req, "c2kv_kv_memory_hint", None) or {}).get(
+                    "racer_initial_replaced_source_spans") or []
+                pending_positions = set((getattr(req, "c2kv_kv_memory_hint", None) or {}).get(
+                    "racer_protected_pending_source_positions") or [])
+                if reference_state is not None and any(
+                    bool((((layer.positions >= start) & (layer.positions < end)) &
+                          ~sum((layer.positions == position for position in pending_positions),
+                               torch.zeros_like(layer.positions, dtype=torch.bool))).any())
+                    for layer in reference_state.layers.values() for start, end in spans
+                ):
+                    raise RuntimeError("RACER_INITIAL_S0_REFERENCE_SOURCE_RETAINED")
             result = evictor.evict(
                 req,
                 method=str(config.get("method") or ""),
@@ -4128,6 +4167,32 @@ class Scheduler(
                 report["history_kv_storage_runtime_status"] = storage_runtime_status
             report["history_kv_physical_eviction"] = physical_receipt
             if result is not None and result.success:
+                excluded = config.get("racer_excluded_history_indices") or []
+                spans = list((getattr(req, "c2kv_kv_memory_hint", None) or {}).get(
+                    "racer_initial_replaced_source_spans") or [])
+                if spans:
+                    requested = len({position for start, end in spans for position in range(start, end)})
+                    replaced = report.get("racer_source_replacement") or {}
+                    removed_positions = set(replaced.get("removed_normal_positions") or [])
+                    for layer in (replaced.get("reference") or {}).get("layers") or []:
+                        removed_positions.update(position for head in layer.get("source_positions") or []
+                                                 for position in head)
+                    pending = set((getattr(req, "c2kv_kv_memory_hint", None) or {}).get(
+                        "racer_protected_pending_source_positions") or [])
+                    removed = len(excluded) + len(removed_positions)
+                    retained = len({position for start, end in spans for position in range(start, end)
+                                    if position in pending})
+                    report["racer_initial_source_replacement"] = {
+                        "source_spans": spans,
+                        "requested_original_source_tokens": requested,
+                        "removed_original_source_tokens": removed,
+                        "retained_original_source_tokens": retained,
+                        "already_absent_original_source_tokens": max(0, requested - removed - retained),
+                        "selection_candidates_excluded": bool(excluded),
+                        "prefill_context_included_replaced_sources": bool(excluded),
+                        "selection_query_scores_include_replaced_sources": bool(excluded) and method != "streamingllm",
+                        "full_history_reprefill_performed": False,
+                    }
                 runtime_status = (
                     "reference_attention_ok"
                     if reference_state is not None
@@ -4524,6 +4589,42 @@ class Scheduler(
         return int(req.kv_committed_len) - old_len
 
     def _select_history_kv_eviction_indices(self, req: "Req", config: dict) -> Optional[list[int]]:
+        excluded = set(config.get("racer_excluded_history_indices") or [])
+        if excluded:
+            from copy import copy
+
+            start, end = int(config["history_start"]), int(config["history_end"])
+            candidates = [index for index in range(end - start) if index not in excluded]
+            if not candidates:
+                return []
+            method = str(config.get("method") or "").lower()
+            if method == "streamingllm":
+                count = max(0, int(config.get("target_tokens") or 0))
+                protected = set(config.get("protected_history_indices") or [])
+                return sorted(protected | set(candidates[-count:] if count else []))
+            scores = getattr(req, "history_kv_selection_scores", None)
+            if not isinstance(scores, dict):
+                return None
+            scoped = copy(req)
+            protected = set(config.get("protected_history_indices") or [])
+            scoped.history_kv_eviction = {**config, "history_start": 0,
+                "history_end": len(candidates), "racer_excluded_history_indices": [],
+                "protected_history_indices": [index for index, original in enumerate(candidates)
+                                              if original in protected]}
+            scoped.history_kv_selection_scores = {**scores, "layers": [
+                torch.as_tensor(layer)[candidates] for layer in scores.get("layers") or []]}
+            ledger = getattr(req, "history_kv_resident_positions", None)
+            if ledger is not None:
+                scoped.history_kv_resident_positions = [ledger[start + index] for index in candidates]
+            selected = self._select_history_kv_eviction_indices(scoped, scoped.history_kv_eviction)
+            if selected is None:
+                return None
+            if hasattr(scoped, "history_kv_score_state"):
+                req.history_kv_score_state = scoped.history_kv_score_state
+            for key, value in scoped.history_kv_eviction.items():
+                if key not in {"history_start", "history_end", "racer_excluded_history_indices", "protected_history_indices"}:
+                    config[key] = value
+            return [candidates[index] for index in selected]
         protected = set(config.get("protected_history_indices") or [])
         if protected:
             from copy import copy
@@ -5021,6 +5122,17 @@ class Scheduler(
         start, end = physical_boundary(start, descriptors), physical_boundary(end, descriptors)
         config.update(method=method, history_start=start, history_end=end)
         config["protected_history_indices"] = protected_history_indices(positions, start, end, tool_spans)
+        source_spans = hint.get("racer_initial_replaced_source_spans") or []
+        if source_spans:
+            from sglang.srt.mem_cache.racer_transaction import excluded_resident_source_indices
+
+            excluded = excluded_resident_source_indices(
+                positions, start, end, source_spans,
+                hint.get("racer_protected_pending_source_positions") or (),
+            )
+            if set(excluded) & set(config["protected_history_indices"]):
+                raise ValueError("RACER_INITIAL_S0_PROTECTED_SOURCE_CONFLICT")
+            config["racer_excluded_history_indices"] = excluded
         if method in {"agentkv", "commitkv"} and config["protected_history_indices"]:
             # These methods move the whole history range into per-head state.
             # A tool carrier inside that range cannot remain an independent,

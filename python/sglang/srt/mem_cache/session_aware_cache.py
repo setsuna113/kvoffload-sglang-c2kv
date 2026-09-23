@@ -628,7 +628,11 @@ class SessionAwareCache(BasePrefixCache):
         from sglang.srt.mem_cache.racer_transaction import replace_reference_sources, interrupt_replaced_commit_window
 
         spans = req.c2kv_kv_memory_hint["racer_replacement_source_spans"]
-        reference, reference_receipt = replace_reference_sources(slot.history_kv_reference_state, spans)
+        initial = ((req.c2kv_kv_memory_hint.get("persistent_history_session") or {})
+                   .get("initial_s0_append") or {})
+        protected = (req.c2kv_kv_memory_hint.get("racer_protected_pending_source_positions") or []) if initial.get("enabled") else []
+        reference, reference_receipt = replace_reference_sources(
+            slot.history_kv_reference_state, spans, protected_positions=protected)
         positions = list(slot.history_kv_resident_positions)
         keep = [index for index, p in enumerate(positions) if not any(start <= p < end for start, end in spans)]
         old_len = len(positions)
@@ -990,6 +994,12 @@ class SessionAwareCache(BasePrefixCache):
             slot = SessionSlot()
             self.slots[session_id] = slot
 
+        if (hint.get("persistent_history_session") or {}).get("transaction") and isinstance(getattr(req, "kv_memory_report", None), dict):
+            from sglang.srt.mem_cache.racer_transaction import protected_pending_positions
+
+            pending_positions = protected_pending_positions(getattr(req, "history_kv_runtime_state", None))
+            req.kv_memory_report["racer_current_protected_pending_positions"] = pending_positions
+            req.kv_memory_report["racer_current_protected_pending_tokens"] = len(pending_positions)
         slot.save_from_req(req, is_first=is_first)
 
     @staticmethod

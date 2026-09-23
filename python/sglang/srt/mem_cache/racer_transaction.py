@@ -16,6 +16,60 @@ from typing import Any
 import torch
 
 
+class RacerCapacityInfeasible(ValueError):
+    """A pre-admission budget failure that leaves the resident session intact."""
+
+    def __init__(self, *, stage: str, decision_id: str, required_tokens: int, capacity_tokens: int):
+        self.stage = stage
+        self.decision_id = decision_id
+        self.required_tokens = required_tokens
+        self.capacity_tokens = capacity_tokens
+        self.rollback_safe = True
+        super().__init__(
+            "RACER_CAPACITY_INFEASIBLE: "
+            f"stage={stage}, decision_id={decision_id}, "
+            f"required_tokens={required_tokens}, capacity_tokens={capacity_tokens}"
+        )
+
+    def as_error(self) -> dict:
+        return {
+            "code": "RACER_CAPACITY_INFEASIBLE",
+            "message": str(self),
+            "capacity": {
+                "schema": "racer-capacity-infeasible-v1",
+                "stage": self.stage,
+                "decision_id": self.decision_id,
+                "required_tokens": self.required_tokens,
+                "capacity_tokens": self.capacity_tokens,
+                "rollback_safe": self.rollback_safe,
+            },
+        }
+
+
+def protected_pending_positions(runtime) -> list[int]:
+    """Return mandatory CommitKV positions in the resident source frame."""
+    pending = getattr(getattr(runtime, "policy", None), "pending", None)
+    if pending is None:
+        return []
+    protected = set(pending.protected_page_ids)
+    return sorted({int(position) for page in pending.pages
+                   if page.page_id in protected for position in page.token_indices})
+
+
+def protected_pending_tokens(runtime) -> int:
+    return len(protected_pending_positions(runtime))
+
+
+def excluded_resident_source_indices(positions, history_start, history_end, spans, pending_positions=()) -> list[int]:
+    """Map explicit source spans into the current compact physical history."""
+    if not 0 <= history_start <= history_end <= len(positions):
+        raise ValueError("RACER_INITIAL_S0_RESIDENT_LEDGER_INCOMPLETE")
+    pending = set(pending_positions)
+    return [index - history_start for index in range(history_start, history_end)
+            if positions[index] not in pending
+            and any(start <= positions[index] < end for start, end in spans)]
+
+
 def transaction_config(hint: dict) -> dict | None:
     value = (hint.get("persistent_history_session") or {}).get("transaction")
     if value is None:
@@ -29,11 +83,25 @@ def transaction_config(hint: dict) -> dict | None:
     return value
 
 
-def enforce_request_budget(hint: dict) -> None:
+def enforce_request_budget(hint: dict, *, pending_tokens: int = 0) -> None:
     """Clamp history allocation after the server resolves exact evidence spans."""
     persistent = hint.get("persistent_history_session") or {}
-    if not persistent.get("transaction"):
+    transaction = transaction_config(hint)
+    if transaction is None:
         return
+    allocation = persistent.get("racer_initial_allocation")
+    initial = persistent.get("initial_s0_append") or {}
+    if allocation is not None:
+        if (not isinstance(allocation, dict)
+            or allocation.get("schema") != "racer-initial-allocation-v1"
+            or type(allocation.get("protected_evidence")) is not bool
+            or allocation["protected_evidence"] != bool(initial.get("enabled"))
+            or not isinstance(allocation.get("source_message_indices"), list)
+            or any(type(index) is not int or index < 0 for index in allocation["source_message_indices"])
+            or not isinstance(allocation.get("event_ids"), list)
+            or any(not isinstance(event_id, str) for event_id in allocation["event_ids"])
+            or (initial.get("enabled") and allocation["source_message_indices"] != initial.get("source_message_indices"))):
+            raise ValueError("RACER_INITIAL_ALLOCATION_INVALID")
     budget = persistent.get("history_budget_tokens")
     if type(budget) is not int or budget <= 0:
         raise ValueError("RACER_HISTORY_BUDGET_REQUIRED")
@@ -45,8 +113,20 @@ def enforce_request_budget(hint: dict) -> None:
         evidence += max(0, end - max(start, horizon))
         horizon = max(horizon, end)
     available = budget - evidence
-    if available <= 0:
-        raise ValueError("RACER_RECOVERY_CAPACITY_EXHAUSTED")
+    config = hint.get("history_kv_eviction") or {}
+    history_exists = (config.get("history_end") is None or
+                      int(config.get("history_end") or 0) - int(config.get("history_start") or 0)
+                      > len(config.get("racer_excluded_history_indices") or []))
+    if hint.get("tool_memory_segments") and int(config.get("history_end") or 0) > int(config.get("history_start") or 0):
+        history_exists = True
+    required_history = max(int(bool(history_exists)), pending_tokens)
+    if available < required_history:
+        raise RacerCapacityInfeasible(
+            stage="regeneration" if transaction["phase"] == "regenerate" else "draft",
+            decision_id=transaction["decision_id"],
+            required_tokens=evidence + required_history,
+            capacity_tokens=budget,
+        )
     requested = {}
     for name in ("history_kv_eviction", "history_kv_reference_config"):
         config = hint.get(name)
@@ -60,10 +140,20 @@ def enforce_request_budget(hint: dict) -> None:
                 config["target_tokens"] = min(target, available)
     hint["racer_budget"] = {
         "history_budget_tokens": budget, "native_evidence_tokens": evidence,
-        "available_history_tokens": available, "requested_targets": requested,
+        "available_history_tokens": available, "mandatory_pending_tokens": pending_tokens,
+        "minimum_history_tokens": required_history, "requested_targets": requested,
         "resolved_targets": {name: hint[name].get("racer_effective_target_tokens", hint[name]["target_tokens"]) for name in requested},
         "source": "server_resolved_source_spans", "cap_increased": False,
     }
+    if allocation is not None:
+        hint["racer_initial_allocation_receipt"] = {
+            "schema": "racer-initial-allocation-v1",
+            "applied": True,
+            "source_message_indices": list(allocation["source_message_indices"]),
+            "event_ids": list(allocation["event_ids"]),
+            "evidence_tokens": evidence,
+            "backend_native_selection_preserved": True,
+        }
 
 
 def tensor_storage_bytes(value: Any) -> int:
@@ -135,6 +225,11 @@ def checkpoint_generation(req) -> None:
     report = getattr(req, "kv_memory_report", None)
     if isinstance(report, dict):
         report["racer_budget"] = dict(hint.get("racer_budget") or {})
+        if hint.get("racer_initial_allocation_receipt") is not None:
+            report["racer_initial_allocation"] = dict(hint["racer_initial_allocation_receipt"])
+            report["racer_initial_allocation"]["original_source_tokens_removed"] = int(
+                (report.get("racer_initial_source_replacement") or {}).get("removed_original_source_tokens") or 0
+            )
         report["racer_transaction"] = {
             **transaction,
             "status": "held",
@@ -144,12 +239,14 @@ def checkpoint_generation(req) -> None:
             "checkpoint_tensor_bytes": checkpoint.tensor_bytes,
             "checkpoint_normal_kv_copy_tokens": 0,
             "checkpoint_scope": "resident_prompt_only",
+            "protected_pending_tokens": protected_pending_tokens(runtime),
+            "protected_pending_positions": protected_pending_positions(runtime),
             "temporary_residency_included_in_peak": os.environ.get("C2KV_PAPER_TELEMETRY", "").strip().lower() in {"1", "true", "yes", "on"},
             "full_history_reprefill_performed": False,
         }
 
 
-def replace_reference_sources(state, spans):
+def replace_reference_sources(state, spans, protected_positions=()):
     """Drop source copies without padding or changing attention multiplicity.
 
     Reference layers have rectangular head layouts. A column touched by any
@@ -166,17 +263,23 @@ def replace_reference_sources(state, spans):
         for start, end in spans:
             source |= (layer.positions >= start) & (layer.positions < end)
         drop = source.any(dim=0)
+        if protected_positions:
+            protected = torch.zeros_like(source)
+            for position in protected_positions:
+                protected |= layer.positions == position
+            drop &= ~protected.any(dim=0)
         copied = copy.copy(layer)
         copied.key = layer.key[:, ~drop, :].clone()
         copied.value = layer.value[:, ~drop, :].clone()
         copied.positions = layer.positions[:, ~drop].clone()
         result.layers[layer_id] = copied
+        removed_source = drop.unsqueeze(0).expand_as(source) & source
         collateral = drop.unsqueeze(0).expand_as(source) & ~source
-        receipt["source_token_slots"] += int(source.sum().item())
+        receipt["source_token_slots"] += int(removed_source.sum().item())
         receipt["collateral_token_slots"] += int(collateral.sum().item())
         receipt["layers"].append({
             "layer_id": int(layer_id),
-            "source_positions": [layer.positions[head][source[head]].tolist() for head in range(source.shape[0])],
+            "source_positions": [layer.positions[head][removed_source[head]].tolist() for head in range(source.shape[0])],
             "collateral_positions": [layer.positions[head][collateral[head]].tolist() for head in range(source.shape[0])],
         })
     return result, receipt

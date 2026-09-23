@@ -13,6 +13,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.mem_cache.racer_transaction import RacerCapacityInfeasible
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
 
@@ -111,6 +112,8 @@ class OpenAIServingBase(ABC):
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
+        except RacerCapacityInfeasible as e:
+            return ORJSONResponse(content={"error": e.as_error()}, status_code=400)
         except ValueError as e:
             return self.create_error_response(
                 message=str(e),

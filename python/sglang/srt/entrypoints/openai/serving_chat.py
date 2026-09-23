@@ -288,10 +288,30 @@ class OpenAIServingChat(OpenAIServingBase):
         recovery_append = bool(
             isinstance(recovery_append, dict) and recovery_append.get("enabled")
         )
+        initial_s0 = (hint.get("persistent_history_session") or {}).get("initial_s0_append") or {}
+        initial_s0 = initial_s0 if isinstance(initial_s0, dict) and initial_s0.get("enabled") else None
+        if initial_s0:
+            if transaction is None or transaction["phase"] != "draft":
+                raise ValueError("RACER_INITIAL_S0_DRAFT_TRANSACTION_REQUIRED")
+            evidence_indices = initial_s0.get("evidence_message_indices")
+            source_indices = initial_s0.get("source_message_indices")
+            if (not isinstance(evidence_indices, list) or len(evidence_indices) < 2
+                or any(type(index) is not int for index in evidence_indices)
+                or evidence_indices != list(range(evidence_indices[0], len(request.messages)))
+                or evidence_indices[0] < 1
+                or request.messages[evidence_indices[0]].role != "assistant"
+                or request.messages[evidence_indices[0]].content not in ("", None)
+                or any(request.messages[index].role != "user" for index in evidence_indices[1:])
+                or not isinstance(source_indices, list)
+                or any(type(index) is not int or index < 0 or index >= evidence_indices[0]
+                       for index in source_indices)):
+                raise ValueError("RACER_INITIAL_S0_MESSAGE_INDICES_INVALID")
         # This is server-owned state, never a caller-selected truncation length.
         hint.pop("persistent_session_drop_generation_prefix_tokens", None)
-        for key in ("racer_ephemeral_source_span", "racer_internal_source_spans", "racer_replacement_source_spans", "racer_active_ephemeral_source_spans"):
+        for key in ("racer_ephemeral_source_span", "racer_internal_source_spans", "racer_replacement_source_spans", "racer_active_ephemeral_source_spans", "racer_initial_replaced_source_spans", "racer_protected_pending_source_positions"):
             hint.pop(key, None)
+        if isinstance(config, dict):
+            config.pop("racer_excluded_history_indices", None)
         if previous is None:
             if transaction and (transaction.get("resolution") or transaction["phase"] != "draft"):
                 raise ValueError("RACER_TRANSACTION_CHECKPOINT_MISSING")
@@ -497,6 +517,83 @@ class OpenAIServingChat(OpenAIServingBase):
             hint[suffix_key] = source_boundary(hint[suffix_key], segments)
         hint["tool_memory_canonical_prompt_tokens"] = source_boundary(input_len, segments)
 
+    def _admit_initial_s0_evidence(self, request, canonical_prompt_ids, body_ids,
+                                   rendered_prompt_ids=None) -> None:
+        """Protect the server-tokenized appended evidence and its assistant frame."""
+        hint = request.c2kv_kv_memory_hint
+        initial_s0 = (hint.get("persistent_history_session") or {}).get("initial_s0_append") or {}
+        if not initial_s0.get("enabled"):
+            return
+        from sglang.srt.mem_cache.c2kv_composition import source_boundary
+
+        frame_index = initial_s0["evidence_message_indices"][0]
+        frame_prefix = self._c2kv_contextual_prefix_ids(
+            request, frame_index, self._chat_template_tools(request), canonical_prompt_ids
+        )
+        if not body_ids or body_ids[:len(frame_prefix)] != frame_prefix:
+            raise ValueError("RACER_INITIAL_S0_TEMPLATE_PREFIX_MISMATCH")
+        rendered = rendered_prompt_ids if rendered_prompt_ids is not None else canonical_prompt_ids
+        if rendered[:len(body_ids)] != body_ids:
+            raise ValueError("RACER_INITIAL_S0_RENDERED_BODY_MISMATCH")
+        generation_prefix = rendered[len(body_ids):]
+        if generation_prefix and canonical_prompt_ids[-len(generation_prefix):] != generation_prefix:
+            raise ValueError("RACER_INITIAL_S0_GENERATION_PREFIX_MISMATCH")
+        body_end = len(canonical_prompt_ids) - len(generation_prefix)
+        evidence_suffix = body_ids[len(frame_prefix):]
+        if (not evidence_suffix or body_end < len(evidence_suffix)
+            or canonical_prompt_ids[body_end - len(evidence_suffix):body_end] != evidence_suffix):
+            raise ValueError("RACER_INITIAL_S0_EVIDENCE_SUFFIX_MISMATCH")
+        segments = hint.get("tool_memory_segments") or []
+        source_start = source_boundary(body_end - len(evidence_suffix), segments)
+        source_end = source_boundary(body_end, segments)
+        config = hint.get("history_kv_eviction") or {}
+        # The session translator maps event spans, but history_start/end remain
+        # input coordinates until scheduler composition.
+        history_start = source_boundary(int(config.get("history_start") or 0), segments)
+        history_end = source_boundary(int(config.get("history_end") or 0), segments)
+        if source_end <= source_start or source_start < history_end:
+            raise ValueError("RACER_INITIAL_S0_EVIDENCE_SPAN_INVALID")
+        requested = set(initial_s0["source_message_indices"])
+        source_spans = [item for item in hint.get("history_kv_event_token_spans", [])
+                        if item.get("message_index") in requested]
+        if (len(source_spans) != len(requested)
+            or any(not history_start <= int(item["start"]) < int(item["end"]) <= history_end
+                   for item in source_spans)):
+            raise ValueError("RACER_INITIAL_S0_SOURCE_SPANS_UNAVAILABLE")
+        pending_positions = set(hint.get("racer_protected_pending_source_positions") or [])
+        excluded = sorted({position - history_start for item in source_spans
+                           for position in range(int(item["start"]), int(item["end"]))
+                           if position not in pending_positions})
+        if not segments and set(excluded) & set(config.get("protected_history_indices") or []):
+            raise ValueError("RACER_INITIAL_S0_PROTECTED_SOURCE_CONFLICT")
+        config["racer_excluded_history_indices"] = excluded
+        hint["racer_initial_replaced_source_spans"] = [
+            [int(item["start"]), int(item["end"])] for item in source_spans
+        ]
+        logical_prefix = int(hint.get("persistent_session_logical_prefix_tokens") or 0)
+        resident_sources = []
+        for start, end in hint["racer_initial_replaced_source_spans"]:
+            if end > logical_prefix:
+                continue
+            run_start = None
+            for position in range(start, end + 1):
+                removable = position < end and position not in pending_positions
+                if removable and run_start is None:
+                    run_start = position
+                elif not removable and run_start is not None:
+                    resident_sources.append([run_start, position])
+                    run_start = None
+        if resident_sources:
+            hint["racer_replacement_source_spans"] = resident_sources
+        span = [source_start, source_end]
+        hint["racer_ephemeral_source_span"] = span
+        hint.setdefault("racer_internal_source_spans", []).append(span)
+        hint.setdefault("racer_active_ephemeral_source_spans", []).append(span)
+        hint["history_kv_event_token_spans"] = [
+            item for item in hint.get("history_kv_event_token_spans", [])
+            if not (int(item["start"]) < source_end and source_start < int(item["end"]))
+        ]
+
     def _commit_persistent_history_session(
         self,
         adapted_request: GenerateReqInput,
@@ -535,6 +632,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 "tool_memory_segments": [dict(item) for item in hint.get("tool_memory_segments", [])],
                 "internal_source_spans": list(hint.get("racer_internal_source_spans") or []),
                 "active_ephemeral_source_spans": list(hint.get("racer_active_ephemeral_source_spans") or []),
+                "protected_pending_tokens": int(((ret[0].get("meta_info") or {}).get("kv_memory_report") or {}).get("racer_transaction", {}).get("protected_pending_tokens") or 0),
+                "protected_pending_positions": list(((ret[0].get("meta_info") or {}).get("kv_memory_report") or {}).get("racer_transaction", {}).get("protected_pending_positions") or []),
+                "current_protected_pending_positions": list(((ret[0].get("meta_info") or {}).get("kv_memory_report") or {}).get("racer_current_protected_pending_positions") or []),
+                "current_protected_pending_tokens": int(((ret[0].get("meta_info") or {}).get("kv_memory_report") or {}).get("racer_current_protected_pending_tokens") or 0),
             }
         if hint.get("tool_memory_segments"):
             self._persistent_history_tool_segments[session_id] = [
@@ -1612,7 +1713,6 @@ class OpenAIServingChat(OpenAIServingBase):
         if persistent_session_id is not None:
             adapted_request._persistent_history_session_id = persistent_session_id
             adapted_request._persistent_history_canonical_prompt_ids = canonical_prompt_ids
-            self._track_persistent_history_request(adapted_request)
             # Derive the removable suffix from the same template and options.
             # A client may request a recovery append, but cannot nominate raw
             # history tokens to truncate or replay.
@@ -1626,6 +1726,13 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 adapted_request._persistent_history_generation_prefix_ids = []
             persistent_config = request.c2kv_kv_memory_hint.get("persistent_history_session") or {}
+            held = getattr(self, "_persistent_history_transactions", {}).get(persistent_session_id) or {}
+            resolution = (persistent_config.get("transaction") or {}).get("resolution")
+            pending_field = ("current_protected_pending_positions" if resolution == "commit"
+                             else "protected_pending_positions")
+            request.c2kv_kv_memory_hint["racer_protected_pending_source_positions"] = list(held.get(pending_field) or [])
+            self._admit_initial_s0_evidence(
+                request, canonical_prompt_ids, body_ids, list(processed_messages.prompt_ids))
             if (persistent_config.get("recovery_append") or {}).get("enabled"):
                 from sglang.srt.mem_cache.c2kv_composition import source_boundary
 
@@ -1646,7 +1753,20 @@ class OpenAIServingChat(OpenAIServingBase):
             if persistent_config.get("transaction"):
                 from sglang.srt.mem_cache.racer_transaction import enforce_request_budget
 
-                enforce_request_budget(request.c2kv_kv_memory_hint)
+                pending_count_field = ("current_protected_pending_tokens" if resolution == "commit"
+                                       else "protected_pending_tokens")
+                pending_count = int(held.get(pending_count_field) or 0)
+                if (transaction.get("phase") == "regenerate"
+                    and (persistent_config.get("recovery_append") or {}).get("enabled")):
+                    replacements = request.c2kv_kv_memory_hint.get("racer_replacement_source_spans") or []
+                    pending_positions = held.get(pending_field) or []
+                    if any(start <= position < end for start, end in replacements
+                           for position in pending_positions):
+                        # The existing recovery lifecycle releases the whole
+                        # pending window when its protected source is replaced.
+                        pending_count = 0
+                enforce_request_budget(request.c2kv_kv_memory_hint, pending_tokens=pending_count)
+            self._track_persistent_history_request(adapted_request)
 
         if request.c2kv_kv_memory_hint:
             logger.info(

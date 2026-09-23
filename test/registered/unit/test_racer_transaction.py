@@ -232,8 +232,227 @@ def test_exact_server_spans_reserve_capacity_without_changing_commitkv_total_bud
     assert payload["racer_budget"]["native_evidence_tokens"] == 7
     assert payload["racer_budget"]["resolved_targets"]["history_kv_reference_config"] == 9
     payload["racer_active_ephemeral_source_spans"] = [[20, 36]]
-    with pytest.raises(ValueError, match="CAPACITY_EXHAUSTED"):
+    with pytest.raises(transaction.RacerCapacityInfeasible, match="CAPACITY_INFEASIBLE"):
         transaction.enforce_request_budget(payload)
+
+
+def test_initial_s0_span_includes_assistant_frame_and_is_native_under_same_budget(monkeypatch):
+    composition = load("racer_initial_composition", "mem_cache/c2kv_composition.py")
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.c2kv_composition", composition)
+    owner = methods("entrypoints/openai/serving_chat.py", "OpenAIServingChat", {"_admit_initial_s0_evidence"})
+    owner._c2kv_contextual_prefix_ids = lambda *args: [0, 1, 2]
+    owner._chat_template_tools = lambda request: None
+    payload = hint()
+    payload["persistent_history_session"].update(
+        history_budget_tokens=10,
+        initial_s0_append={"enabled": True, "source_message_indices": [0],
+                           "evidence_message_indices": [2, 3]},
+        racer_initial_allocation={"schema": "racer-initial-allocation-v1",
+                                  "event_ids": ["e0"], "source_message_indices": [0],
+                                  "protected_evidence": True},
+    )
+    payload["history_kv_eviction"] = {"method": "h2o", "history_start": 0,
+                                       "history_end": 3, "target_tokens": 10}
+    payload["history_kv_event_token_spans"] = [
+        {"message_index": 0, "start": 0, "end": 3},
+        {"message_index": 2, "start": 3, "end": 6},
+        {"message_index": 3, "start": 6, "end": 8}
+    ]
+    request = SimpleNamespace(c2kv_kv_memory_hint=payload)
+    owner._admit_initial_s0_evidence(request, list(range(12)), list(range(8)))
+    assert payload["racer_ephemeral_source_span"] == [3, 8]
+    assert payload["history_kv_event_token_spans"] == [{"message_index": 0, "start": 0, "end": 3}]
+    assert payload["history_kv_eviction"]["racer_excluded_history_indices"] == [0, 1, 2]
+    transaction.enforce_request_budget(payload)
+    assert payload["racer_budget"]["native_evidence_tokens"] == 5
+    assert payload["history_kv_eviction"]["target_tokens"] == 5
+    assert payload["racer_initial_allocation_receipt"]["evidence_tokens"] == 5
+    assert payload["racer_initial_allocation_receipt"]["backend_native_selection_preserved"]
+    req = SimpleNamespace(c2kv_kv_memory_hint=payload, origin_input_ids=list(range(8)),
+                          history_kv_resident_positions=list(range(8)),
+                          kv_memory_report={"racer_initial_source_replacement": {
+                              "removed_original_source_tokens": 3}})
+    transaction.checkpoint_generation(req)
+    assert req.kv_memory_report["racer_initial_allocation"]["evidence_tokens"] == 5
+    assert req.kv_memory_report["racer_initial_allocation"]["original_source_tokens_removed"] == 3
+
+
+@pytest.mark.parametrize("method,expected", [("h2o", [2, 5]), ("streamingllm", [3, 5])])
+def test_native_selection_excludes_initial_s0_source_without_rewriting_query_scores(method, expected):
+    owner = methods("managers/scheduler.py", "Scheduler", {"_select_history_kv_eviction_indices"})
+    config = {"method": method, "history_start": 0, "history_end": 6,
+              "target_tokens": 2, "history_kv_h2o_recent_fraction": 0.5,
+              "racer_excluded_history_indices": [1, 4]}
+    scores = torch.tensor([0.0, 100.0, 50.0, 0.0, 100.0, 0.0])
+    request = SimpleNamespace(history_kv_eviction=config,
+                              history_kv_selection_scores={"layers": [scores], "query_tokens": 3},
+                              history_kv_resident_positions=list(range(6)))
+    selected = owner._select_history_kv_eviction_indices(request, config)
+    assert selected == expected
+    assert request.history_kv_selection_scores["query_tokens"] == 3
+    assert torch.equal(request.history_kv_selection_scores["layers"][0], scores)
+    assert not set(selected) & {1, 4}
+
+
+def test_initial_s0_requires_explicit_trailing_assistant_and_evidence_messages():
+    owner = methods("entrypoints/openai/serving_chat.py", "OpenAIServingChat", {"_prepare_persistent_history_delta"})
+    owner._is_persistent_history_request = lambda request: True
+    owner._translate_tool_session_coordinates = lambda *args: None
+    owner._persistent_history_sessions = {}
+    payload = hint()
+    payload["persistent_history_session"]["initial_s0_append"] = {
+        "enabled": True, "source_message_indices": [0], "evidence_message_indices": [2, 3]
+    }
+    messages = [SimpleNamespace(role="user", content="source"),
+                SimpleNamespace(role="user", content="current"),
+                SimpleNamespace(role="assistant", content=""),
+                SimpleNamespace(role="user", content="evidence")]
+    request = SimpleNamespace(stream=False, session_params={"id": "s"},
+                              c2kv_kv_memory_hint=payload, messages=messages)
+    delta, session_id, canonical = owner._prepare_persistent_history_delta(request, [1, 2, 3])
+    assert (delta, session_id, canonical) == ([1, 2, 3], "s", [1, 2, 3])
+    payload["persistent_history_session"]["initial_s0_append"]["evidence_message_indices"] = [3]
+    with pytest.raises(ValueError, match="RACER_INITIAL_S0_MESSAGE_INDICES_INVALID"):
+        owner._prepare_persistent_history_delta(request, [1, 2, 3])
+
+
+def test_capacity_preflight_is_typed_and_preserves_commitkv_pending_requirement():
+    payload = hint(decision="decision-7", phase="regenerate", resolution="discard")
+    payload["persistent_history_session"]["history_budget_tokens"] = 8
+    payload["history_kv_eviction"] = {"method": "commitkv", "history_start": 0,
+                                       "history_end": 20, "target_tokens": 8}
+    payload["history_kv_reference_config"] = {"method": "commitkv", "target_tokens": 8}
+    payload["racer_active_ephemeral_source_spans"] = [[20, 26]]
+    with pytest.raises(transaction.RacerCapacityInfeasible) as failure:
+        transaction.enforce_request_budget(payload, pending_tokens=3)
+    error = failure.value.as_error()
+    assert error["code"] == "RACER_CAPACITY_INFEASIBLE"
+    assert error["capacity"] == {
+        "schema": "racer-capacity-infeasible-v1", "stage": "regeneration",
+        "decision_id": "decision-7", "required_tokens": 9,
+        "capacity_tokens": 8, "rollback_safe": True,
+    }
+    assert payload["history_kv_reference_config"]["target_tokens"] == 8
+    assert "racer_budget" not in payload
+
+
+def test_initial_s0_wire_indices_remap_with_removed_tool_carrier():
+    composition = load("racer_remap_composition", "mem_cache/c2kv_composition.py")
+    payload = {"persistent_history_session": {"initial_s0_append": {
+        "source_message_indices": [0, 2], "evidence_message_indices": [4, 5]}}}
+    composition.remap_message_metadata(payload, [1], 6)
+    assert payload["persistent_history_session"]["initial_s0_append"] == {
+        "source_message_indices": [0, 1], "evidence_message_indices": [3, 4]
+    }
+
+
+def test_initial_s0_tool_carrier_expands_source_coordinates_once(monkeypatch):
+    composition = load("racer_carrier_composition", "mem_cache/c2kv_composition.py")
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.c2kv_composition", composition)
+    owner = methods("entrypoints/openai/serving_chat.py", "OpenAIServingChat", {
+        "_prepare_persistent_history_delta", "_translate_tool_session_coordinates",
+        "_admit_initial_s0_evidence"})
+    owner._is_persistent_history_request = lambda _: True
+    owner._persistent_history_sessions = {}
+    owner._persistent_history_tool_segments = {}
+    owner._c2kv_contextual_prefix_ids = lambda *args: [0, 1, 2]
+    owner._chat_template_tools = lambda _: None
+    payload = hint()
+    payload["persistent_history_session"]["initial_s0_append"] = {
+        "enabled": True, "source_message_indices": [0], "evidence_message_indices": [2, 3]}
+    payload["history_kv_eviction"] = {"method": "h2o", "history_start": 0, "history_end": 3}
+    payload["tool_memory_segments"] = [{"token_start": 1, "token_end": 1, "source_tokens": 3}]
+    payload["history_kv_event_token_spans"] = [
+        {"message_index": 0, "start": 0, "end": 3},
+        {"message_index": 2, "start": 3, "end": 6},
+        {"message_index": 3, "start": 6, "end": 8}]
+    messages = [SimpleNamespace(role=role, content=content) for role, content in (
+        ("user", "source"), ("user", "current"), ("assistant", ""), ("user", "evidence"))]
+    req = SimpleNamespace(stream=False, session_params={"id": "s"},
+                          c2kv_kv_memory_hint=payload, messages=messages)
+    owner._prepare_persistent_history_delta(req, list(range(8)))
+    assert payload["history_kv_eviction"]["history_end"] == 3
+    assert payload["history_kv_event_token_spans"][0]["end"] == 6
+    owner._admit_initial_s0_evidence(req, list(range(8)), list(range(8)))
+    assert payload["racer_ephemeral_source_span"] == [6, 11]
+    assert payload["racer_initial_replaced_source_spans"] == [[0, 6]]
+
+
+def test_initial_s0_suffix_survives_reconciled_generated_bpe(monkeypatch):
+    composition = load("racer_bpe_composition", "mem_cache/c2kv_composition.py")
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.c2kv_composition", composition)
+    owner = methods("entrypoints/openai/serving_chat.py", "OpenAIServingChat", {
+        "_admit_initial_s0_evidence"})
+    owner._c2kv_contextual_prefix_ids = lambda *args: [10, 11, 12, 13]
+    owner._chat_template_tools = lambda _: None
+    payload = hint()
+    payload["persistent_history_session"]["initial_s0_append"] = {
+        "enabled": True, "source_message_indices": [0], "evidence_message_indices": [2, 3]}
+    payload["history_kv_eviction"] = {"method": "commitkv", "history_start": 0, "history_end": 2}
+    payload["history_kv_event_token_spans"] = [{"message_index": 0, "start": 0, "end": 2}]
+    req = SimpleNamespace(c2kv_kv_memory_hint=payload)
+    # Historical generated tokens occupy one more token than the fresh render.
+    owner._admit_initial_s0_evidence(
+        req, [10, 99, 11, 12, 13, 14, 15], [10, 11, 12, 13, 14],
+        [10, 11, 12, 13, 14, 15])
+    assert payload["racer_ephemeral_source_span"] == [5, 6]
+    assert payload["racer_initial_replaced_source_spans"] == [[0, 2]]
+
+
+def test_second_decision_initial_s0_replaces_resident_sources_and_regeneration_expires_evidence(monkeypatch):
+    composition = load("racer_second_composition", "mem_cache/c2kv_composition.py")
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.c2kv_composition", composition)
+    owner = methods("entrypoints/openai/serving_chat.py", "OpenAIServingChat", {
+        "_prepare_persistent_history_delta", "_admit_initial_s0_evidence"})
+    owner._is_persistent_history_request = lambda _: True
+    owner._translate_tool_session_coordinates = lambda *args: None
+    owner._persistent_history_sessions = {"s": [10, 11, 12]}
+    owner._persistent_history_exact_output = {"s": False}
+    owner._persistent_history_transactions = {"s": {"decision_id": "a", "tool_memory_segments": []}}
+    owner._persistent_history_generation_bases = {"s": [10, 11, 12]}
+    owner._c2kv_contextual_prefix_ids = lambda *args: [10, 11, 12, 13]
+    owner._chat_template_tools = lambda _: None
+    payload = hint("b", resolution="commit")
+    payload["persistent_history_session"]["initial_s0_append"] = {
+        "enabled": True, "source_message_indices": [0], "evidence_message_indices": [2, 3]}
+    payload["history_kv_eviction"] = {"method": "h2o", "history_start": 0, "history_end": 2}
+    payload["history_kv_event_token_spans"] = [{"message_index": 0, "start": 0, "end": 2}]
+    messages = [SimpleNamespace(role=role, content=content) for role, content in (
+        ("user", "source"), ("user", "feedback"), ("assistant", ""), ("user", "evidence"))]
+    req = SimpleNamespace(stream=False, session_params={"id": "s"},
+                          c2kv_kv_memory_hint=payload, messages=messages)
+    delta, _, _ = owner._prepare_persistent_history_delta(req, [10, 11, 12, 13, 14])
+    assert delta == [13, 14]
+    owner._admit_initial_s0_evidence(req, [10, 11, 12, 13, 14], [10, 11, 12, 13, 14])
+    assert payload["racer_replacement_source_spans"] == [[0, 2]]
+    assert payload["racer_ephemeral_source_span"] == [4, 5]
+    owner._persistent_history_sessions["s"] = [10, 11, 12, 13, 14]
+    owner._persistent_history_generation_bases["s"] = [10, 11, 12, 13, 14]
+    owner._persistent_history_generation_prefixes = {"s": [13, 14]}
+    owner._persistent_history_transactions["s"] = {
+        "decision_id": "b", "tool_memory_segments": [],
+        "internal_source_spans": [[4, 5]], "active_ephemeral_source_spans": [[4, 5]]}
+    recovery = hint("b", phase="regenerate", resolution="discard")
+    recovery["persistent_history_session"]["recovery_append"] = {
+        "enabled": True, "replace_previous_evidence": True}
+    recovery["history_kv_eviction"] = {"method": "h2o", "history_start": 0, "history_end": 2}
+    regen = SimpleNamespace(stream=False, session_params={"id": "s"},
+                            c2kv_kv_memory_hint=recovery)
+    owner._prepare_persistent_history_delta(regen, [10, 11, 12, 13, 14, 15])
+    assert recovery["racer_active_ephemeral_source_spans"] == []
+    assert recovery["racer_internal_source_spans"] == [[4, 5]]
+
+
+def test_reference_replacement_keeps_pending_even_when_column_has_other_source():
+    layer = SimpleNamespace(key=torch.arange(6).reshape(2, 3, 1),
+                            value=torch.arange(6).reshape(2, 3, 1),
+                            positions=torch.tensor([[0, 4, 8], [1, 5, 9]]))
+    state, receipt = transaction.replace_reference_sources(
+        SimpleNamespace(layers={0: layer}), [(4, 6)], protected_positions=[5])
+    assert state.layers[0].positions.tolist() == [[0, 4, 8], [1, 5, 9]]
+    assert receipt["source_token_slots"] == 0
+    assert transaction.excluded_resident_source_indices([0, 4, 5, 8], 0, 4,
+                                                          [(4, 6)], [5]) == [1]
 
 
 def test_commitkv_recovery_capacity_keeps_total_budget_and_pending_protection():
@@ -250,6 +469,7 @@ def test_commitkv_recovery_capacity_keeps_total_budget_and_pending_protection():
         policy.checkpoint(range(8), range(8), target_tokens=8, capacity_tokens=2, num_layers=1, num_kv_heads=1)
     runtime = SimpleNamespace(policy=policy, post_queries=[torch.ones(1, 1, 1)], post_positions=[torch.tensor([9])],
                               pending_commit_id="real-tool", receipts=[])
+    assert transaction.protected_pending_tokens(runtime) == 3
     interrupted = transaction.interrupt_replaced_commit_window(runtime, [1])
     assert interrupted["reason"] == "racer_source_replacement"
     assert interrupted["accepted_page_ids"] == []
