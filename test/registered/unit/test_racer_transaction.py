@@ -258,6 +258,81 @@ def test_commitkv_recovery_capacity_keeps_total_budget_and_pending_protection():
     assert not runtime.post_queries
 
 
+class DriftTokenizer:
+    """The model generated `OME` + `G` (100, 101) where canonical BPE is `OMEG` (200)."""
+
+    pieces = {1: "<|im_start|>assistant\n", 2: "<|im_end|>", 3: "<|im_start|>tool\nres<|im_end|>",
+              5: "<|im_start|>assistant\n<|im_end|>", 6: "<|im_start|>user\nevidence<|im_end|>",
+              7: "<|im_start|>user\nchanged<|im_end|>", 100: "OME", 101: "G", 200: "OMEG"}
+
+    def decode(self, ids, *, skip_special_tokens, clean_up_tokenization_spaces):
+        return "".join(self.pieces[item] for item in ids)
+
+    def encode(self, text, *, add_special_tokens):
+        assert text == self.decode([1, 100, 101, 2, 3], skip_special_tokens=False,
+                                   clean_up_tokenization_spaces=False)
+        return [1, 200, 2, 3]
+
+
+def _drifted_recovery_owner(exact=True):
+    """A held draft whose earlier action stayed in generated BPE (SZ task 57, shift 1)."""
+    owner = methods("entrypoints/openai/serving_chat.py", "OpenAIServingChat", {
+        "_prepare_persistent_history_delta", "_reconcile_exact_generated_prefix",
+        "_persistent_generation_prefix"})
+    owner.tokenizer_manager = SimpleNamespace(tokenizer=DriftTokenizer())
+    owner._is_persistent_history_request = lambda _: True
+    owner._translate_tool_session_coordinates = lambda *args: None
+    base = [1, 100, 101, 2, 3, 1]  # actual draft prompt; fresh render is [1, 200, 2, 3, 1]
+    owner._persistent_history_sessions = {"s": base + [100]}
+    owner._persistent_history_generation_bases = {"s": list(base)}
+    owner._persistent_history_generation_prefixes = {
+        "s": owner._persistent_generation_prefix([1, 200, 2, 3, 1], [1, 200, 2, 3], base)}
+    owner._persistent_history_exact_output = {"s": exact}
+    owner._persistent_history_transactions = {"s": {"decision_id": "a", "tool_memory_segments": []}}
+    payload = hint(phase="regenerate", resolution="discard")
+    payload["persistent_history_session"]["recovery_append"] = {"enabled": True}
+    payload["history_kv_eviction"] = {"method": "commitkv", "history_start": 1, "history_end": 4}
+    payload["history_kv_event_token_spans"] = [{"message_index": 1, "start": 1, "end": 3},
+                                               {"message_index": 2, "start": 3, "end": 4}]
+    return owner, SimpleNamespace(stream=False, session_params={"id": "s"}, c2kv_kv_memory_hint=payload)
+
+
+def test_generation_prompt_is_found_in_the_fresh_frame_after_generated_bpe():
+    prefix = methods("entrypoints/openai/serving_chat.py", "OpenAIServingChat",
+                     {"_persistent_generation_prefix"})._persistent_generation_prefix
+    # Historical frame: canonical == rendered, the same suffix as before.
+    assert prefix([1, 200, 2, 3, 1], [1, 200, 2, 3], [1, 200, 2, 3, 1]) == [1]
+    # Generated BPE kept for an earlier action: the body no longer prefixes canonical.
+    assert prefix([1, 200, 2, 3, 1], [1, 200, 2, 3], [1, 100, 101, 2, 3, 1]) == [1]
+    assert prefix([1, 200, 2, 3, 1], [1, 200, 2, 3], [1, 100, 101, 2, 3, 9]) == []
+    assert prefix([1, 200, 2, 3], [1, 200, 2, 3], [1, 200, 2, 3]) == []
+
+
+def test_exact_recovery_rebinds_generated_bpe_before_dropping_the_generation_prompt():
+    owner, req = _drifted_recovery_owner()
+    payload = req.c2kv_kv_memory_hint
+    delta, _, canonical = owner._prepare_persistent_history_delta(req, [1, 200, 2, 3, 5, 6, 1])
+    assert canonical == [1, 100, 101, 2, 3, 5, 6, 1]
+    assert delta == [5, 6, 1]
+    assert payload["persistent_session_drop_generation_prefix_tokens"] == 1
+    assert payload["persistent_session_logical_prefix_tokens"] == 5
+    assert payload["persistent_session_retokenization_token_shift"] == 1
+    assert payload["history_kv_event_token_spans"] == [{"message_index": 1, "start": 1, "end": 4},
+                                                       {"message_index": 2, "start": 4, "end": 5}]
+    assert payload["history_kv_eviction"]["history_end"] == 5
+    assert req.session_params["drop_previous_output"] is True
+
+
+@pytest.mark.parametrize(("exact", "fresh"), [
+    (True, [1, 200, 7, 5, 6, 1]),   # the prior text itself changed
+    (False, [1, 200, 2, 3, 5, 6, 1]),  # non-exact methods never keep generated BPE
+])
+def test_recovery_body_mismatch_still_fails_closed(exact, fresh):
+    owner, req = _drifted_recovery_owner(exact)
+    with pytest.raises(ValueError, match="RECOVERY_BODY_PREFIX_MISMATCH"):
+        owner._prepare_persistent_history_delta(req, fresh)
+
+
 def test_held_receipt_reports_the_exact_regeneration_retention_boundary():
     core = load("racer_test_commitkv_retention", "mem_cache/commitkv.py")
     policy = core.CommitKVRuntimeState(core.CommitKVConfig(measurement_layer_id=0))

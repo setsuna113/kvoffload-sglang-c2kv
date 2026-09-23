@@ -164,6 +164,22 @@ class OpenAIServingChat(OpenAIServingBase):
             and hint["persistent_history_session"].get("enabled")
         )
 
+    @staticmethod
+    def _persistent_generation_prefix(
+        rendered_ids: List[int], body_ids: List[int], canonical_prompt_ids: List[int]
+    ) -> List[int]:
+        """Generation-prompt tokens that end ``canonical_prompt_ids``, else ``[]``.
+
+        Compared in the freshly rendered frame: an exact generated prefix can
+        keep a different BPE for earlier messages in ``canonical_prompt_ids``,
+        but not for the generation prompt the template appends after them.
+        """
+        prefix = (
+            rendered_ids[len(body_ids):]
+            if rendered_ids[:len(body_ids)] == body_ids else []
+        )
+        return prefix if prefix and canonical_prompt_ids[-len(prefix):] == prefix else []
+
     def _reconcile_exact_generated_prefix(
         self,
         previous: List[int],
@@ -312,6 +328,9 @@ class OpenAIServingChat(OpenAIServingBase):
         exact_output = bool(
             getattr(self, "_persistent_history_exact_output", {}).get(session_id)
         )
+        # A discard below reuses the generation base, which for exact-output
+        # methods keeps earlier generated actions in their generated BPE.
+        exact_generated_frame = exact_output
         held = getattr(self, "_persistent_history_transactions", {}).get(session_id)
         if held is not None:
             if transaction is None or not transaction.get("resolution"):
@@ -338,9 +357,29 @@ class OpenAIServingChat(OpenAIServingBase):
             if not generation_prefix or previous[-len(generation_prefix):] != generation_prefix:
                 raise ValueError("PERSISTENT_HISTORY_RECOVERY_GENERATION_PREFIX_UNAVAILABLE")
             logical_prefix -= len(generation_prefix)
+            body = previous[:logical_prefix]
+            if (
+                exact_generated_frame
+                and len(full_prompt_ids) > logical_prefix
+                and full_prompt_ids[:logical_prefix] != body
+            ):
+                # The recovery prompt is freshly rendered; move it into the
+                # resident generated-token frame exactly as a continuation does.
+                mismatch = next(
+                    i for i, (left, right) in enumerate(zip(body, full_prompt_ids))
+                    if left != right
+                )
+                try:
+                    full_prompt_ids = self._reconcile_exact_generated_prefix(
+                        body, full_prompt_ids, mismatch, hint, c2kv_segments
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"PERSISTENT_HISTORY_RECOVERY_BODY_PREFIX_MISMATCH: reason={exc}"
+                    ) from exc
             if (
                 len(full_prompt_ids) <= logical_prefix
-                or full_prompt_ids[:logical_prefix] != previous[:logical_prefix]
+                or full_prompt_ids[:logical_prefix] != body
             ):
                 raise ValueError("PERSISTENT_HISTORY_RECOVERY_BODY_PREFIX_MISMATCH")
             hint["persistent_session_drop_generation_prefix_tokens"] = len(generation_prefix)
@@ -1619,12 +1658,11 @@ class OpenAIServingChat(OpenAIServingBase):
             body_ids = self._c2kv_chat_template_input_ids(
                 request, list(request.messages), self._chat_template_tools(request)
             )
-            if canonical_prompt_ids[:len(body_ids)] == body_ids:
-                adapted_request._persistent_history_generation_prefix_ids = (
-                    canonical_prompt_ids[len(body_ids):]
+            adapted_request._persistent_history_generation_prefix_ids = (
+                self._persistent_generation_prefix(
+                    list(processed_messages.prompt_ids), body_ids, canonical_prompt_ids
                 )
-            else:
-                adapted_request._persistent_history_generation_prefix_ids = []
+            )
             persistent_config = request.c2kv_kv_memory_hint.get("persistent_history_session") or {}
             if (persistent_config.get("recovery_append") or {}).get("enabled"):
                 from sglang.srt.mem_cache.c2kv_composition import source_boundary
