@@ -995,11 +995,15 @@ class SessionAwareCache(BasePrefixCache):
             self.slots[session_id] = slot
 
         if (hint.get("persistent_history_session") or {}).get("transaction") and isinstance(getattr(req, "kv_memory_report", None), dict):
-            from sglang.srt.mem_cache.racer_transaction import protected_pending_positions
+            from sglang.srt.mem_cache.racer_transaction import (
+                protected_pending_positions, regeneration_mandatory_history,
+            )
 
-            pending_positions = protected_pending_positions(getattr(req, "history_kv_runtime_state", None))
+            runtime = getattr(req, "history_kv_runtime_state", None)
+            pending_positions = protected_pending_positions(runtime)
             req.kv_memory_report["racer_current_protected_pending_positions"] = pending_positions
             req.kv_memory_report["racer_current_protected_pending_tokens"] = len(pending_positions)
+            req.kv_memory_report["racer_current_mandatory_history"] = regeneration_mandatory_history(runtime)
         slot.save_from_req(req, is_first=is_first)
 
     @staticmethod

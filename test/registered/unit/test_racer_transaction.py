@@ -596,6 +596,66 @@ def test_held_receipt_reports_the_exact_regeneration_retention_boundary():
     assert plain.kv_memory_report["racer_transaction"]["regeneration_mandatory_history"]["tokens"] == 0
 
 
+def test_current_mandatory_history_receipt_uses_saved_runtime_not_held_checkpoint(monkeypatch):
+    core = load("racer_test_current_commitkv", "mem_cache/commitkv.py")
+    lifecycle = load("racer_test_current_lifecycle", "mem_cache/history_kv_lifecycle.py")
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.history_kv_lifecycle", lifecycle)
+    policy = core.CommitKVRuntimeState(core.CommitKVConfig(measurement_layer_id=0))
+    held_page = core.EventPage(11, 0, 0, 2)
+    current_pages = (core.EventPage(17, 0, 2, 4), core.EventPage(19, 0, 4, 5))
+    policy.pending = core.PendingCommit("held", (held_page,), {}, (held_page.page_id,), 5)
+    runtime = SimpleNamespace(policy=policy)
+    req = SimpleNamespace(session=SimpleNamespace(session_id="s"), c2kv_kv_memory_hint=hint(),
+        origin_input_ids=list(range(5)), history_kv_resident_positions=list(range(5)),
+        history_kv_reference_config={"method": "commitkv"}, history_kv_reference_state=None,
+        history_kv_runtime_state=runtime, history_kv_score_state=None, kv_memory_report={},
+        history_kv_eviction=None, req_pool_idx=0, kv_committed_len=6, kv_allocated_len=7,
+        c2kv_position_correction=0, reference_decode_logical_start=5,
+        reference_decode_protected_len=5, output_ids=[100, 101], persistent_decode_cache_locs=[])
+    transaction.checkpoint_generation(req)
+    policy.pending = core.PendingCommit("current", current_pages, {},
+                                        tuple(page.page_id for page in current_pages), 5)
+    owner = methods("mem_cache/session_aware_cache.py", "SessionAwareCache", {
+        "cache_finished_req", "_discard_persistent_decode_suffix", "_is_persistent_history_req"})
+    owner.req_to_token_pool = SimpleNamespace(req_to_token=torch.tensor([[40, 41, 42, 43, 44, 45, 46, 0]]))
+    owner.page_size = 1
+    owner.token_to_kv_pool_allocator = SimpleNamespace(free=lambda indices: None)
+    saved = []
+    owner.slots = {"s": SimpleNamespace(history_kv_resident_positions=[], racer_ephemeral_spans=[],
+                                        save_from_req=lambda req, is_first: saved.append(req.kv_memory_report.copy()))}
+    owner.cache_finished_req(req)
+    report = saved[0]
+    assert report["racer_transaction"]["regeneration_mandatory_history"] == {
+        "tokens": 2, "source_message_indices": [11], "release": "replaced_source_message"}
+    assert report["racer_current_mandatory_history"] == {
+        "tokens": 3, "source_message_indices": [17, 19], "release": "replaced_source_message"}
+    assert report["racer_current_protected_pending_positions"] == [2, 3, 4]
+    assert report["racer_current_protected_pending_tokens"] == 3
+
+    serving = methods("entrypoints/openai/serving_chat.py", "OpenAIServingChat", {"_build_chat_response"})
+    namespace = serving._build_chat_response.__globals__
+    namespace.update({
+        "process_routed_experts_from_ret": lambda *_: None,
+        "process_cached_tokens_details_from_ret": lambda *_: None,
+        "process_hidden_states_from_ret": lambda *_: None,
+        "ChatCompletionResponseChoice": SimpleNamespace,
+        "ChatCompletionResponse": SimpleNamespace,
+        "ChatMessage": SimpleNamespace,
+        "UsageProcessor": SimpleNamespace(calculate_response_usage=lambda *_, **__: None),
+        "logger": logging.getLogger(__name__),
+    })
+    serving.reasoning_parser = None
+    serving.tool_call_parser = None
+    serving.tokenizer_manager = SimpleNamespace(server_args=SimpleNamespace(enable_cache_report=False))
+    request = SimpleNamespace(logprobs=False, tool_choice="none", tools=[], n=1, model="test",
+                              c2kv_kv_memory_hint={})
+    ret = [{"text": "ok", "meta_info": {"id": "r", "weight_version": "test",
+            "finish_reason": {"type": "stop"}, "kv_memory_report": report}}]
+    response = serving._build_chat_response(request, ret, 0)
+    assert response.metadata["kv_memory_report"] is report
+    assert response.metadata["kv_memory_report"]["racer_current_mandatory_history"]["source_message_indices"] == [17, 19]
+
+
 def test_shadow_features_retain_native_contract_and_configured_layer(monkeypatch):
     packed = load("racer_test_packed", "mem_cache/c2kv_native_packed.py")
     monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.c2kv_native_packed", packed)
@@ -649,4 +709,6 @@ def test_first_turn_without_completed_history_has_measured_zero_and_method_ident
     assert report["history_kv_lifecycle"]["full_history_reprefill_performed"] is False
     assert report["history_kv_lifecycle"]["retained_tokens_this_turn"] == 0
     assert report["racer_transaction"]["checkpoint_prompt_tokens"] == 5
+    assert report["racer_current_mandatory_history"] == {
+        "tokens": 0, "source_message_indices": [], "release": "replaced_source_message"}
     assert saved == [req]
