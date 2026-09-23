@@ -1122,37 +1122,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 1, min(span_tokens, int(math.ceil(span_tokens * ratio)))
             )
             target_source = "server_tokenized_retention_ratio"
-            budget_policy_kind = "ratio"
-            budget_policy_value = ratio
         else:
-            declared_target_tokens = int(config["target_tokens"])
             target_tokens = max(
-                1, min(span_tokens, declared_target_tokens)
+                1, min(span_tokens, int(config["target_tokens"]))
             )
             target_source = "absolute_request_budget"
-            budget_policy_kind = "tokens"
-            budget_policy_value = declared_target_tokens
         config["history_start"] = history_start
         config["history_end"] = history_end
         config["target_tokens"] = target_tokens
         config["target_tokens_source"] = target_source
-        config["budget_policy_kind"] = budget_policy_kind
-        config["budget_policy_value"] = budget_policy_value
-        config["budget_denominator_tokens"] = span_tokens
         config["server_tokenized"] = True
-        reference_config = hint.get("history_kv_reference_config")
-        if isinstance(reference_config, dict):
-            if budget_policy_kind == "ratio":
-                reference_config["retention_ratio"] = ratio
-                reference_config["target_tokens"] = target_tokens
-                reference_config["target_tokens_source"] = target_source
-            elif str(reference_config.get("method") or "").lower() == "commitkv":
-                # CommitKV's total budget remains the declared token count
-                # even when the physical selector clamps a short history.
-                reference_config.setdefault("target_tokens", declared_target_tokens)
-            reference_config["budget_policy_kind"] = budget_policy_kind
-            reference_config["budget_policy_value"] = budget_policy_value
-            reference_config["budget_denominator_tokens"] = span_tokens
         # The server owns the final chat template, so this is the only exact
         # full-history token count used by persistent physical accounting.
         hint["full_equivalent_history_tokens"] = span_tokens

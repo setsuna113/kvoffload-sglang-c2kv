@@ -23,9 +23,6 @@ from sglang.srt.mem_cache.commitkv import (  # noqa: E402
 from sglang.srt.mem_cache.history_kv_reference import (  # noqa: E402
     CommitKVServingState,
 )
-from sglang.srt.mem_cache.racer_transaction import (  # noqa: E402
-    enforce_request_budget,
-)
 
 
 def _extract_method(path: Path, class_name: str, method_name: str):
@@ -51,9 +48,6 @@ def _extract_method(path: Path, class_name: str, method_name: str):
         "math": math,
         "torch": torch,
         "ForwardBatch": object,
-        "MatchPrefixParams": object,
-        "MatchResult": object,
-        "_is_streaming": lambda req: True,
         "paper_telemetry": SimpleNamespace(
             bind_request=lambda *args, **kwargs: None,
             sample=lambda *args, **kwargs: None,
@@ -88,11 +82,6 @@ SERVING_RESOLVE_RANGE = _extract_method(
     "OpenAIServingChat",
     "_resolve_history_kv_eviction_range",
 )
-SESSION_MATCH_PREFIX = _extract_method(
-    ROOT / "python" / "sglang" / "srt" / "mem_cache" / "session_aware_cache.py",
-    "SessionAwareCache",
-    "match_prefix",
-)
 
 
 class _ForwardMode:
@@ -117,30 +106,20 @@ class _KVPool:
         return self._keys[layer_id], self._values[layer_id]
 
 
-def _resolved_commitkv_hint(
-    history_tokens: int,
-    *,
-    total_budget: int | None = 2048,
-    retention_ratio: float | None = None,
-    method: str = "commitkv",
-):
+def _resolved_commitkv_hint(history_tokens: int, *, total_budget: int = 2048):
     hint = {
         "history_kv_eviction": {
-            "method": method,
+            "method": "commitkv",
             "history_start_message_count": 1,
             "history_message_count": 2,
+            "target_tokens": total_budget,
         },
         "history_kv_reference_config": {
-            "method": method,
+            "method": "commitkv",
+            "target_tokens": total_budget,
             "measurement_layer_id": 0,
         },
     }
-    if retention_ratio is not None:
-        hint["history_kv_eviction"]["retention_ratio"] = retention_ratio
-        hint["history_kv_reference_config"]["retention_ratio"] = retention_ratio
-    else:
-        hint["history_kv_eviction"]["target_tokens"] = total_budget
-        hint["history_kv_reference_config"]["target_tokens"] = total_budget
     request = SimpleNamespace(messages=[object(), object()], c2kv_kv_memory_hint=hint)
     completed_ids = list(range(history_tokens + 1))
     owner = SimpleNamespace(
@@ -742,217 +721,3 @@ def test_commitkv_absolute_budget_survives_resolver_clamps_across_turns():
     }
     with pytest.raises(RuntimeError, match="COMMITKV_TOTAL_BUDGET_CHANGED"):
         build(range(2100, 2200), 1024, state)
-
-
-@pytest.mark.parametrize("method", ["h2o", "snapkv_persistent", "pyramidkv", "commitkv"])
-@pytest.mark.parametrize("ratio", [0.25, 0.5])
-def test_ratio_budget_uses_same_server_history_denominator_for_all_methods(method, ratio):
-    for history_tokens in (8, 16):
-        hint = _resolved_commitkv_hint(
-            history_tokens, total_budget=None, retention_ratio=ratio, method=method
-        )
-        physical = hint["history_kv_eviction"]
-        reference = hint["history_kv_reference_config"]
-        expected = math.ceil(history_tokens * ratio)
-        assert physical["target_tokens"] == reference["target_tokens"] == expected
-        assert physical["budget_denominator_tokens"] == history_tokens
-        assert reference["budget_denominator_tokens"] == history_tokens
-        assert reference["target_tokens_source"] == "server_tokenized_retention_ratio"
-        assert reference["budget_policy_kind"] == "ratio"
-        assert reference["budget_policy_value"] == ratio
-
-
-def test_commitkv_ratio_budget_grows_across_turns_with_pending_page_protected():
-    hints = [
-        _resolved_commitkv_hint(size, total_budget=None, retention_ratio=0.25)
-        for size in (8, 16, 32)
-    ]
-    hints[0]["history_kv_reference_config"]["pending_fraction"] = 0.5
-    hints[0]["history_kv_reference_config"]["page_size"] = 1
-    scheduler = SimpleNamespace(model_config=SimpleNamespace(num_hidden_layers=1))
-    scheduler._init_c2kv_kv_memory_report = MethodType(SCHEDULER_INIT, scheduler)
-    scheduler._build_commitkv_reference_state = MethodType(SCHEDULER_BUILD, scheduler)
-    req = SimpleNamespace(
-        history_kv_runtime_state=None,
-        history_kv_reference_config=None,
-        history_kv_resident_positions=list(range(8)),
-        history_kv_reference_state=None,
-        req_pool_idx=0,
-    )
-    scheduler._init_c2kv_kv_memory_report(req, hints[0])
-    serving_state = req.history_kv_runtime_state
-    assert serving_state.target_tokens == 2
-    assert serving_state.budget_policy == ("ratio", 0.25)
-
-    serving_state.policy.record_pre(
-        "commit",
-        [EventPage("action", 0, 0, 1)],
-        _FixedEffectWindow(list(range(8))),
-        list(range(8)),
-        total_budget=2,
-    )
-    pre_effects = dict(serving_state.policy.pending.pre_effects)
-
-    def build(normal_positions, hint, previous):
-        normal_positions = list(normal_positions)
-        keys = torch.tensor(normal_positions, dtype=torch.float32).view(-1, 1, 1)
-        scheduler.req_to_token_pool = SimpleNamespace(
-            req_to_token=torch.arange(len(keys), dtype=torch.long).view(1, -1)
-        )
-        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
-            get_kvcache=lambda: _KVPool([keys], [keys + 100])
-        )
-        req.history_kv_reference_config = hint["history_kv_reference_config"]
-        req.history_kv_resident_positions = normal_positions
-        req.history_kv_reference_state = previous
-        return scheduler._build_commitkv_reference_state(
-            req,
-            {
-                "history_start": 0,
-                "history_end": len(normal_positions),
-                "target_tokens": hint["history_kv_eviction"]["target_tokens"],
-            },
-        )
-
-    first = build(range(8), hints[0], None)
-    assert first.layers[0].positions.tolist() == [[0, 7]]
-    second = build(range(8, 16), hints[1], first)
-    assert len(second.layers[0].positions[0]) == 4
-    assert 0 in second.layers[0].positions[0].tolist()
-    assert second.selection_metadata["pending_pre_total_budget_tokens"] == 2
-    assert second.selection_metadata["commitkv_total_budget_tokens"] == 4
-    assert serving_state.policy.pending.pre_effects == pre_effects
-    third = build(range(16, 32), hints[2], second)
-    assert len(third.layers[0].positions[0]) == 8
-    assert 0 in third.layers[0].positions[0].tolist()
-    assert serving_state.target_tokens == 8
-    with pytest.raises(ValueError, match="shrank during a transition"):
-        serving_state.resolve_budget(
-            _resolved_commitkv_hint(
-                4, total_budget=None, retention_ratio=0.25
-            )["history_kv_reference_config"]
-        )
-    assert serving_state.target_tokens == 8
-
-    req.history_kv_reference_config = {
-        **hints[2]["history_kv_reference_config"],
-        "retention_ratio": 0.5,
-        "budget_policy_value": 0.5,
-    }
-    with pytest.raises(RuntimeError, match="COMMITKV_TOTAL_BUDGET_CHANGED"):
-        build(range(32, 40), {"history_kv_reference_config": req.history_kv_reference_config,
-                              "history_kv_eviction": {"target_tokens": 20}}, third)
-
-
-def test_commitkv_ratio_without_completed_history_starts_unresolved():
-    scheduler = SimpleNamespace(model_config=SimpleNamespace(num_hidden_layers=1))
-    scheduler._init_c2kv_kv_memory_report = MethodType(SCHEDULER_INIT, scheduler)
-    req = SimpleNamespace(history_kv_runtime_state=None, history_kv_reference_config=None)
-    scheduler._init_c2kv_kv_memory_report(
-        req,
-        {"history_kv_reference_config": {
-            "method": "commitkv", "retention_ratio": 0.25, "measurement_layer_id": 0
-        }},
-    )
-    state = req.history_kv_runtime_state
-    assert state.target_tokens == 1
-    assert state.budget_policy == ("ratio", 0.25)
-    assert not state.budget_resolved
-    state.resolve_budget(
-        _resolved_commitkv_hint(8, total_budget=None, retention_ratio=0.25)[
-            "history_kv_reference_config"
-        ]
-    )
-    assert state.target_tokens == 2
-    assert state.budget_resolved
-
-
-def test_racer_recovery_keeps_commitkv_total_policy_and_reserves_capacity():
-    hints = [_resolved_commitkv_hint(16, total_budget=8) for _ in range(2)]
-    for hint, evidence_tokens in zip(hints, (2, 4)):
-        hint["persistent_history_session"] = {
-            "transaction": {"decision_id": "d", "phase": "draft"},
-            "history_budget_tokens": 8,
-        }
-        hint["racer_active_ephemeral_source_spans"] = [[16, 16 + evidence_tokens]]
-        enforce_request_budget(hint)
-        reference = hint["history_kv_reference_config"]
-        assert reference["target_tokens"] == 8
-        assert reference["budget_policy_value"] == 8
-        assert reference["racer_effective_target_tokens"] == 8 - evidence_tokens
-
-    scheduler = SimpleNamespace(model_config=SimpleNamespace(num_hidden_layers=1))
-    scheduler._init_c2kv_kv_memory_report = MethodType(SCHEDULER_INIT, scheduler)
-    scheduler._build_commitkv_reference_state = MethodType(SCHEDULER_BUILD, scheduler)
-    req = SimpleNamespace(
-        history_kv_runtime_state=None,
-        history_kv_reference_config=None,
-        history_kv_resident_positions=list(range(8)),
-        history_kv_reference_state=None,
-        req_pool_idx=0,
-    )
-    scheduler._init_c2kv_kv_memory_report(req, hints[0])
-    state = req.history_kv_runtime_state
-    state.policy.record_pre(
-        "commit", [EventPage("action", 0, 0, 1)],
-        _FixedEffectWindow(list(range(8))), list(range(8)), total_budget=8,
-    )
-    req.history_kv_reference_config = hints[1]["history_kv_reference_config"]
-    state.resolve_budget(req.history_kv_reference_config)
-    assert state.target_tokens == 8
-    assert state.policy.pending.total_budget == 8
-    keys = torch.arange(8, dtype=torch.float32).view(8, 1, 1)
-    scheduler.req_to_token_pool = SimpleNamespace(
-        req_to_token=torch.arange(8, dtype=torch.long).view(1, -1)
-    )
-    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
-        get_kvcache=lambda: _KVPool([keys], [keys + 100])
-    )
-    selected = scheduler._build_commitkv_reference_state(
-        req, {"history_start": 0, "history_end": 8, "target_tokens": 4}
-    )
-    assert selected.layers[0].key.shape[1] == 4
-    assert selected.selection_metadata["commitkv_total_budget_tokens"] == 8
-    assert selected.selection_metadata["active_capacity_tokens"] == 4
-
-
-def test_changed_commitkv_policy_rejects_before_racer_discard_mutates_slot():
-    state = CommitKVServingState(
-        policy=CommitKVRuntimeState(CommitKVConfig(measurement_layer_id=0)),
-        target_tokens=8,
-        budget_policy=("tokens", 8),
-    )
-    held = SimpleNamespace(runtime_state=state)
-    slot = SimpleNamespace(
-        req_pool_idx=0,
-        history_kv_runtime_state=state,
-        history_kv_resident_positions=[0],
-        racer_held_generation=held,
-    )
-    mutations = []
-    owner = SimpleNamespace(
-        slots={"s": slot},
-        _resolve_racer_transaction=lambda *_: mutations.append("discard"),
-        _adopt_legacy_persistent_prefix=lambda *_: mutations.append("adopt"),
-    )
-    req = SimpleNamespace(
-        session=SimpleNamespace(session_id="s"),
-        history_kv_eviction={"persistent_continuation_pending": True},
-        history_kv_reference_config={
-            "method": "commitkv",
-            "target_tokens": 4,
-            "budget_policy_kind": "tokens",
-            "budget_policy_value": 4,
-        },
-        c2kv_kv_memory_hint={
-            "persistent_history_session": {
-                "transaction": {"phase": "regenerate", "resolution": "discard"}
-            }
-        },
-    )
-    with pytest.raises(RuntimeError, match="COMMITKV_TOTAL_BUDGET_CHANGED"):
-        SESSION_MATCH_PREFIX(owner, SimpleNamespace(req=req))
-    assert mutations == []
-    assert slot.racer_held_generation is held
-    assert slot.history_kv_runtime_state is state
-    assert state.target_tokens == 8

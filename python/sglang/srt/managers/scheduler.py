@@ -3272,19 +3272,11 @@ class Scheduler(
                     req.history_kv_reference_config[
                         "measurement_layer_id_source"
                     ] = "final_layer_project_convention"
-                initial_target = reference_config.get("target_tokens")
-                if initial_target is None:
-                    initial_target = (
-                        1
-                        if reference_config.get("retention_ratio") is not None
-                        else 2048
-                    )
                 req.history_kv_runtime_state = CommitKVServingState(
                     policy=CommitKVRuntimeState(CommitKVConfig(**config_keys)),
-                    target_tokens=int(initial_target),
-                )
-                req.history_kv_runtime_state.resolve_budget(
-                    req.history_kv_reference_config
+                    target_tokens=int(
+                        reference_config.get("target_tokens") or 2048
+                    ),
                 )
         req.c2kv_kv_memory_hint = dict(hint)
         req.kv_memory_report = report
@@ -3854,8 +3846,17 @@ class Scheduler(
         if not isinstance(serving_state, CommitKVServingState):
             raise RuntimeError("COMMITKV_RUNTIME_STATE_UNAVAILABLE")
         reference_config = getattr(req, "history_kv_reference_config", None)
-        if isinstance(reference_config, dict):
-            serving_state.resolve_budget(reference_config)
+        declared_target_tokens = (
+            int(reference_config.get("target_tokens") or 2048)
+            if isinstance(reference_config, dict)
+            else serving_state.target_tokens
+        )
+        if declared_target_tokens != serving_state.target_tokens:
+            raise RuntimeError(
+                "COMMITKV_TOTAL_BUDGET_CHANGED: "
+                f"state={serving_state.target_tokens}, "
+                f"request={declared_target_tokens}"
+            )
         history_start = int(config.get("history_start") or 0)
         history_end = int(config.get("history_end") or 0)
         history_len = history_end - history_start
@@ -4394,12 +4395,6 @@ class Scheduler(
         elif method == "commitkv":
             runtime = getattr(req, "history_kv_runtime_state", None)
             interval = int(runtime.policy.config.checkpoint_interval)
-            if (
-                runtime.budget_policy is not None
-                and runtime.budget_policy[0] == "ratio"
-                and not runtime.budget_resolved
-            ):
-                return 0
         else:
             return 0
         old_len = int(req.kv_committed_len)
@@ -4431,14 +4426,6 @@ class Scheduler(
             )
             ledger.extend(range(start, start + old_len - len(ledger)))
         req.history_kv_resident_positions = ledger
-        if method == "commitkv":
-            checkpoint_target = runtime.target_tokens
-        else:
-            checkpoint_target = (
-                reference_config.get("target_tokens")
-                or base_config.get("target_tokens")
-                or 2048
-            )
         checkpoint_config = {
             **base_config,
             **reference_config,
@@ -4447,7 +4434,9 @@ class Scheduler(
             "history_end": old_len,
             "target_tokens": int(
                 reference_config.get("racer_effective_target_tokens")
-                or checkpoint_target
+                or reference_config.get("target_tokens")
+                or base_config.get("target_tokens")
+                or 2048
             ),
         }
         if method == "agentkv":

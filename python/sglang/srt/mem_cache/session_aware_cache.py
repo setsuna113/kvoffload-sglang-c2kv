@@ -292,21 +292,6 @@ class SessionAwareCache(BasePrefixCache):
         # next persistent request overwrites the slot metadata.
         config = getattr(req, "history_kv_eviction", None)
         hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
-        reference_config = getattr(req, "history_kv_reference_config", None)
-        if isinstance(reference_config, dict):
-            from sglang.srt.mem_cache.history_kv_reference import CommitKVServingState
-
-            held = getattr(slot, "racer_held_generation", None)
-            transaction = (hint.get("persistent_history_session") or {}).get(
-                "transaction"
-            ) or {}
-            runtime = (
-                held.runtime_state
-                if held is not None and transaction.get("resolution") == "discard"
-                else getattr(slot, "history_kv_runtime_state", None)
-            )
-            if isinstance(runtime, CommitKVServingState):
-                runtime.resolve_budget(reference_config, validate_only=True)
         if (
             isinstance(config, dict)
             and config.get("persistent_continuation_pending")
@@ -345,10 +330,6 @@ class SessionAwareCache(BasePrefixCache):
             if expected_horizon != slot_horizon:
                 raise RuntimeError("PERSISTENT_HISTORY_SESSION_STALE_CONTINUATION")
 
-        if isinstance(reference_config, dict):
-            runtime = getattr(slot, "history_kv_runtime_state", None)
-            if isinstance(runtime, CommitKVServingState):
-                runtime.resolve_budget(reference_config)
         slot.restore_to_req(req)
         self._refresh_persistent_tool_prefix(slot, req)
 
