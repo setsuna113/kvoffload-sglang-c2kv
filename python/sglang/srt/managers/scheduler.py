@@ -94,6 +94,10 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     CheckWeightsReqInput,
+    C2KVBulkCacheLookupReqInput,
+    C2KVBulkCacheLookupReqOutput,
+    C2KVPinLeaseReqInput,
+    C2KVPinLeaseReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
@@ -902,6 +906,7 @@ class Scheduler(
             )
 
         self.c2kv_pool = None
+        self.c2kv_native_pin_leases = {}
         if server_args.enable_c2kv:
             from sglang.srt.mem_cache.c2kv_pool import (
                 C2KVPool,
@@ -1381,6 +1386,8 @@ class Scheduler(
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (TokenizedExtractReqInput, self.handle_extract_request),
+                (C2KVBulkCacheLookupReqInput, self.handle_c2kv_bulk_cache_lookup),
+                (C2KVPinLeaseReqInput, self.handle_c2kv_pin_lease),
                 (
                     TokenizedRepairExtractReqInput,
                     self.handle_repair_extract_request,
@@ -2310,6 +2317,139 @@ class Scheduler(
         ):
             release_kv_cache(req, self.tree_cache, is_insert=False)
 
+    def handle_c2kv_pin_lease(self, recv_req: C2KVPinLeaseReqInput):
+        """Atomically pin selected keys for one native request lifecycle."""
+        owner_id = recv_req.owner_id
+        action = recv_req.action
+
+        def output(success=True, error=""):
+            return C2KVPinLeaseReqOutput(
+                owner_id=owner_id, action=action, success=success, error=error
+            )
+
+        if not owner_id:
+            return output(False, "C2KV_PIN_LEASE_OWNER_REQUIRED")
+        if action == "release":
+            keys = self.c2kv_native_pin_leases.pop(owner_id, None)
+            if keys is not None:
+                self.c2kv_pool.unpin_many(keys)
+            return output()
+        if action != "acquire":
+            return output(False, "C2KV_PIN_LEASE_ACTION_INVALID")
+        if self.c2kv_pool is None:
+            return output(False, "C2KV not enabled.")
+        keys = tuple(dict.fromkeys(recv_req.key_hashes))
+        if not keys:
+            return output(False, "C2KV_PIN_LEASE_KEYS_REQUIRED")
+        existing = self.c2kv_native_pin_leases.get(owner_id)
+        local_ready = (
+            (existing is None or existing == keys)
+            and all(key in self.c2kv_pool._cache for key in keys)
+        )
+        if self.tp_size > 1 and torch.distributed.is_initialized():
+            all_ready = torch.tensor([int(local_ready)], dtype=torch.long)
+            torch.distributed.all_reduce(
+                all_ready,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            local_ready = bool(all_ready.item())
+        if not local_ready:
+            return output(False, "C2KV_PIN_LEASE_KEYS_MISSING_OR_OWNER_CONFLICT")
+        if existing is None:
+            if not self.c2kv_pool.pin_many(keys):
+                return output(False, "C2KV_PIN_LEASE_KEYS_MISSING")
+            self.c2kv_native_pin_leases[owner_id] = keys
+        return output()
+
+    def _c2kv_extract_cache_key(self, recv_req: TokenizedExtractReqInput):
+        """Resolve the exact cache key used by ordinary C2KV extraction."""
+        model_runner = self.tp_worker.model_runner
+        try:
+            compression_ratio = model_runner.get_c2kv_compression_ratio(
+                recv_req.compression_ratio
+            )
+        except ValueError as e:
+            return None, None, str(e)
+
+        hf_config = getattr(self.model_config, "hf_config", None)
+        extractor_config = {
+            "gist_type": getattr(self.server_args, "c2kv_gist_type", "dynamic-interleave"),
+            "gist_param": getattr(self.server_args, "c2kv_gist_param", "qkv"),
+            "gist_extra_embed_num": getattr(hf_config, "gist_extra_embed_num", 1),
+            "gist_residual_type": getattr(hf_config, "gist_residual_type", "none"),
+            "gist_overlap": getattr(hf_config, "gist_overlap", 0),
+            "pic_enabled": bool(getattr(hf_config, "pic_enabled", False)),
+            "pic_param": getattr(hf_config, "pic_param", "qkv"),
+        }
+        projection_set = getattr(recv_req, "projection_set", "history") or "history"
+        if projection_set != "history":
+            # The tool checkpoint identity joins the key. History keys keep
+            # their original schema so old cached entries remain reusable.
+            tool_identity = getattr(
+                model_runner.model, "c2kv_tool_gist_identity", None
+            )
+            if projection_set != "tool" or not tool_identity:
+                return (
+                    None,
+                    None,
+                    "C2KV_TOOL_GIST_UNAVAILABLE: projection_set "
+                    f"{projection_set!r} is not loaded on this server "
+                    "(start it with --c2kv-tool-gist-weights)",
+                )
+            extractor_config["projection_set"] = "tool"
+            extractor_config["projection_identity"] = tool_identity
+        key_hash = self.c2kv_pool.compute_hash(
+            recv_req.input_ids,
+            compression_ratio=compression_ratio,
+            extractor_config=extractor_config,
+        )
+        return key_hash, compression_ratio, None
+
+    def handle_c2kv_bulk_cache_lookup(self, recv_req: C2KVBulkCacheLookupReqInput):
+        """Return a consecutive hit prefix without starting an encoder pass."""
+        if self.c2kv_pool is None:
+            return C2KVBulkCacheLookupReqOutput(
+                success=False, error="C2KV not enabled."
+            )
+        if not 1 <= len(recv_req.items) <= 32:
+            return C2KVBulkCacheLookupReqOutput(
+                success=False, error="C2KV bulk cache lookup requires 1 to 32 items"
+            )
+        local_hit_count = 0
+        for item in recv_req.items:
+            if not item.input_ids:
+                return C2KVBulkCacheLookupReqOutput(
+                    success=False, error="input_ids is empty."
+                )
+            key_hash, _, error = self._c2kv_extract_cache_key(item)
+            if error is not None:
+                return C2KVBulkCacheLookupReqOutput(success=False, error=error)
+            if key_hash not in self.c2kv_pool._cache:
+                break
+            local_hit_count += 1
+
+        hit_count = local_hit_count
+        if self.tp_size > 1 and torch.distributed.is_initialized():
+            common_count = torch.tensor([hit_count], dtype=torch.long)
+            torch.distributed.all_reduce(
+                common_count,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            hit_count = int(common_count.item())
+
+        # Reuse the decorated single-hit handler to retain per-chunk receipts,
+        # paper telemetry, and LRU touch order. All ranks use the same prefix.
+        hits = [self.handle_extract_request(item) for item in recv_req.items[:hit_count]]
+        if any(not result.success or not result.cache_hit for result in hits):
+            return C2KVBulkCacheLookupReqOutput(
+                success=False, error="C2KV bulk cache lookup lost a cache hit"
+            )
+        return C2KVBulkCacheLookupReqOutput(
+            hits=hits, first_miss_index=hit_count
+        )
+
     @paper_telemetry.measure_synchronous_request("c2kv_extract", "extraction")
     def handle_extract_request(self, recv_req: "TokenizedExtractReqInput"):
         from sglang.srt.managers.io_struct import C2KVExtractReqOutput
@@ -2324,53 +2464,10 @@ class Scheduler(
                 error="input_ids is empty.", success=False
             )
         model_runner = self.tp_worker.model_runner
-        try:
-            compression_ratio = model_runner.get_c2kv_compression_ratio(
-                recv_req.compression_ratio
-            )
-        except ValueError as e:
-            return C2KVExtractReqOutput(error=str(e), success=False)
-
-        hf_config = getattr(self.model_config, "hf_config", None)
-        extractor_config = {
-            "gist_type": getattr(
-                self.server_args, "c2kv_gist_type", "dynamic-interleave"
-            ),
-            "gist_param": getattr(self.server_args, "c2kv_gist_param", "qkv"),
-            "gist_extra_embed_num": getattr(
-                hf_config, "gist_extra_embed_num", 1
-            ),
-            "gist_residual_type": getattr(
-                hf_config, "gist_residual_type", "none"
-            ),
-            "gist_overlap": getattr(hf_config, "gist_overlap", 0),
-            "pic_enabled": bool(getattr(hf_config, "pic_enabled", False)),
-            "pic_param": getattr(hf_config, "pic_param", "qkv"),
-        }
+        key_hash, compression_ratio, error = self._c2kv_extract_cache_key(recv_req)
+        if error is not None:
+            return C2KVExtractReqOutput(error=error, success=False)
         projection_set = getattr(recv_req, "projection_set", "history") or "history"
-        if projection_set != "history":
-            # A second encoder's entries must never alias the history set's:
-            # the set name and the tool checkpoint identity join the key.  The
-            # "history" key is byte-identical to the pre-tool-set schema.
-            tool_identity = getattr(
-                model_runner.model, "c2kv_tool_gist_identity", None
-            )
-            if projection_set != "tool" or not tool_identity:
-                return C2KVExtractReqOutput(
-                    error=(
-                        "C2KV_TOOL_GIST_UNAVAILABLE: projection_set "
-                        f"{projection_set!r} is not loaded on this server "
-                        "(start it with --c2kv-tool-gist-weights)"
-                    ),
-                    success=False,
-                )
-            extractor_config["projection_set"] = "tool"
-            extractor_config["projection_identity"] = tool_identity
-        key_hash = self.c2kv_pool.compute_hash(
-            recv_req.input_ids,
-            compression_ratio=compression_ratio,
-            extractor_config=extractor_config,
-        )
         self._log_c2kv_token_usage(
             "extract_request",
             key_hash=key_hash[:16],
@@ -3699,6 +3796,7 @@ class Scheduler(
 
         paper_telemetry.sample(
             "pyramidkv_reference_state_materialized",
+            req=req,
             tensors=[
                 tensor
                 for layer in state.layers.values()
@@ -3817,6 +3915,7 @@ class Scheduler(
 
         paper_telemetry.sample(
             "agentkv_reference_state_materialized",
+            req=req,
             tensors=[
                 tensor
                 for layer in state.layers.values()
@@ -3950,6 +4049,7 @@ class Scheduler(
 
         paper_telemetry.sample(
             "commitkv_reference_state_materialized",
+            req=req,
             tensors=[
                 tensor
                 for layer in state.layers.values()
@@ -3977,7 +4077,7 @@ class Scheduler(
         config = getattr(req, "history_kv_eviction", None)
         if not isinstance(config, dict):
             return True
-        paper_telemetry.set_phase("selection")
+        paper_telemetry.set_phase("selection", req=req)
         session_error = _persistent_history_session_error(req, config)
         if session_error is not None:
             report = getattr(req, "kv_memory_report", None)
@@ -4001,8 +4101,8 @@ class Scheduler(
             req.persistent_history_eviction_failed = True
             req.to_finish = _FA(session_error)
             req.check_finished()
-            paper_telemetry.sample("history_kv_eviction_failed")
-            paper_telemetry.set_phase("prefill")
+            paper_telemetry.sample("history_kv_eviction_failed", req=req)
+            paper_telemetry.set_phase("prefill", req=req)
             return False
         score_info = getattr(req, "history_kv_selection_scores", None)
         selection_query_tokens_observed = (
@@ -4199,8 +4299,8 @@ class Scheduler(
             req.persistent_history_eviction_failed = True
             req.to_finish = _FA(error or "Physical history KV eviction failed")
             req.check_finished()
-            paper_telemetry.sample("history_kv_eviction_failed")
-            paper_telemetry.set_phase("prefill")
+            paper_telemetry.sample("history_kv_eviction_failed", req=req)
+            paper_telemetry.set_phase("prefill", req=req)
             return False
 
         if reference_state is not None:
@@ -4282,8 +4382,8 @@ class Scheduler(
             if not (0 <= history_start <= history_end <= len(virtual_ids)):
                 req.to_finish = _FA("PERSISTENT_HISTORY_ACTIVE_SEQUENCE_INVALID")
                 req.check_finished()
-                paper_telemetry.sample("history_kv_active_sequence_invalid")
-                paper_telemetry.set_phase("prefill")
+                paper_telemetry.sample("history_kv_active_sequence_invalid", req=req)
+                paper_telemetry.set_phase("prefill", req=req)
                 return False
             active_input_ids = (
                 virtual_ids[:history_start]
@@ -4298,8 +4398,8 @@ class Scheduler(
                     f"committed_len={req.kv_committed_len}"
                 )
                 req.check_finished()
-                paper_telemetry.sample("history_kv_active_sequence_length_mismatch")
-                paper_telemetry.set_phase("prefill")
+                paper_telemetry.sample("history_kv_active_sequence_length_mismatch", req=req)
+                paper_telemetry.set_phase("prefill", req=req)
                 return False
             req.c2kv_persistent_active_input_ids = active_input_ids
             req.c2kv_virtual_input_ids = list(active_input_ids)
@@ -4376,8 +4476,8 @@ class Scheduler(
             req=req,
             **result.as_dict(),
         )
-        paper_telemetry.sample("history_kv_eviction_applied")
-        paper_telemetry.set_phase("prefill")
+        paper_telemetry.sample("history_kv_eviction_applied", req=req)
+        paper_telemetry.set_phase("prefill", req=req)
         return True
 
     def _apply_reference_decode_checkpoint(self, req: "Req") -> int:

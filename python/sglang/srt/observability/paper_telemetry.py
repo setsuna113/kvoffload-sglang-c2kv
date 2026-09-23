@@ -1,8 +1,9 @@
 """Opt-in, request-scoped telemetry for the C2KV paper experiments.
 
 This module deliberately has no effect unless ``C2KV_PAPER_TELEMETRY=1``.
-The paper runner is single-flight, so the scheduler process has one measured
-request at a time.  Persistent KV occupancy is reported separately from CUDA
+The paper runner is single-flight by default. Set ``C2KV_PAPER_CONCURRENT=1``
+for concurrent serving; memory snapshots then describe shared process occupancy.
+Persistent KV occupancy is reported separately from CUDA
 allocator/NVML process memory: the former is live K/V payload, while the latter
 also includes model weights, workspaces, Q tensors, and allocator reservation.
 """
@@ -10,6 +11,7 @@ also includes model weights, workspaces, Q tensors, and allocator reservation.
 from __future__ import annotations
 
 import copy
+import contextvars
 import functools
 import json
 import os
@@ -22,10 +24,17 @@ import torch
 
 
 _TRUE = {"1", "true", "yes", "on"}
+_SYNCHRONOUS_REQUEST_ID = contextvars.ContextVar(
+    "c2kv_paper_synchronous_request_id", default=None
+)
 
 
 def enabled() -> bool:
     return os.environ.get("C2KV_PAPER_TELEMETRY", "").strip().lower() in _TRUE
+
+
+def concurrent_enabled() -> bool:
+    return os.environ.get("C2KV_PAPER_CONCURRENT", "").strip().lower() in _TRUE
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -43,6 +52,7 @@ class _PaperTelemetry:
         self._tree_cache = None
         self._bytes_per_kv_token = 0
         self._active: Optional[Dict[str, Any]] = None
+        self._actives: Dict[str, Dict[str, Any]] = {}
         self._completed: Dict[str, Dict[str, Any]] = {}
         self._nvml = None
         self._nvml_handle = None
@@ -140,8 +150,22 @@ class _PaperTelemetry:
         if not enabled():
             return
         with self._lock:
-            if self._active is not None and self._active["server_request_id"] == str(req.rid):
-                self._active["req"] = req
+            active = self._actives.get(str(req.rid))
+            if active is not None:
+                active["req"] = req
+
+    def _targets(self, req: Any = None) -> list[Dict[str, Any]]:
+        if req is not None:
+            rid = str(getattr(req, "rid", req))
+            active = self._actives.get(rid)
+            return [active] if active is not None else []
+        if concurrent_enabled():
+            synchronous_rid = _SYNCHRONOUS_REQUEST_ID.get()
+            if synchronous_rid is not None:
+                active = self._actives.get(synchronous_rid)
+                return [active] if active is not None else []
+            return list(self._actives.values())
+        return [self._active] if self._active is not None else []
 
     def _reference_payload(self, owners: Iterable[Any], *, include_snapshots: bool = True) -> Dict[str, int]:
         states = {}
@@ -203,8 +227,9 @@ class _PaperTelemetry:
         bpt = self._bytes_per_kv_token
         cache = self._tree_cache_sizes()
         owners = list(getattr(self._tree_cache, "slots", {}).values())
-        if self._active is not None and self._active.get("req") is not None:
-            owners.append(self._active["req"])
+        for active in self._actives.values():
+            if active.get("req") is not None:
+                owners.append(active["req"])
         reference = self._reference_payload(owners)
         return {
             "bytes_per_kv_token": bpt,
@@ -294,17 +319,20 @@ class _PaperTelemetry:
             return
         rid = str(server_request_id or "")
         with self._lock:
-            if self._active is not None and self._active["server_request_id"] != rid:
+            if not concurrent_enabled() and self._active is not None and self._active["server_request_id"] != rid:
                 self._finish_locked(success=False, error="superseded_by_next_request")
             try:
-                if torch.cuda.is_available():
+                if torch.cuda.is_available() and not self._actives:
                     torch.cuda.reset_peak_memory_stats()
             except Exception:
                 pass
             baseline = self._snapshot("baseline")
+            if concurrent_enabled():
+                for other in self._actives.values():
+                    self._update_peak(baseline, other)
             now = baseline["monotonic_ns"]
             phase_name = str(phase or ("extraction" if kind != "generation" else "prefill"))
-            self._active = {
+            active = {
                 "server_request_id": rid,
                 "outer_request_id": str(outer_request_id or rid),
                 "phase": str(phase or phase_name),
@@ -326,10 +354,17 @@ class _PaperTelemetry:
                     baseline["kv"].get("cached_evictable_kv_tokens")
                 ),
                 "req": None,
+                "overlapped": bool(self._actives),
             }
+            if concurrent_enabled():
+                for other in self._actives.values():
+                    other["overlapped"] = True
+            self._actives[rid] = active
+            if not concurrent_enabled():
+                self._active = active
 
-    def _update_peak(self, snapshot: Dict[str, Any]) -> None:
-        active = self._active
+    def _update_peak(self, snapshot: Dict[str, Any], active: Optional[Dict[str, Any]] = None) -> None:
+        active = active or self._active
         if active is None:
             return
         active["cached_evictable_peak_tokens"] = max(
@@ -377,12 +412,15 @@ class _PaperTelemetry:
         *,
         tensors: Optional[Iterable[Any]] = None,
         temporary_kv: bool = False,
+        req: Any = None,
     ) -> Optional[Dict[str, Any]]:
         if not enabled():
             return None
         with self._lock:
-            if self._active is None:
+            targets = self._targets(req)
+            if not targets:
                 return None
+            peak_targets = list(self._actives.values()) if concurrent_enabled() else targets
             snapshot = self._snapshot(event)
             if tensors is not None:
                 tensor_bytes = self._tensor_bytes(tensors)
@@ -406,38 +444,52 @@ class _PaperTelemetry:
                         snapshot["kv"]["request_resident_kv_bytes"]
                         + tensor_bytes["storage_bytes"]
                     )
-                    self._active["temporary_logical_peak_bytes"] = max(
-                        self._active["temporary_logical_peak_bytes"],
-                        tensor_bytes["logical_bytes"],
-                    )
-                    self._active["temporary_storage_peak_bytes"] = max(
-                        self._active["temporary_storage_peak_bytes"],
-                        tensor_bytes["storage_bytes"],
-                    )
-            self._update_peak(snapshot)
+                    # Without a request identifier, temporary tensors belong
+                    # to the shared process, not to any one request's work.
+                    temporary_targets = targets if req is not None or len(targets) == 1 else []
+                    for active in temporary_targets:
+                        active["temporary_logical_peak_bytes"] = max(
+                            active["temporary_logical_peak_bytes"],
+                            tensor_bytes["logical_bytes"],
+                        )
+                        active["temporary_storage_peak_bytes"] = max(
+                            active["temporary_storage_peak_bytes"],
+                            tensor_bytes["storage_bytes"],
+                        )
+            for active in peak_targets:
+                self._update_peak(snapshot, active)
             return snapshot
 
-    def set_phase(self, name: str) -> None:
+    def set_phase(self, name: str, *, req: Any = None, reqs: Optional[Iterable[Any]] = None) -> None:
         if not enabled():
             return
         with self._lock:
-            active = self._active
-            if active is None or active["current_phase"]["name"] == name:
-                return
-            end = self._snapshot(f"phase:{active['current_phase']['name']}:end")
-            self._update_peak(end)
-            current = active.pop("current_phase")
-            current.update(
-                end_ns=end["monotonic_ns"],
-                duration_ns=end["monotonic_ns"] - current["start_ns"],
-                end_snapshot=end,
+            targets = (
+                [active for item in reqs for active in self._targets(item)]
+                if reqs is not None else self._targets(req)
             )
-            active["phases"].append(current)
-            active["current_phase"] = {
-                "name": name,
-                "start_ns": end["monotonic_ns"],
-                "start_snapshot": end,
-            }
+            # An unbound phase transition cannot identify which overlapping
+            # request changed state. Callers with a request pass it explicitly.
+            if req is None and reqs is None and len(targets) > 1:
+                return
+            for active in targets:
+                if active["current_phase"]["name"] == name:
+                    continue
+                end = self._snapshot(f"phase:{active['current_phase']['name']}:end")
+                for other in self._actives.values() if concurrent_enabled() else (active,):
+                    self._update_peak(end, other)
+                current = active.pop("current_phase")
+                current.update(
+                    end_ns=end["monotonic_ns"],
+                    duration_ns=end["monotonic_ns"] - current["start_ns"],
+                    end_snapshot=end,
+                )
+                active["phases"].append(current)
+                active["current_phase"] = {
+                    "name": name,
+                    "start_ns": end["monotonic_ns"],
+                    "start_snapshot": end,
+                }
 
     def mark_generation_start(
         self, req: Any, *, normal_kv_tokens: Optional[int] = None
@@ -445,8 +497,8 @@ class _PaperTelemetry:
         if not enabled():
             return
         with self._lock:
-            active = self._active
-            if active is None or active["server_request_id"] != str(getattr(req, "rid", "")):
+            active = self._actives.get(str(getattr(req, "rid", "")))
+            if active is None:
                 return
             active["req"] = req
             if active["whole_full_kv_tokens"] is None:
@@ -468,8 +520,9 @@ class _PaperTelemetry:
                 active_tokens * self._bytes_per_kv_token + reference["bytes"])
             snapshot["reference_history_resident_bytes"] = reference["bytes"]
             active["generation_start"] = snapshot
-            self._update_peak(snapshot)
-            self.set_phase("decode")
+            for other in self._actives.values() if concurrent_enabled() else (active,):
+                self._update_peak(snapshot, other)
+            self.set_phase("decode", req=req)
 
     @staticmethod
     def _req_semantics(req: Any) -> Dict[str, Any]:
@@ -569,16 +622,22 @@ class _PaperTelemetry:
         self,
         *,
         req: Any = None,
+        server_request_id: Any = None,
         success: bool = True,
         error: Optional[str] = None,
         metric_overrides: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        active = self._active
+        if req is not None:
+            server_request_id = getattr(req, "rid", server_request_id)
+        active = self._actives.get(str(server_request_id)) if server_request_id is not None else self._active
+        if active is None and server_request_id is None and len(self._actives) == 1:
+            active = next(iter(self._actives.values()))
         if active is None:
             return None
         req = req or active.get("req")
         final = self._snapshot("final")
-        self._update_peak(final)
+        for other in self._actives.values() if concurrent_enabled() else (active,):
+            self._update_peak(final, other)
         current = active.pop("current_phase")
         current.update(
             end_ns=final["monotonic_ns"],
@@ -689,10 +748,22 @@ class _PaperTelemetry:
                 if peak_nvml is not None and baseline_nvml is not None
                 else None
             ),
+            "memory_scope": (
+                "process_shared_during_overlap"
+                if active["overlapped"] else "request_single_flight"
+            ),
+            "torch_peak_scope": (
+                "process_since_idle_reset"
+                if concurrent_enabled() else "process_since_request_start_reset"
+            ),
+            "duration_scope": "request_wall_clock_elapsed",
             **semantics,
         }
         if active["kind"] == "c2kv_extract":
             metrics["extraction_duration_ns"] = duration_ns
+        raw_prefix_cache = getattr(req, "c2kv_raw_prefix_cache", None)
+        if isinstance(raw_prefix_cache, dict):
+            metrics["c2kv_raw_prefix_cache"] = copy.deepcopy(raw_prefix_cache)
         if metric_overrides:
             metrics.update(metric_overrides)
         result = {
@@ -720,13 +791,16 @@ class _PaperTelemetry:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(result, sort_keys=True) + "\n")
-        self._active = None
+        self._actives.pop(active["server_request_id"], None)
+        if self._active is active:
+            self._active = None
         return result
 
     def finish(
         self,
         *,
         req: Any = None,
+        server_request_id: Any = None,
         success: bool = True,
         error: Optional[str] = None,
         metric_overrides: Optional[Dict[str, Any]] = None,
@@ -736,6 +810,7 @@ class _PaperTelemetry:
         with self._lock:
             return self._finish_locked(
                 req=req,
+                server_request_id=server_request_id,
                 success=success,
                 error=error,
                 metric_overrides=metric_overrides,
@@ -746,7 +821,8 @@ class _PaperTelemetry:
             return None
         rid = str(getattr(req, "rid", ""))
         with self._lock:
-            if finalize and self._active is not None and self._active["server_request_id"] == rid:
+            active = self._actives.get(rid)
+            if finalize and active is not None:
                 reason = getattr(req, "finished_reason", None)
                 reason_json = reason.to_json() if hasattr(reason, "to_json") else {}
                 is_abort = isinstance(reason_json, dict) and reason_json.get("type") == "abort"
@@ -755,21 +831,23 @@ class _PaperTelemetry:
                     success=reason is not None and not is_abort,
                     error=(reason_json.get("message") if is_abort else None),
                 )
-            if rid in self._completed:
-                return self._completed[rid]
-            if self._active is None or self._active["server_request_id"] != rid:
-                return None
-            self.sample("response_snapshot")
+            if active is None:
+                return self._completed.get(rid)
+            self.sample("response_snapshot", req=req)
             return {
                 "schema_version": 1,
-                "outer_request_id": self._active["outer_request_id"],
+                "outer_request_id": active["outer_request_id"],
                 "server_request_id": rid,
-                "phase": self._active["phase"],
-                "kind": self._active["kind"],
+                "phase": active["phase"],
+                "kind": active["kind"],
                 "success": None,
                 "metrics": {
-                    "request_peak_resident_kv_tokens": self._active["peak"]["kv"]["request_resident_kv_tokens"],
-                    "request_peak_resident_kv_bytes": self._active["peak"]["kv"]["request_resident_kv_bytes"],
+                    "request_peak_resident_kv_tokens": active["peak"]["kv"]["request_resident_kv_tokens"],
+                    "request_peak_resident_kv_bytes": active["peak"]["kv"]["request_resident_kv_bytes"],
+                    "memory_scope": (
+                        "process_shared_during_overlap"
+                        if active["overlapped"] else "request_single_flight"
+                    ),
                 },
             }
 
@@ -801,30 +879,35 @@ def measure_synchronous_request(kind: str, default_phase: str):
                 kind=kind,
                 whole_full_kv_tokens=len(getattr(recv_req, "input_ids", ()) or ()),
             )
+            token = _SYNCHRONOUS_REQUEST_ID.set(str(getattr(recv_req, "rid", "")))
             try:
-                output = func(self, recv_req, *args, **kwargs)
-            except Exception as exc:
-                finish_request(success=False, error=str(exc))
-                raise
-            metric_overrides = None
-            if kind == "c2kv_extract":
-                metric_overrides = {
-                    "gist_generation_duration_ns": getattr(
-                        output, "gist_generation_duration_ns", None
-                    ),
-                    "cache_hit": bool(getattr(output, "cache_hit", False)),
-                }
-            result = finish_request(
-                success=bool(getattr(output, "success", True)),
-                error=getattr(output, "error", None) or None,
-                metric_overrides=metric_overrides,
-            )
-            if result is not None:
+                try:
+                    output = func(self, recv_req, *args, **kwargs)
+                except Exception as exc:
+                    finish_request(server_request_id=getattr(recv_req, "rid", None), success=False, error=str(exc))
+                    raise
+                metric_overrides = None
                 if kind == "c2kv_extract":
-                    extraction_duration_ns = result.get("duration_ns")
-                    output.extraction_duration_ns = extraction_duration_ns
-                output.paper_measurement = result
-            return output
+                    metric_overrides = {
+                        "gist_generation_duration_ns": getattr(
+                            output, "gist_generation_duration_ns", None
+                        ),
+                        "cache_hit": bool(getattr(output, "cache_hit", False)),
+                    }
+                result = finish_request(
+                    server_request_id=getattr(recv_req, "rid", None),
+                    success=bool(getattr(output, "success", True)),
+                    error=getattr(output, "error", None) or None,
+                    metric_overrides=metric_overrides,
+                )
+                if result is not None:
+                    if kind == "c2kv_extract":
+                        extraction_duration_ns = result.get("duration_ns")
+                        output.extraction_duration_ns = extraction_duration_ns
+                    output.paper_measurement = result
+                return output
+            finally:
+                _SYNCHRONOUS_REQUEST_ID.reset(token)
 
         return wrapped
 

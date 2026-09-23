@@ -24,6 +24,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -388,6 +389,9 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         yield
     finally:
+        prewarm = getattr(_global_state.tokenizer_manager, "c2kv_native_prewarm_queue", None)
+        if prewarm is not None:
+            await prewarm.close()
         warmup_thread.join()
 
 
@@ -825,6 +829,35 @@ def _c2kv_native_capability() -> Dict[str, Any]:
         "schema": NATIVE_PACKED_CAPABILITY_SCHEMA,
         "enabled": bool(getattr(server_args, "enable_c2kv", False)),
         "endpoint": "/v1/c2kv/native_generate",
+        "serving_features": {
+            "raw_prefix_cache": (
+                "raw-prefix-v1"
+                if get_bool_env_var("C2KV_NATIVE_RAW_PREFIX_CACHE")
+                and not getattr(server_args, "disable_radix_cache", False)
+                and not getattr(server_args, "disable_finished_insert", False)
+                and not getattr(server_args, "speculative_algorithm", None)
+                and not getattr(server_args, "is_eagle", False)
+                and getattr(server_args, "page_size", 1) == 1
+                else None
+            ),
+            "background_extras": (
+                "selected-first-response-barrier-v1"
+                if get_bool_env_var("C2KV_NATIVE_BACKGROUND_EXTRAS")
+                else None
+            ),
+            "bulk_cache_lookup": (
+                "bulk-cache-lookup-v1"
+                if get_bool_env_var("C2KV_NATIVE_BULK_CACHE_LOOKUP")
+                else None
+            ),
+            "cross_turn_prewarm": (
+                "cross-turn-prewarm-v1"
+                if get_bool_env_var("C2KV_NATIVE_CROSS_TURN_PREWARM")
+                and getattr(server_args, "tokenizer_worker_num", 1) == 1
+                and getattr(server_args, "dp_size", 1) == 1
+                else None
+            ),
+        },
         "packing_version": C2KV_NATIVE_PACKING_VERSION,
         "raw_layout_profile": C2KV_NATIVE_RAW_LAYOUT_PROFILE,
         "model_binding": model_binding,
@@ -912,14 +945,159 @@ def _c2kv_native_whole_full_measurement(request, plan):
     return len(plan.logical_input_ids), "native_logical_input_ids"
 
 
+def _c2kv_native_background_extras_fallback_reason(request, plan, tokenizer_manager):
+    """Explain why a request retains the original serial extraction order."""
+    if not get_bool_env_var("C2KV_NATIVE_BACKGROUND_EXTRAS"):
+        return "disabled"
+    selected = set(plan.selected_handles)
+    if not any(chunk["handle"] not in selected for chunk in plan.unique_chunks):
+        return "no_extra_chunks"
+    if getattr(
+        getattr(tokenizer_manager, "server_args", None),
+        "incremental_streaming_output", False,
+    ):
+        return "incremental_streaming_output"
+    if request.max_tool_extraction_calls is None:
+        return (
+            None if request.max_extraction_calls >= len(plan.unique_chunks)
+            else "extraction_budget"
+        )
+    counts = {"history": 0, "tool": 0}
+    for chunk in plan.unique_chunks:
+        counts[chunk.get("projection_set") or "history"] += 1
+    if (request.max_extraction_calls < counts["history"]
+            or request.max_tool_extraction_calls < counts["tool"]):
+        return "extraction_budget"
+    return None
+
+
+def _c2kv_native_background_extras_eligible(request, plan, tokenizer_manager):
+    return _c2kv_native_background_extras_fallback_reason(
+        request, plan, tokenizer_manager
+    ) is None
+
+
+async def _c2kv_native_generate_with_background_extras(
+    tokenizer_manager, generation_request, raw_request, run_extras
+):
+    """Start extras after generation admission; return only after both finish.
+
+    Non-incremental internal streaming emits cumulative output and logprobs.
+    The first yielded result proves the scheduler admitted and pinned the
+    selected keys. The endpoint still returns one ordinary JSON response.
+    """
+    # The scheduler emits at token 1 and whenever len % stream_interval == 1;
+    # finished requests are emitted regardless of the interval. We need only
+    # those first/final cumulative records, including the final logprobs and
+    # hidden states, rather than an IPC copy after every decode token.
+    generation_request.sampling_params["stream_interval"] = (
+        generation_request.sampling_params["max_new_tokens"] + 1
+    )
+    generation_request.stream = True
+    generator = tokenizer_manager.generate_request(generation_request, raw_request)
+    extras_task = None
+    generation_task = None
+    generation_finished = False
+    try:
+        generated = await generator.__anext__()
+        finish = (generated.get("meta_info") or {}).get("finish_reason")
+        if isinstance(finish, dict) and finish.get("type") == "abort":
+            if finish.get("status_code") in (500, 503):
+                raise HTTPException(
+                    status_code=finish["status_code"], detail=finish.get("message")
+                )
+            raise ValueError(finish.get("message") or "C2KV generation aborted")
+        async def drain_generation():
+            nonlocal generated, generation_finished
+            async for generated in generator:
+                finish = (generated.get("meta_info") or {}).get("finish_reason")
+                if isinstance(finish, dict) and finish.get("type") == "abort":
+                    if finish.get("status_code") in (500, 503):
+                        raise HTTPException(
+                            status_code=finish["status_code"],
+                            detail=finish.get("message"),
+                        )
+                    raise ValueError(finish.get("message") or "C2KV generation aborted")
+            generation_finished = True
+            return generated
+
+        generation_task = asyncio.create_task(drain_generation())
+        extras_task = asyncio.create_task(run_extras())
+        done, _ = await asyncio.wait(
+            {generation_task, extras_task}, return_when=asyncio.FIRST_EXCEPTION
+        )
+        for task in done:
+            if task.cancelled():
+                raise asyncio.CancelledError
+            error = task.exception()
+            if error is not None:
+                raise error
+        return generation_task.result()
+    except BaseException:
+        if extras_task is not None:
+            extras_task.cancel()
+        if generation_task is not None:
+            generation_task.cancel()
+        await asyncio.gather(
+            *(task for task in (extras_task, generation_task) if task is not None),
+            return_exceptions=True,
+        )
+        if not generation_finished:
+            # Cancellation of the HTTP coroutine otherwise leaves a live
+            # scheduler request and its selected pool pins behind.
+            await tokenizer_manager.abort_request_and_wait(generation_request.rid)
+        raise
+    finally:
+        await generator.aclose()
+
+
+def _c2kv_native_prewarm_queue(tokenizer_manager):
+    """One idle-time queue shared by all native requests on this frontend."""
+    from sglang.srt.managers.c2kv_prewarm import NativePrewarmQueue
+
+    capability = _c2kv_native_capability()
+    if (not capability["enabled"] or capability["model_binding"]["pic_enabled"]
+            or capability["serving_features"]["cross_turn_prewarm"] is None):
+        raise ValueError("Cross-turn prewarm requires enabled native C2KV, one tokenizer worker and DP=1")
+    queue = getattr(tokenizer_manager, "c2kv_native_prewarm_queue", None)
+    if queue is None:
+        queue = NativePrewarmQueue(tokenizer_manager.c2kv_extract)
+        tokenizer_manager.c2kv_native_prewarm_queue = queue
+    return queue
+
+
+@app.post("/c2kv_native_prewarm", response_class=SGLangORJSONResponse)
+async def c2kv_native_prewarm(request: Dict[str, Any]):
+    """Acknowledge bounded prewarming without waiting for encoder work."""
+    from sglang.srt.managers.c2kv_prewarm import validate_prewarm_request
+
+    try:
+        payload = validate_prewarm_request(request)
+        queue = _c2kv_native_prewarm_queue(_global_state.tokenizer_manager)
+        if payload["operation"] == "submit":
+            vocab_size = _global_state.tokenizer_manager.model_config.vocab_size
+            if any(token >= vocab_size for chunk in payload["chunks"] for token in chunk["token_ids"]):
+                raise ValueError("Prewarm token ID exceeds the model vocabulary")
+            return queue.submit(payload)
+        return await queue.drain(payload["owner_id"], payload["job_id"], payload["session_id"])
+    except ValueError as error:
+        return _create_error_response(error)
+
+
 @app.post("/v1/c2kv/native_generate", response_class=SGLangORJSONResponse)
 async def v1_c2kv_native_generate(
     request: C2KVNativePackedGenerateRequest, raw_request: Request
 ):
     """Generate from exact event-native token IDs and cached gist chunks."""
 
+    lease_owner = None
+    prewarm = None
     try:
         tokenizer_manager = _global_state.tokenizer_manager
+        if get_bool_env_var("C2KV_NATIVE_CROSS_TURN_PREWARM"):
+            queue = _c2kv_native_prewarm_queue(tokenizer_manager)
+            await queue.enter_foreground()
+            prewarm = queue
         capability = _c2kv_native_capability()
         if not capability["enabled"]:
             raise ValueError("C2KV native packed generation requires --enable-c2kv")
@@ -984,6 +1162,8 @@ async def v1_c2kv_native_generate(
         resolved: Dict[str, Dict[str, Any]] = {}
         cache_hits = 0
         cache_misses = 0
+        bulk_cache_lookup_calls = 0
+        bulk_cache_hit_chunks = 0
         projection_misses = {"tool": 0, "history": 0}
         materialized_encoder_tokens = 0
         scope_reused_encoder_tokens = 0
@@ -998,60 +1178,145 @@ async def v1_c2kv_native_generate(
         )
         extraction_phase = f"{measurement_phase_prefix}:extraction"
         generation_phase = f"{measurement_phase_prefix}:generation"
-        extraction_telemetry = []
-        for index, chunk in enumerate(plan.unique_chunks):
-            extraction_rid = f"{base_rid}:extract:{index}"
-            projection = chunk.get("projection_set") or "history"
-            if request.max_tool_extraction_calls is None:
-                allow_cache_miss = cache_misses < request.max_extraction_calls
-            else:
-                projection_budget = request.max_tool_extraction_calls if projection == "tool" else request.max_extraction_calls
-                allow_cache_miss = projection_misses[projection] < projection_budget
-            result = await tokenizer_manager.c2kv_extract(
-                input_ids=list(chunk["token_ids"]),
-                input_text="",
-                compression_ratio=chunk.get("compression_ratio") or request.compression_ratio,
-                rid=extraction_rid,
-                allow_cache_miss=allow_cache_miss,
-                outer_request_id=outer_request_id,
-                measurement_phase=extraction_phase,
-                projection_set=chunk.get("projection_set") or "history",
-            )
-            if not result.success:
-                raise ValueError(result.error)
-            if result.original_seq_len != len(chunk["token_ids"]):
-                raise ValueError(
-                    "C2KV native extraction returned an inconsistent source length: "
-                    f"{result.original_seq_len} != {len(chunk['token_ids'])}"
-                )
-            if projection == "tool":
-                ratio = chunk.get("compression_ratio") or request.compression_ratio
-                expected_gist_len = (len(chunk["token_ids"]) + ratio - 1) // ratio
-                if result.gist_len != expected_gist_len:
-                    raise ValueError("C2KV_NATIVE_TOOL_GIST_LENGTH_MISMATCH")
-            cache_hit = bool(result.cache_hit)
-            if cache_hit:
-                cache_hits += 1
-                scope_reused_encoder_tokens += len(chunk["token_ids"])
-            else:
-                cache_misses += 1
-                projection_misses[projection] += 1
-                materialized_encoder_tokens += len(chunk["token_ids"])
-            resolved[chunk["handle"]] = {
-                "chunk_id": chunk["chunk_id"],
-                "handle": chunk["handle"],
-                "cache_key": result.key_hash,
-                "cache_hit": cache_hit,
-                "gist_len": result.gist_len,
-                "original_seq_len": result.original_seq_len,
-                "request_id": extraction_rid,
-                "extraction_duration_ns": result.extraction_duration_ns,
-                "gist_generation_duration_ns": (
-                    result.gist_generation_duration_ns
-                ),
-            }
-            extraction_telemetry.append(
-                {
+        extraction_telemetry_by_index = {}
+        indexed_chunks = list(enumerate(plan.unique_chunks))
+        background_fallback_reason = _c2kv_native_background_extras_fallback_reason(
+            request, plan, tokenizer_manager
+        )
+        background_extras = background_fallback_reason is None
+        selected_set = set(plan.selected_handles)
+        selected_chunks = [
+            item for item in indexed_chunks if item[1]["handle"] in selected_set
+        ]
+        extra_chunks = [
+            item for item in indexed_chunks if item[1]["handle"] not in selected_set
+        ]
+
+        async def extract_chunks(items, *, drain_on_cancel=False):
+            nonlocal cache_hits, cache_misses
+            nonlocal bulk_cache_lookup_calls, bulk_cache_hit_chunks
+            nonlocal materialized_encoder_tokens, scope_reused_encoder_tokens
+            bulk_enabled = get_bool_env_var(
+                "C2KV_NATIVE_BULK_CACHE_LOOKUP"
+            ) and hasattr(tokenizer_manager, "c2kv_bulk_cache_lookup")
+            prefetched_hits = {}
+            known_miss_index = None
+
+            async def await_rpc(call):
+                if not drain_on_cancel:
+                    return await call
+                # Background extras may be cancelled while the communicator
+                # still owns a reply. Drain it before releasing selected pins.
+                task = asyncio.create_task(call)
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    await task
+                    raise
+
+            for position, (index, chunk) in enumerate(items):
+                extraction_rid = f"{base_rid}:extract:{index}"
+                projection = chunk.get("projection_set") or "history"
+                if request.max_tool_extraction_calls is None:
+                    allow_cache_miss = cache_misses < request.max_extraction_calls
+                else:
+                    projection_budget = (
+                        request.max_tool_extraction_calls
+                        if projection == "tool" else request.max_extraction_calls
+                    )
+                    allow_cache_miss = projection_misses[projection] < projection_budget
+                if (
+                    bulk_enabled
+                    and index not in prefetched_hits
+                    and index != known_miss_index
+                    and len(items) - position > 1
+                ):
+                    probe = items[position : position + 32]
+                    reply = await await_rpc(
+                        tokenizer_manager.c2kv_bulk_cache_lookup(
+                            [
+                                {
+                                    "rid": f"{base_rid}:extract:{probe_index}",
+                                    "input_ids": probe_chunk["token_ids"],
+                                    "compression_ratio": (
+                                        probe_chunk.get("compression_ratio")
+                                        or request.compression_ratio
+                                    ),
+                                    "projection_set": (
+                                        probe_chunk.get("projection_set") or "history"
+                                    ),
+                                }
+                                for probe_index, probe_chunk in probe
+                            ],
+                            outer_request_id=outer_request_id,
+                            measurement_phase=extraction_phase,
+                        )
+                    )
+                    if not reply.success:
+                        raise ValueError(reply.error)
+                    if (
+                        reply.first_miss_index != len(reply.hits)
+                        or not 0 <= len(reply.hits) <= len(probe)
+                    ):
+                        raise ValueError("C2KV bulk cache lookup returned an invalid prefix")
+                    bulk_cache_lookup_calls += 1
+                    bulk_cache_hit_chunks += len(reply.hits)
+                    prefetched_hits.update(
+                        (probe_item[0], hit)
+                        for probe_item, hit in zip(probe, reply.hits)
+                    )
+                    known_miss_index = (
+                        probe[len(reply.hits)][0]
+                        if len(reply.hits) < len(probe)
+                        else None
+                    )
+
+                result = prefetched_hits.pop(index, None)
+                if result is None:
+                    result = await await_rpc(
+                        tokenizer_manager.c2kv_extract(
+                            input_ids=list(chunk["token_ids"]),
+                            input_text="",
+                            compression_ratio=chunk.get("compression_ratio") or request.compression_ratio,
+                            rid=extraction_rid,
+                            allow_cache_miss=allow_cache_miss,
+                            outer_request_id=outer_request_id,
+                            measurement_phase=extraction_phase,
+                            projection_set=projection,
+                        )
+                    )
+                if not result.success:
+                    raise ValueError(result.error)
+                if result.original_seq_len != len(chunk["token_ids"]):
+                    raise ValueError(
+                        "C2KV native extraction returned an inconsistent source length: "
+                        f"{result.original_seq_len} != {len(chunk['token_ids'])}"
+                    )
+                if projection == "tool":
+                    ratio = chunk.get("compression_ratio") or request.compression_ratio
+                    expected_gist_len = (len(chunk["token_ids"]) + ratio - 1) // ratio
+                    if result.gist_len != expected_gist_len:
+                        raise ValueError("C2KV_NATIVE_TOOL_GIST_LENGTH_MISMATCH")
+                cache_hit = bool(result.cache_hit)
+                if cache_hit:
+                    cache_hits += 1
+                    scope_reused_encoder_tokens += len(chunk["token_ids"])
+                else:
+                    cache_misses += 1
+                    projection_misses[projection] += 1
+                    materialized_encoder_tokens += len(chunk["token_ids"])
+                resolved[chunk["handle"]] = {
+                    "chunk_id": chunk["chunk_id"],
+                    "handle": chunk["handle"],
+                    "cache_key": result.key_hash,
+                    "cache_hit": cache_hit,
+                    "gist_len": result.gist_len,
+                    "original_seq_len": result.original_seq_len,
+                    "request_id": extraction_rid,
+                    "extraction_duration_ns": result.extraction_duration_ns,
+                    "gist_generation_duration_ns": result.gist_generation_duration_ns,
+                }
+                extraction_telemetry_by_index[index] = {
                     "chunk_id": chunk["chunk_id"],
                     "handle": chunk["handle"],
                     "outer_request_id": outer_request_id,
@@ -1059,12 +1324,14 @@ async def v1_c2kv_native_generate(
                     "phase": extraction_phase,
                     "cache_hit": cache_hit,
                     "extraction_duration_ns": result.extraction_duration_ns,
-                    "gist_generation_duration_ns": (
-                        result.gist_generation_duration_ns
-                    ),
+                    "gist_generation_duration_ns": result.gist_generation_duration_ns,
                     "paper_measurement": result.paper_measurement,
                 }
-            )
+
+        if background_extras:
+            await extract_chunks(selected_chunks)
+        else:
+            await extract_chunks(indexed_chunks)
 
         segments = []
         chunks_by_handle = {item["handle"]: item for item in plan.unique_chunks}
@@ -1126,9 +1393,34 @@ async def v1_c2kv_native_generate(
             c2kv_paper_history_active_kv_tokens=history_gist_tokens,
             c2kv_paper_canonical_full_source=True,
         )
-        generated = await tokenizer_manager.generate_request(
-            generation_request, raw_request
-        ).__anext__()
+        if background_extras:
+            if selected_set:
+                proposed_owner = uuid.uuid4().hex
+                acquired = await tokenizer_manager.c2kv_pin_lease(
+                    owner_id=proposed_owner,
+                    action="acquire",
+                    key_hashes=[
+                        resolved[handle]["cache_key"]
+                        for handle in dict.fromkeys(plan.selected_handles)
+                    ],
+                )
+                if not acquired.success:
+                    raise ValueError(acquired.error)
+                lease_owner = proposed_owner
+            generated = await _c2kv_native_generate_with_background_extras(
+                tokenizer_manager,
+                generation_request,
+                raw_request,
+                lambda: extract_chunks(extra_chunks, drain_on_cancel=True),
+            )
+        else:
+            generated = await tokenizer_manager.generate_request(
+                generation_request, raw_request
+            ).__anext__()
+        extraction_telemetry = [
+            extraction_telemetry_by_index[index]
+            for index in range(len(plan.unique_chunks))
+        ]
         meta_info = generated.get("meta_info") or {}
         output_ids = list(generated.get("output_ids") or [])
         raw_logprobs = list(meta_info.get("output_token_logprobs") or [])
@@ -1235,6 +1527,19 @@ async def v1_c2kv_native_generate(
                 "session_id": request.session_id,
                 "generation_id": request.generation_id,
                 "sampling_profile": request.sampling_profile,
+                "serving_execution": {
+                    "mode": (
+                        "selected-first-response-barrier-v1"
+                        if background_extras else "sequential-v1"
+                    ),
+                    "response_barrier": (
+                        "generation_and_extras" if background_extras else "sequential"
+                    ),
+                    "extra_jobs": len(extra_chunks) if background_extras else 0,
+                    "fallback_reason": background_fallback_reason,
+                    "bulk_cache_lookup_calls": bulk_cache_lookup_calls,
+                    "bulk_cache_hit_chunks": bulk_cache_hit_chunks,
+                },
                 "output_ids": output_ids,
                 "text": generated.get("text", ""),
                 "token_logprobs": token_logprobs,
@@ -1280,6 +1585,15 @@ async def v1_c2kv_native_generate(
     except ValueError as error:
         logger.error("[c2kv-native] request rejected: %s", error)
         return _create_error_response(error)
+    finally:
+        try:
+            if lease_owner is not None:
+                await tokenizer_manager.c2kv_pin_lease(
+                    owner_id=lease_owner, action="release"
+                )
+        finally:
+            if prewarm is not None:
+                prewarm.exit_foreground()
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
@@ -2098,8 +2412,13 @@ async def v1_c2kv_extract(
     request: C2KVExtractRequest, raw_request: Request
 ) -> C2KVExtractResponse:
     """Extract and store C2KV gist KV cache for a document."""
+    prewarm = None
     try:
         tokenizer_manager = _global_state.tokenizer_manager
+        queue = getattr(tokenizer_manager, "c2kv_native_prewarm_queue", None)
+        if queue is not None:
+            await queue.enter_foreground()
+            prewarm = queue
         tokenizer = tokenizer_manager.tokenizer
         if request.projection_set not in ("history", "tool"):
             raise ValueError(
@@ -2164,6 +2483,9 @@ async def v1_c2kv_extract(
             key_hash="", gist_len=0, original_seq_len=0,
             success=False, error=str(e),
         )
+    finally:
+        if prewarm is not None:
+            prewarm.exit_foreground()
 
 
 def _c2kv_template_ids(tokenizer, messages, tools, chat_template_kwargs):
@@ -2323,8 +2645,13 @@ async def v1_c2kv_repair_extract(
     request: C2KVRepairExtractRequest, raw_request: Request
 ) -> C2KVRepairExtractResponse:
     """Extract and store raw/neutral repair KV for a span."""
+    prewarm = None
     try:
         tokenizer_manager = _global_state.tokenizer_manager
+        queue = getattr(tokenizer_manager, "c2kv_native_prewarm_queue", None)
+        if queue is not None:
+            await queue.enter_foreground()
+            prewarm = queue
         tokenizer = tokenizer_manager.tokenizer
         chat_template_kwargs = request.chat_template_kwargs or {}
 
@@ -2552,6 +2879,9 @@ async def v1_c2kv_repair_extract(
             success=False,
             error=str(e),
         )
+    finally:
+        if prewarm is not None:
+            prewarm.exit_foreground()
 
 
 @app.post(

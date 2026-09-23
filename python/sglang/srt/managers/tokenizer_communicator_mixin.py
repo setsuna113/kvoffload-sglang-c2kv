@@ -23,7 +23,11 @@ import zmq
 from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    C2KVBulkCacheLookupReqInput,
+    C2KVBulkCacheLookupReqOutput,
     C2KVExtractReqOutput,
+    C2KVPinLeaseReqInput,
+    C2KVPinLeaseReqOutput,
     C2KVRepairExtractReqOutput,
     TokenizedExtractReqInput,
     TokenizedRepairExtractReqInput,
@@ -262,6 +266,12 @@ class TokenizerCommunicatorMixin:
         self.c2kv_extract_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.c2kv_bulk_cache_lookup_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.c2kv_pin_lease_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.c2kv_repair_extract_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -352,6 +362,14 @@ class TokenizerCommunicatorMixin:
                     self.c2kv_extract_communicator.handle_recv,
                 ),
                 (
+                    C2KVBulkCacheLookupReqOutput,
+                    self.c2kv_bulk_cache_lookup_communicator.handle_recv,
+                ),
+                (
+                    C2KVPinLeaseReqOutput,
+                    self.c2kv_pin_lease_communicator.handle_recv,
+                ),
+                (
                     C2KVRepairExtractReqOutput,
                     self.c2kv_repair_extract_communicator.handle_recv,
                 ),
@@ -440,6 +458,86 @@ class TokenizerCommunicatorMixin:
             projection_set=projection_set or "history",
         )
         return (await self.c2kv_extract_communicator(req))[0]
+
+    async def c2kv_bulk_cache_lookup(
+        self: TokenizerManager,
+        items: List[Dict[str, Any]],
+        *,
+        outer_request_id: Optional[str] = None,
+        measurement_phase: Optional[str] = None,
+    ) -> C2KVBulkCacheLookupReqOutput:
+        """Return the cache-hit prefix without scheduling extraction on a miss."""
+        if not 1 <= len(items) <= 32:
+            raise ValueError("C2KV bulk cache lookup requires 1 to 32 items")
+        self.auto_create_handle_loop()
+        req = C2KVBulkCacheLookupReqInput(
+            items=[
+                TokenizedExtractReqInput(
+                    rid=item["rid"],
+                    input_ids=list(item["input_ids"]),
+                    input_text="",
+                    compression_ratio=item["compression_ratio"],
+                    allow_cache_miss=False,
+                    projection_set=item["projection_set"],
+                    c2kv_outer_request_id=outer_request_id,
+                    c2kv_measurement_phase=measurement_phase,
+                )
+                for item in items
+            ]
+        )
+        call = asyncio.create_task(self.c2kv_bulk_cache_lookup_communicator(req))
+        try:
+            return (await asyncio.shield(call))[0]
+        except asyncio.CancelledError:
+            # A cancelled HTTP request must not leave a bulk reply waiting in
+            # this communicator's slot before the next native request.
+            await call
+            raise
+
+    async def c2kv_pin_lease(
+        self: TokenizerManager,
+        *,
+        owner_id: str,
+        action: str,
+        key_hashes: Optional[List[str]] = None,
+    ) -> C2KVPinLeaseReqOutput:
+        """Acquire/release a selected-key lease on every scheduler DP shard."""
+        self.auto_create_handle_loop()
+        req = C2KVPinLeaseReqInput(
+            owner_id=owner_id, action=action, key_hashes=key_hashes or []
+        )
+        async def protected_call(lease_req):
+            call = asyncio.create_task(self.c2kv_pin_lease_communicator(lease_req))
+            try:
+                return await asyncio.shield(call)
+            except asyncio.CancelledError:
+                # The scheduler already owns this RPC. Drain its reply before
+                # propagating cancellation, including rollback releases.
+                await call
+                raise
+
+        try:
+            replies = await protected_call(req)
+        except asyncio.CancelledError:
+            # A sent acquire may complete after HTTP cancellation. Consume its
+            # acknowledgement and release by owner before returning control.
+            if action == "acquire":
+                await protected_call(
+                    C2KVPinLeaseReqInput(owner_id=owner_id, action="release")
+                )
+            raise
+        if action == "acquire" and not all(reply.success for reply in replies):
+            # DP shards own separate pools. Roll back shards that acquired.
+            await protected_call(
+                C2KVPinLeaseReqInput(owner_id=owner_id, action="release")
+            )
+        error = next((reply.error for reply in replies if not reply.success), "")
+        return C2KVPinLeaseReqOutput(
+            owner_id=owner_id,
+            action=action,
+            success=all(reply.success for reply in replies),
+            error=error,
+        )
 
     async def c2kv_repair_extract(
         self: TokenizerManager,
