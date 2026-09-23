@@ -358,10 +358,11 @@ def select_pyramidkv_headwise(
             recent_window=recent_window,
             beta=beta,
         )
-    if sum(budgets) > requested_target_tokens * len(scores_by_layer):
-        raise ValueError(
-            "PyramidKV official funnel cannot satisfy this absolute target"
-        )
+    flat_fallback = sum(budgets) > requested_target_tokens * len(scores_by_layer)
+    if flat_fallback:
+        # Only a one-token target lands here: the funnel's per-layer minimum
+        # is two tokens. Keep the hard bound with a flat schedule instead.
+        budgets = [requested_target_tokens] * len(scores_by_layer)
     selected = []
     realized_budgets = []
     for scores, budget in zip(scores_by_layer, budgets):
@@ -395,6 +396,7 @@ def select_pyramidkv_headwise(
         "per_layer_budget_tokens": realized_budgets,
         "requested_target_tokens": requested_target_tokens,
         "nominal_schedule_target_tokens": nominal_target_tokens,
+        "flat_schedule_fallback": flat_fallback,
         "realized_full_token_equivalent": (
             sum(realized_budgets) + len(realized_budgets) - 1
         )
