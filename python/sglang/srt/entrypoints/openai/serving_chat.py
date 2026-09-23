@@ -1220,9 +1220,9 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = self._chat_template_tools(request)
         prefix_ids = []
         for end in range(1, len(request.messages) + 1):
-            ids = self._c2kv_chat_template_input_ids(
-                request, list(request.messages[:end]), tools
-            )
+            # A boundary inside a group of consecutive tool results must not
+            # close the group early (parallel tool calls in one decision).
+            ids = self._c2kv_contextual_prefix_ids(request, end, tools, prompt_ids)
             if len(ids) > len(prompt_ids) or prompt_ids[: len(ids)] != ids:
                 raise ValueError(
                     "HISTORY_KV_EVENT_TEMPLATE_PREFIX_MISMATCH: "

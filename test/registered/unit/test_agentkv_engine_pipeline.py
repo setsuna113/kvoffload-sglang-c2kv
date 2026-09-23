@@ -62,8 +62,8 @@ def test_serving_resolves_exact_events_and_agentkv_decode_markers() -> None:
     owner = SimpleNamespace(
         tokenizer_manager=SimpleNamespace(tokenizer=tokenizer),
         _chat_template_tools=lambda request: ["tool"],
-        _c2kv_chat_template_input_ids=(
-            lambda request, messages, tools: prefixes[len(messages)]
+        _c2kv_contextual_prefix_ids=(
+            lambda request, count, tools, prompt_ids: prefixes[count]
         ),
         _c2kv_first_message_start_offset=lambda request, message, tools: 1,
     )

@@ -122,3 +122,47 @@ def test_contextual_boundary_does_not_accept_changed_history(prefix, roles):
     obj, request = context(prefix, roles)
     assert serving_method("_c2kv_contextual_prefix_ids")(
         obj, request, 2, None, [1, 2, 3, 4, 99, 10]) == prefix
+
+
+def event_owner(renders):
+    """Owner whose template closes a truncated tool group with EOS (99) + newline (10)."""
+    tokenizer = SimpleNamespace(eos_token_id=99, decode=lambda ids: {10: "\n"}.get(ids[0], "x"))
+    owner = SimpleNamespace(
+        tokenizer_manager=SimpleNamespace(tokenizer=tokenizer),
+        _chat_template_tools=lambda request: None,
+        _c2kv_chat_template_input_ids=lambda request, messages, tools: renders[len(messages)],
+        _c2kv_first_message_start_offset=lambda request, message, tools: 0,
+    )
+    contextual = serving_method("_c2kv_contextual_prefix_ids")
+    owner._c2kv_contextual_prefix_ids = lambda *args: contextual(owner, *args)
+    events = [{"role": role, "phase": phase, "message_index": index}
+              for index, (role, phase) in enumerate(
+                  [("user", "others"), ("assistant", "act"), ("tool", "tool"), ("tool", "tool")])]
+    request = SimpleNamespace(
+        messages=[SimpleNamespace(role=event["role"]) for event in events],
+        c2kv_kv_memory_hint={"history_kv_event_messages": events})
+    return owner, request
+
+
+def test_event_spans_split_parallel_tool_results_without_closing_the_group():
+    import sys
+    sys.path.insert(0, str(SOURCE.parents[4]))
+    # Two parallel tool calls: the complete prompt renders both results in one
+    # turn, so the prefix ending at the first result is [1, 2, 3, 4] here.
+    renders = {1: [1, 2], 2: [1, 2, 3], 3: [1, 2, 3, 4, 99, 10], 4: [1, 2, 3, 4, 5, 99, 10]}
+    owner, request = event_owner(renders)
+    serving_method("_resolve_history_kv_event_token_spans")(owner, request, renders[4] + [8])
+    hint = request.c2kv_kv_memory_hint
+    assert [(span["start"], span["end"]) for span in hint["history_kv_event_token_spans"]] == [
+        (0, 2), (2, 3), (3, 4), (4, 7)]
+    assert hint["history_kv_event_generation_suffix_start"] == 7
+
+
+def test_event_spans_still_reject_a_changed_result_inside_a_tool_group():
+    import sys
+    sys.path.insert(0, str(SOURCE.parents[4]))
+    renders = {1: [1, 2], 2: [1, 2, 3], 3: [1, 2, 3, 6, 99, 10], 4: [1, 2, 3, 4, 5, 99, 10]}
+    owner, request = event_owner(renders)
+    with pytest.raises(ValueError, match="HISTORY_KV_EVENT_TEMPLATE_PREFIX_MISMATCH"):
+        serving_method("_resolve_history_kv_event_token_spans")(
+            owner, request, renders[4] + [8])
