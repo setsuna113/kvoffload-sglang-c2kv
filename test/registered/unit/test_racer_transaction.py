@@ -258,6 +258,40 @@ def test_commitkv_recovery_capacity_keeps_total_budget_and_pending_protection():
     assert not runtime.post_queries
 
 
+def test_held_receipt_reports_the_exact_regeneration_retention_boundary():
+    core = load("racer_test_commitkv_retention", "mem_cache/commitkv.py")
+    policy = core.CommitKVRuntimeState(core.CommitKVConfig(measurement_layer_id=0))
+    protected = (core.EventPage(5, 0, 0, 3), core.EventPage(6, 0, 3, 5))
+    unprotected = core.EventPage(4, 0, 5, 7)
+    policy.pending = core.PendingCommit(
+        "tool-6", (*protected, unprotected), {}, tuple(page.page_id for page in protected), 8)
+    runtime = SimpleNamespace(policy=policy)
+    req = SimpleNamespace(c2kv_kv_memory_hint=hint(), origin_input_ids=list(range(8)),
+                          history_kv_resident_positions=list(range(8)), history_kv_reference_state=None,
+                          history_kv_runtime_state=runtime, history_kv_score_state=None, kv_memory_report={})
+    transaction.checkpoint_generation(req)
+    receipt = req.kv_memory_report["racer_transaction"]["regeneration_mandatory_history"]
+    assert receipt == {"tokens": 5, "source_message_indices": [5, 6], "release": "replaced_source_message"}
+    # The receipt describes the held copy a regeneration restores, not the live draft state.
+    policy.record_incomplete_post("tool-6", observed_query_count=0)
+    assert req.racer_held_generation.runtime_state.policy.pending is not None
+    held = req.racer_held_generation.runtime_state.policy
+    held.checkpoint(range(7, -1, -1), range(8), target_tokens=8, capacity_tokens=5,
+                    num_layers=1, num_kv_heads=1)
+    with pytest.raises(ValueError, match="pending tokens exceed"):
+        held.checkpoint(range(8), range(8), target_tokens=8, capacity_tokens=4, num_layers=1, num_kv_heads=1)
+    # Replacing a protected page's message source releases the whole transition.
+    assert transaction.interrupt_replaced_commit_window(
+        SimpleNamespace(policy=held, post_queries=[], post_positions=[], pending_commit_id="tool-6", receipts=[]),
+        [3])["reason"] == "racer_source_replacement"
+    assert held.pending is None
+    plain = SimpleNamespace(c2kv_kv_memory_hint=hint(), origin_input_ids=[1, 2], history_kv_resident_positions=None,
+                            history_kv_reference_state=None, history_kv_runtime_state=None,
+                            history_kv_score_state=None, kv_memory_report={})
+    transaction.checkpoint_generation(plain)
+    assert plain.kv_memory_report["racer_transaction"]["regeneration_mandatory_history"]["tokens"] == 0
+
+
 def test_shadow_features_retain_native_contract_and_configured_layer(monkeypatch):
     packed = load("racer_test_packed", "mem_cache/c2kv_native_packed.py")
     monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.c2kv_native_packed", packed)
