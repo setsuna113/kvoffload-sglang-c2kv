@@ -142,6 +142,47 @@ class CommitKVRuntimeState:
 
         if self.pending is not None:
             raise RuntimeError("previous CommitKV transition is still pending")
+        pages, mapped, pre_effects, protected_ids, protected_local_indices = (
+            self.preview_pre(
+                pages, window, resident_positions, total_budget=total_budget
+            )
+        )
+        by_id = {page.page_id: page for page in pages}
+        self.pending = PendingCommit(
+            commit_id=commit_id,
+            pages=tuple(pages),
+            pre_effects=pre_effects,
+            protected_page_ids=tuple(protected_ids),
+            total_budget=total_budget,
+        )
+        return {
+            "commit_id": commit_id,
+            "measurement_phase": "pre_commit",
+            "measurement_layer_id": self.config.measurement_layer_id,
+            "scanned_pages": len(pages),
+            "measurable_pages": len(pre_effects),
+            "protected_pending_pages": len(protected_ids),
+            "protected_pending_tokens": len(protected_local_indices),
+            "protected_page_ids": list(protected_ids),
+            "unmeasurable_page_ids": [
+                page_id for page_id in by_id if page_id not in mapped
+            ],
+        }
+
+    def preview_pre(
+        self,
+        pages: Sequence[EventPage],
+        window: "DeletionEffectWindow",
+        resident_positions: Sequence[int] | torch.Tensor,
+        *,
+        total_budget: int,
+    ):
+        """Return the scan, pre effects and protection ``record_pre`` stores.
+
+        Nothing is mutated, so a caller can report the protection that the
+        next commit would open before that commit's request is admitted.
+        """
+
         if total_budget < 1:
             raise ValueError("total_budget must be positive")
         # Pages accepted by an earlier joint retirement are gone from the cache
@@ -163,7 +204,6 @@ class CommitKVRuntimeState:
             page_id: float(window.effect(indices).item())
             for page_id, indices in mapped.items()
         }
-        by_id = {page.page_id: page for page in pages}
         protected_ids, protected_local_indices = protect_pending_pages(
             mapped,
             pre_effects,
@@ -171,26 +211,7 @@ class CommitKVRuntimeState:
             pending_fraction=self.config.pending_fraction,
             max_pages=self.config.max_pending_pages,
         )
-        self.pending = PendingCommit(
-            commit_id=commit_id,
-            pages=tuple(pages),
-            pre_effects=pre_effects,
-            protected_page_ids=tuple(protected_ids),
-            total_budget=total_budget,
-        )
-        return {
-            "commit_id": commit_id,
-            "measurement_phase": "pre_commit",
-            "measurement_layer_id": self.config.measurement_layer_id,
-            "scanned_pages": len(pages),
-            "measurable_pages": len(pre_effects),
-            "protected_pending_pages": len(protected_ids),
-            "protected_pending_tokens": len(protected_local_indices),
-            "protected_page_ids": list(protected_ids),
-            "unmeasurable_page_ids": [
-                page_id for page_id in by_id if page_id not in mapped
-            ],
-        }
+        return pages, mapped, pre_effects, protected_ids, protected_local_indices
 
     def record_post(
         self,

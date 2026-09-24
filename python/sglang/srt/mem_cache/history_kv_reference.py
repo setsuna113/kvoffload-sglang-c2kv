@@ -82,6 +82,47 @@ class ReferenceHistoryKVState:
         return self.layers.get(int(layer_id))
 
 
+def normalize_event_spans(spans: Sequence[dict]) -> tuple:
+    """CommitKV's event signature: (message, role, phase, start, end) rows."""
+    return tuple(
+        (
+            int(item.get("message_index", -1)),
+            str(item.get("role") or ""),
+            str(item.get("phase") or "others"),
+            int(item.get("start", -1)),
+            int(item.get("end", -1)),
+        )
+        for item in spans
+    )
+
+
+def new_event_rows(previous_signature: Sequence[tuple], normalized: Sequence[tuple]):
+    """Rows whose message is new since ``previous_signature``, and their tool rows."""
+    previous_indices = {item[0] for item in previous_signature}
+    new_events = [item for item in normalized if item[0] not in previous_indices]
+    new_tools = [
+        item
+        for item in new_events
+        if item[1].lower() == "tool" or item[2].lower() == "tool"
+    ]
+    return new_events, new_tools
+
+
+def commitkv_event_transition(
+    previous_message_indices: Sequence[int], spans: Sequence[dict]
+) -> str:
+    """Classify what ``configure_events`` does with these spans.
+
+    ``"tool_event"`` opens a new window (``tool_transition_protection``),
+    ``"new_events"`` only closes the open one, and ``"none"`` keeps it.
+    """
+    previous = tuple((int(index), "", "others", -1, -1) for index in previous_message_indices)
+    new_events, new_tools = new_event_rows(previous, normalize_event_spans(spans))
+    if new_tools:
+        return "tool_event"
+    return "new_events" if new_events else "none"
+
+
 @dataclass
 class CommitKVServingState:
     """Serving capture around CommitKV's exact tensor-policy core."""
@@ -100,28 +141,49 @@ class CommitKVServingState:
     pre_scan_metadata: dict = field(default_factory=dict)
     receipts: list[dict] = field(default_factory=list)
 
+    def event_message_indices(self) -> list[int]:
+        """Message indices of the last configured event spans."""
+        return sorted({item[0] for item in self.event_signature})
+
+    def tool_transition_protection(self) -> dict:
+        """Protection that a new tool event would open from this state.
+
+        ``configure_events`` closes the open window on any new event and, on a
+        new tool event with a full pre window, runs ``record_pre`` over the
+        saved scan.  This is the same computation without mutation, so it can
+        be reported before the next request is planned and admitted.
+        """
+        observed = (
+            int(self.pre_window.query_positions.numel())
+            if self.pre_window is not None
+            else 0
+        )
+        if observed != self.policy.config.window_size:
+            return {"tokens": 0, "positions": [], "source_message_indices": []}
+        pages, _, _, protected_ids, _ = self.policy.preview_pre(
+            self.pre_pages,
+            self.pre_window,
+            self.pre_window.key_positions,
+            total_budget=self.target_tokens,
+        )
+        by_id = {page.page_id: page for page in pages}
+        protected = [by_id[page_id] for page_id in protected_ids]
+        positions = sorted(
+            {int(index) for page in protected for index in page.token_indices}
+        )
+        return {
+            "tokens": len(positions),
+            "positions": positions,
+            "source_message_indices": sorted({page.event_id for page in protected}),
+        }
+
     def configure_events(self, spans: Sequence[dict]) -> None:
         from sglang.srt.mem_cache.commitkv import partition_event_span
 
-        normalized = tuple(
-            (
-                int(item.get("message_index", -1)),
-                str(item.get("role") or ""),
-                str(item.get("phase") or "others"),
-                int(item.get("start", -1)),
-                int(item.get("end", -1)),
-            )
-            for item in spans
-        )
+        normalized = normalize_event_spans(spans)
         if normalized == self.event_signature:
             return
-        previous_indices = {item[0] for item in self.event_signature}
-        new_events = [item for item in normalized if item[0] not in previous_indices]
-        new_tools = [
-            item
-            for item in new_events
-            if item[1].lower() == "tool" or item[2].lower() == "tool"
-        ]
+        new_events, new_tools = new_event_rows(self.event_signature, normalized)
         if new_events:
             # The next request starts a new agent turn. A short previous turn
             # cannot finish its post window using queries after this input.

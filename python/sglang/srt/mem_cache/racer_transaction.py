@@ -60,6 +60,58 @@ def protected_pending_tokens(runtime) -> int:
     return len(protected_pending_positions(runtime))
 
 
+def commitkv_next_transition(runtime) -> dict | None:
+    """What the next request's CommitKV events can protect from this runtime.
+
+    A draft that follows adds new events, which close the open window; a new
+    tool event also opens one over the saved pre-commit scan before selection.
+    None for methods without CommitKV lifecycle state.
+    """
+    preview = getattr(runtime, "tool_transition_protection", None)
+    if not callable(preview):
+        return None
+    return {"event_message_indices": runtime.event_message_indices(),
+            "tool_event": preview()}
+
+
+def draft_pending_positions(transition, spans, carried_positions) -> list[int]:
+    """Positions CommitKV protects in a draft, from the prior state's receipt.
+
+    ``transition`` is ``commitkv_next_transition`` of the state the draft
+    resumes; ``carried_positions`` is that state's open window.  Without a
+    receipt (other methods or an older engine) the open window is returned.
+    """
+    if not isinstance(transition, dict):
+        return list(carried_positions)
+    from sglang.srt.mem_cache.history_kv_reference import commitkv_event_transition
+
+    kind = commitkv_event_transition(transition["event_message_indices"], spans)
+    if kind == "tool_event":
+        return list(transition["tool_event"]["positions"])
+    return [] if kind == "new_events" else list(carried_positions)
+
+
+def resumed_draft_pending_positions(hint: dict, held: dict) -> list[int] | None:
+    """Pending positions a draft keeps when it resumes a held session, else None.
+
+    ``held`` is the serving layer's record of the previous transaction.  A
+    commit resumes the saved state, a discard its checkpoint.  The initial S0
+    evidence rows are removed from the events before CommitKV sees them.
+    """
+    persistent = hint.get("persistent_history_session") or {}
+    transaction = persistent.get("transaction") or {}
+    if transaction.get("phase") != "draft" or not held:
+        return None
+    commit = transaction.get("resolution") == "commit"
+    carried = held.get("current_protected_pending_positions" if commit
+                       else "protected_pending_positions") or []
+    evidence = set((persistent.get("initial_s0_append") or {}).get("evidence_message_indices") or ())
+    spans = [item for item in hint.get("history_kv_event_token_spans") or []
+             if item.get("message_index") not in evidence]
+    transition = held.get("current_commitkv_next_transition" if commit else "commitkv_next_transition")
+    return draft_pending_positions(transition, spans, carried)
+
+
 def excluded_resident_source_indices(positions, history_start, history_end, spans, pending_positions=()) -> list[int]:
     """Map explicit source spans into the current compact physical history."""
     if not 0 <= history_start <= history_end <= len(positions):
@@ -245,6 +297,9 @@ def checkpoint_generation(req) -> None:
             "full_history_reprefill_performed": False,
             "regeneration_mandatory_history": regeneration_mandatory_history(runtime),
         }
+        transition = commitkv_next_transition(runtime)
+        if transition is not None:
+            report["racer_transaction"]["commitkv_next_transition"] = transition
 
 
 def regeneration_mandatory_history(runtime) -> dict:

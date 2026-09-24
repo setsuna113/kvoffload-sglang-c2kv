@@ -3924,6 +3924,19 @@ class Scheduler(
         # engine's documented convention is most-recent-first; lifecycle
         # retirement/protection then modifies that order exactly.
         baseline = range(len(resident_positions) - 1, -1, -1)
+        hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
+        source_spans = hint.get("racer_initial_replaced_source_spans") or []
+        if source_spans:
+            # A committed generation can be an initial S0 source while only
+            # partly in the resident prefix; a decode checkpoint may already
+            # have moved its decoded prefix into the reference state.  Like the
+            # excluded normal-row tokens, those copies are not candidates.
+            pending = set(hint.get("racer_protected_pending_source_positions") or [])
+            baseline = [
+                index for index in baseline
+                if resident_positions[index] in pending
+                or not any(start <= resident_positions[index] < end for start, end in source_spans)
+            ]
         selected, metadata = serving_state.policy.checkpoint(
             baseline,
             resident_positions,
@@ -4514,6 +4527,9 @@ class Scheduler(
                 or base_config.get("target_tokens")
                 or 2048
             ),
+            # The prefill's RACER source exclusions index its history range.
+            # This range is the decoded tail, which holds no replaced source.
+            "racer_excluded_history_indices": [],
         }
         if method == "agentkv":
             next_state = self._build_agentkv_reference_state(

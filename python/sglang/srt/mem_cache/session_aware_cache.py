@@ -996,7 +996,7 @@ class SessionAwareCache(BasePrefixCache):
 
         if (hint.get("persistent_history_session") or {}).get("transaction") and isinstance(getattr(req, "kv_memory_report", None), dict):
             from sglang.srt.mem_cache.racer_transaction import (
-                protected_pending_positions, regeneration_mandatory_history,
+                commitkv_next_transition, protected_pending_positions, regeneration_mandatory_history,
             )
 
             runtime = getattr(req, "history_kv_runtime_state", None)
@@ -1004,6 +1004,9 @@ class SessionAwareCache(BasePrefixCache):
             req.kv_memory_report["racer_current_protected_pending_positions"] = pending_positions
             req.kv_memory_report["racer_current_protected_pending_tokens"] = len(pending_positions)
             req.kv_memory_report["racer_current_mandatory_history"] = regeneration_mandatory_history(runtime)
+            transition = commitkv_next_transition(runtime)
+            if transition is not None:
+                req.kv_memory_report["racer_current_commitkv_next_transition"] = transition
         slot.save_from_req(req, is_first=is_first)
 
     @staticmethod

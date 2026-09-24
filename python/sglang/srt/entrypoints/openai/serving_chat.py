@@ -675,6 +675,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 "protected_pending_positions": list(((ret[0].get("meta_info") or {}).get("kv_memory_report") or {}).get("racer_transaction", {}).get("protected_pending_positions") or []),
                 "current_protected_pending_positions": list(((ret[0].get("meta_info") or {}).get("kv_memory_report") or {}).get("racer_current_protected_pending_positions") or []),
                 "current_protected_pending_tokens": int(((ret[0].get("meta_info") or {}).get("kv_memory_report") or {}).get("racer_current_protected_pending_tokens") or 0),
+                "commitkv_next_transition": ((ret[0].get("meta_info") or {}).get("kv_memory_report") or {}).get("racer_transaction", {}).get("commitkv_next_transition"),
+                "current_commitkv_next_transition": ((ret[0].get("meta_info") or {}).get("kv_memory_report") or {}).get("racer_current_commitkv_next_transition"),
             }
         if hint.get("tool_memory_segments"):
             self._persistent_history_tool_segments[session_id] = [
@@ -1768,7 +1770,16 @@ class OpenAIServingChat(OpenAIServingBase):
             resolution = (persistent_config.get("transaction") or {}).get("resolution")
             pending_field = ("current_protected_pending_positions" if resolution == "commit"
                              else "protected_pending_positions")
-            request.c2kv_kv_memory_hint["racer_protected_pending_source_positions"] = list(held.get(pending_field) or [])
+            pending_positions = list(held.get(pending_field) or [])
+            from sglang.srt.mem_cache.racer_transaction import resumed_draft_pending_positions
+
+            # CommitKV reconfigures its lifecycle from a draft's events before
+            # selection: new events close the resumed window and a new tool
+            # event opens the one the previous response reported.
+            draft_pending = resumed_draft_pending_positions(request.c2kv_kv_memory_hint, held)
+            if draft_pending is not None:
+                pending_positions = draft_pending
+            request.c2kv_kv_memory_hint["racer_protected_pending_source_positions"] = pending_positions
             self._admit_initial_s0_evidence(
                 request, canonical_prompt_ids, body_ids, list(processed_messages.prompt_ids))
             if (persistent_config.get("recovery_append") or {}).get("enabled"):
@@ -1794,6 +1805,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 pending_count_field = ("current_protected_pending_tokens" if resolution == "commit"
                                        else "protected_pending_tokens")
                 pending_count = int(held.get(pending_count_field) or 0)
+                if draft_pending is not None:
+                    pending_count = len(draft_pending)
                 if (transaction.get("phase") == "regenerate"
                     and (persistent_config.get("recovery_append") or {}).get("enabled")):
                     replacements = request.c2kv_kv_memory_hint.get("racer_replacement_source_spans") or []
