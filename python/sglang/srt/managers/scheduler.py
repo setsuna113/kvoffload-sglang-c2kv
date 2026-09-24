@@ -3221,6 +3221,25 @@ class Scheduler(
         if not isinstance(hint, dict):
             hint = {}
         report = initialize_c2kv_kv_memory_report(hint)
+        persistent = hint.get("persistent_history_session") or {}
+        extra = persistent.get("extra_protection") or {}
+        transaction = persistent.get("transaction") or {}
+        if (isinstance(extra, dict) and extra.get("enabled") is True
+            and extra.get("schema") == "racer-native-protection-v1"
+            and transaction.get("phase") == "draft"):
+            report["racer_native_protection"] = {
+                "schema": "racer-native-protection-v1",
+                "decision_id": transaction.get("decision_id"),
+                "event_ids": list(extra.get("event_ids") or []),
+                "requested_source_messages": len(extra.get("source_message_indices") or []),
+                "requested_source_tokens": 0,
+                "applied": False,
+                "status": "no_selection",
+                "reason": "no_selection",
+                "changed_rows": 0,
+                "selection_count": 0,
+                "applied_any": False,
+            }
         history_eviction = hint.get("history_kv_eviction")
         if isinstance(history_eviction, dict):
             req.history_kv_eviction = dict(history_eviction)
@@ -3627,6 +3646,7 @@ class Scheduler(
         if protected_indices or excluded_indices:
             normal_positions = [normal_positions[index] for index in normal_indices]
         expected_scores = []
+        candidate_position_rows = []
         for layer_id, score in zip(layer_ids, headwise_scores):
             score = score.detach().float().cpu()
             existing_layer = (
@@ -3657,6 +3677,7 @@ class Scheduler(
                 )
             order = torch.argsort(candidate_positions, dim=1)
             expected_scores.append(torch.gather(score, 1, order))
+            candidate_position_rows.append(torch.gather(candidate_positions, 1, order))
         selected, metadata = select_pyramidkv_headwise(
             expected_scores,
             target_tokens=int(config.get("target_tokens") or history_len),
@@ -3668,7 +3689,25 @@ class Scheduler(
                 1, int(config.get("history_kv_kernel_size") or 5)
             ),
             pooling=str(config.get("history_kv_pooling") or "avgpool").lower(),
+            include_optional_rank=bool((getattr(req, "kv_memory_report", None) or {}).get(
+                "racer_native_protection")),
         )
+        if (getattr(req, "kv_memory_report", None) or {}).get("racer_native_protection"):
+            rows = [row for layer in candidate_position_rows for row in layer]
+            indices = [row for layer in selected for row in layer]
+            recent_window = max(1, int(config.get("history_kv_recent_window") or 64))
+            fixed_rows = [row[-min(recent_window, chosen.numel()):]
+                          for row, chosen in zip(rows, indices)]
+            ranking = [row for layer in metadata.pop("_racer_native_optional_rank")
+                       for row in layer]
+            patched = self._protect_native_history_rows(
+                req, rows, indices, config=config,
+                fixed_rows=fixed_rows, drop_order=ranking,
+            )
+            selected = [torch.stack(patched[cursor:cursor + layer.shape[0]])
+                        for cursor, layer in zip(
+                            [sum(item.shape[0] for item in selected[:index])
+                             for index in range(len(selected))], selected)]
 
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
@@ -3770,6 +3809,10 @@ class Scheduler(
         per_layer_rows = []
         per_layer_rows_by_stage = []
         per_layer_budgets = []
+        candidate_position_rows = []
+        selected_layers = []
+        layer_sources = []
+        optional_ranks = []
         for layer_id in range(
             kv_cache.start_layer, kv_cache.start_layer + kv_cache.layer_num
         ):
@@ -3785,7 +3828,7 @@ class Scheduler(
                 if existing_state is not None
                 else None
             )
-            merged_key, _, _ = merge_reference_candidates(
+            merged_key, _, merged_positions = merge_reference_candidates(
                 existing_layer,
                 normal_key,
                 normal_value,
@@ -3801,17 +3844,35 @@ class Scheduler(
                 candidate_key,
                 observations,
                 target_tokens=int(config.get("target_tokens") or history_len),
+                optional_rank_output=(optional_ranks if
+                    (getattr(req, "kv_memory_report", None) or {}).get(
+                        "racer_native_protection") else None),
             )
-            layers[layer_id] = gather_reference_candidates(
-                existing_layer,
-                normal_key,
-                normal_value,
-                positions,
-                indices.to(normal_key.device),
-            )
+            candidate_position_rows.extend(row for row in merged_positions)
+            selected_layers.append(indices)
+            layer_sources.append((layer_id, existing_layer, normal_key, normal_value))
             per_layer_rows.append(int(observations.shape[0]))
             per_layer_rows_by_stage.append(ring.rows_by_stage(layer_id))
             per_layer_budgets.append(int(indices.shape[1]))
+        if (getattr(req, "kv_memory_report", None) or {}).get("racer_native_protection"):
+            selected_rows = [row for layer in selected_layers for row in layer]
+            fixed_rows = [list(row[:16]) + list(row[-8:])
+                          for row in candidate_position_rows]
+            patched = self._protect_native_history_rows(
+                req, candidate_position_rows, selected_rows, config=config,
+                fixed_rows=fixed_rows, drop_order=optional_ranks,
+            )
+            cursor = 0
+            for index, layer in enumerate(selected_layers):
+                selected_layers[index] = torch.stack(patched[cursor:cursor + layer.shape[0]])
+                cursor += layer.shape[0]
+        for (layer_id, existing_layer, normal_key, normal_value), indices in zip(
+            layer_sources, selected_layers
+        ):
+            layers[layer_id] = gather_reference_candidates(
+                existing_layer, normal_key, normal_value, positions,
+                indices.to(normal_key.device),
+            )
         metadata = {
             "method": "agentkv",
             "algorithm_version": AGENTKV_ALGORITHM_VERSION,
@@ -3946,6 +4007,26 @@ class Scheduler(
             num_kv_heads=num_kv_heads,
             device=first_key.device,
         )
+        if (getattr(req, "kv_memory_report", None) or {}).get("racer_native_protection"):
+            retired = {position for page in serving_state.policy.retired_pages.values()
+                       for position in page.token_indices}
+            pending = set()
+            transition = serving_state.policy.pending
+            if transition is not None:
+                pending_ids = set(transition.protected_page_ids)
+                pending = {position for page in transition.pages
+                           if page.page_id in pending_ids
+                           for position in page.token_indices}
+            rows = [resident_positions for layer in selected for _ in layer]
+            native_rows = [row for layer in selected for row in layer]
+            patched = self._protect_native_history_rows(
+                req, rows, native_rows, config=config, forbidden_positions=retired,
+                fixed_positions=pending,
+            )
+            cursor = 0
+            for index, layer in enumerate(selected):
+                selected[index] = torch.stack(patched[cursor:cursor + layer.shape[0]])
+                cursor += layer.shape[0]
         metadata.update(
             method="commitkv",
             history_kv_backend="reference_attention",
@@ -4009,6 +4090,62 @@ class Scheduler(
             commitkv_baseline_policy="most_recent_first_project_convention",
         )
         return state
+
+    def _protect_native_history_rows(
+        self, req, candidate_rows, native_rows, *, config=None, forbidden_positions=(),
+        fixed_positions=(), fixed_rows=None, drop_order=None,
+    ):
+        """Apply an optional draft-only pin across every actual selection row."""
+        receipt = (getattr(req, "kv_memory_report", None) or {}).get(
+            "racer_native_protection"
+        )
+        if receipt is None:
+            return native_rows
+        from sglang.srt.mem_cache.racer_native_protection import (
+            protect_native_rows, requested_positions,
+        )
+
+        hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
+        requested = requested_positions(hint)
+        receipt["requested_source_tokens"] = len(requested)
+        receipt["native_row_count"] = len(native_rows)
+        receipt["native_row_budgets"] = [int(row.numel()) for row in native_rows]
+        config = config or getattr(req, "history_kv_eviction", None) or {}
+        receipt["selection_count"] = int(receipt.get("selection_count") or 0) + 1
+        receipt["target_tokens"] = int(config.get("target_tokens") or 0)
+        if hint.get("racer_native_protection_span_status") != "resolved":
+            receipt.update(applied=False, changed_rows=0,
+                           status="source_span_unavailable", reason="source_span_unavailable")
+            return native_rows
+        cutoff = config.get("canonical_history_end")
+        if cutoff is not None and any(position >= int(cutoff) for position in requested):
+            receipt.update(applied=False, changed_rows=0,
+                           status="source_outside_history", reason="source_outside_history")
+            return native_rows
+        history_start = int(config.get("history_start") or 0)
+        ledger = getattr(req, "history_kv_resident_positions", None)
+        if ledger is None:
+            ledger = []
+        common_prefix = set(ledger[:history_start])
+        required = [position for position in requested if position not in common_prefix]
+        receipt["common_protected_source_tokens"] = len(requested) - len(required)
+        if requested and not required:
+            receipt.update(applied=False, changed_rows=0,
+                           status="already_retained_common", reason="already_retained_common")
+            return native_rows
+        patched, status, changed = protect_native_rows(
+            candidate_rows, native_rows, required,
+            forbidden_positions=forbidden_positions,
+            fixed_positions=fixed_positions, fixed_rows=fixed_rows,
+            drop_order=drop_order,
+        )
+        receipt.update(
+            applied=status == "applied", status=status,
+            reason=None if status == "applied" else status,
+            changed_rows=changed,
+            applied_any=bool(receipt.get("applied_any")) or status == "applied",
+        )
+        return patched
 
     def _apply_history_kv_eviction(self, req: "Req") -> bool:
         from sglang.srt.managers.schedule_batch import FINISH_ABORT as _FA
@@ -4147,6 +4284,54 @@ class Scheduler(
                 selected = []
             elif not isinstance(selected, list):
                 selected = self._select_history_kv_eviction_indices(req, config)
+            protection_receipt = (getattr(req, "kv_memory_report", None) or {}).get(
+                "racer_native_protection"
+            )
+            if protection_receipt is not None and protection_receipt["status"] == "no_selection":
+                from sglang.srt.mem_cache.racer_native_protection import requested_positions
+                protection_receipt["requested_source_tokens"] = len(requested_positions(
+                    getattr(req, "c2kv_kv_memory_hint", None) or {}
+                ))
+                if method == "streamingllm":
+                    protection_receipt.update(
+                        status="native_recent_only", reason="native_recent_only",
+                        native_row_count=1,
+                        native_row_budgets=[int(config.get("target_tokens") or 0)],
+                    )
+                elif (method in {"h2o", "snapkv", "snapkv_persistent"}
+                      and isinstance(selected, list) and not config.get("tool_kv_eviction")):
+                    ledger = getattr(req, "history_kv_resident_positions", None)
+                    if ledger is None:
+                        ledger = list(range(len(req.c2kv_virtual_input_ids)))
+                    candidates = ledger[history_start:history_end]
+                    target = int(config.get("target_tokens") or 0)
+                    if target > 0 and len(selected) > target:
+                        protection_receipt.update(
+                            applied=False, changed_rows=0,
+                            status="native_over_budget", reason="native_over_budget",
+                            native_row_count=1, native_row_budgets=[len(selected)],
+                            target_tokens=target,
+                        )
+                    else:
+                        selected_tensor = torch.tensor(selected, dtype=torch.long)
+                        fixed = [candidates[index] for index in config.get("protected_history_indices") or []
+                                 if 0 <= index < len(candidates)]
+                        optional_rank = config.get("_racer_native_optional_rank") or []
+                        optional_indices = set(optional_rank)
+                        fixed.extend(candidates[index] for index in selected
+                                     if index not in optional_indices and 0 <= index < len(candidates))
+                        ranking = [optional_rank]
+                        selected = self._protect_native_history_rows(
+                            req, [candidates], [selected_tensor], config=config,
+                            fixed_positions=fixed,
+                            drop_order=ranking,
+                        )[0].tolist()
+                    config.pop("_racer_native_optional_rank", None)
+                else:
+                    protection_receipt.update(
+                        status="native_selection_unavailable",
+                        reason="native_selection_unavailable",
+                    )
             excluded = set(config.get("racer_excluded_history_indices") or [])
             if excluded:
                 if not isinstance(selected, list) or excluded.intersection(selected):
@@ -4650,7 +4835,8 @@ class Scheduler(
                 req.history_kv_score_state = scoped.history_kv_score_state
             for key, value in scoped.history_kv_eviction.items():
                 if key not in {"history_start", "history_end", "racer_excluded_history_indices", "protected_history_indices"}:
-                    config[key] = value
+                    config[key] = ([candidates[index] for index in value]
+                                   if key == "_racer_native_optional_rank" else value)
             return [candidates[index] for index in selected]
         protected = set(config.get("protected_history_indices") or [])
         if protected:
@@ -4680,7 +4866,8 @@ class Scheduler(
                 req.history_kv_score_state = scoped.history_kv_score_state
             for key, value in scoped.history_kv_eviction.items():
                 if key not in {"history_start", "history_end", "protected_history_indices"}:
-                    config[key] = value
+                    config[key] = ([candidates[index] for index in value]
+                                   if key == "_racer_native_optional_rank" else value)
             return sorted(protected | {candidates[index] for index in selected})
         method = str(config.get("method") or "").strip().lower()
         if method == "snapkv":
@@ -4761,6 +4948,11 @@ class Scheduler(
             past_limit = max(0, history_len - recent_budget)
             scores = torch.stack(layer_scores, dim=0).mean(dim=0)
             selected = _unique_sorted(_topk(scores, heavy_budget, past_limit) + recent)
+            if (getattr(req, "kv_memory_report", None) or {}).get("racer_native_protection"):
+                config["_racer_native_optional_rank"] = sorted(
+                    (index for index in selected if index < past_limit),
+                    key=lambda index: float(scores[index]),
+                )
             req.history_kv_eviction["selection_reason"] = "h2o_heavy_hitter_recent"
             req.history_kv_eviction["h2o_heavy_kept"] = len(selected) - len(recent)
             req.history_kv_eviction["h2o_recent_kept"] = len(recent)
@@ -4791,8 +4983,15 @@ class Scheduler(
                         pooling,
                     )
                 selected = _unique_sorted(_topk(past_scores, past_budget) + recent)
+                if (getattr(req, "kv_memory_report", None) or {}).get("racer_native_protection"):
+                    config["_racer_native_optional_rank"] = sorted(
+                        (index for index in selected if index < past_limit),
+                        key=lambda index: float(past_scores[index]),
+                    )
             else:
                 selected = recent
+                if (getattr(req, "kv_memory_report", None) or {}).get("racer_native_protection"):
+                    config["_racer_native_optional_rank"] = []
             req.history_kv_eviction["selection_reason"] = "snapkv_attention_pooling_recent"
             req.history_kv_eviction["snapkv_selected_old"] = max(0, len(selected) - len(recent))
             req.history_kv_eviction["snapkv_recent_kept"] = len(recent)

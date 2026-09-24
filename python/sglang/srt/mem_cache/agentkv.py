@@ -356,6 +356,7 @@ def select_agentkv_layer_indices(
     target_tokens: int,
     sink_tokens: int = AGENTKV_SINK_TOKENS,
     recent_tokens: int = AGENTKV_OBSERVATION_WINDOW,
+    optional_rank_output: list[list[int]] | None = None,
 ) -> torch.Tensor:
     """Run the upstream StageQ-SnapKV selection for one layer.
 
@@ -372,6 +373,8 @@ def select_agentkv_layer_indices(
         raise ValueError("AgentKV sink and recent token counts must be non-negative")
     identity = _identity_indices(history_tokens, kv_heads, key.device)
     if history_tokens <= target_tokens:
+        if optional_rank_output is not None:
+            optional_rank_output.extend([] for _ in range(kv_heads))
         return identity
     if query_observation.ndim != 3:
         raise ValueError(
@@ -380,6 +383,8 @@ def select_agentkv_layer_indices(
     if query_observation.numel() == 0:
         # Faithful StageQ-SnapKV behavior: no valid query observation means no
         # eviction, rather than substituting another selector.
+        if optional_rank_output is not None:
+            optional_rank_output.extend([] for _ in range(kv_heads))
         return identity
     if query_observation.device != key.device:
         raise ValueError("AgentKV key and query observations must share a device")
@@ -406,6 +411,8 @@ def select_agentkv_layer_indices(
         sorted=True,
     )
     if mandatory.numel() >= target_tokens:
+        if optional_rank_output is not None:
+            optional_rank_output.extend([] for _ in range(kv_heads))
         return mandatory[:target_tokens].expand(kv_heads, -1).contiguous()
 
     candidate_start = sink_len
@@ -414,6 +421,8 @@ def select_agentkv_layer_indices(
         candidate_start, candidate_end, dtype=torch.long, device=key.device
     )
     if candidates.numel() == 0:
+        if optional_rank_output is not None:
+            optional_rank_output.extend([] for _ in range(kv_heads))
         return mandatory.expand(kv_heads, -1).contiguous()
 
     query_observation = query_observation[:AGENTKV_ANCHOR_BUDGET]
@@ -429,6 +438,11 @@ def select_agentkv_layer_indices(
     selected = candidates[
         torch.topk(scores, k=topk_count, dim=-1, sorted=False).indices
     ]
+    if optional_rank_output is not None:
+        optional_rank_output.extend(
+            sorted(row.tolist(), key=lambda index: float(score_row[index - candidate_start]))
+            for row, score_row in zip(selected, scores)
+        )
     mandatory_by_head = mandatory.expand(kv_heads, -1)
     return torch.sort(torch.cat([mandatory_by_head, selected], dim=1), dim=1).values
 

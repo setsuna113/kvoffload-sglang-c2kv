@@ -373,6 +373,7 @@ def select_pyramidkv_headwise(
     kernel_size: int = 5,
     pooling: str = "avgpool",
     beta: int = 20,
+    include_optional_rank: bool = False,
 ) -> tuple[list[torch.Tensor], dict]:
     """Return official-style per-layer/per-KV-head source indices.
 
@@ -432,6 +433,7 @@ def select_pyramidkv_headwise(
         budgets = [requested_target_tokens] * len(scores_by_layer)
     selected = []
     realized_budgets = []
+    optional_ranks = []
     for scores, budget in zip(scores_by_layer, budgets):
         layer_history_tokens = int(scores.shape[1])
         budget = min(budget, layer_history_tokens)
@@ -455,10 +457,17 @@ def select_pyramidkv_headwise(
             prefix = torch.topk(old_scores, k=old_budget, dim=-1).indices
             prefix = prefix.sort(dim=-1).values
             indices = torch.cat([prefix, suffix], dim=-1)
+            if include_optional_rank:
+                optional_ranks.append([
+                    sorted(row.tolist(), key=lambda index: float(score_row[index]))
+                    for row, score_row in zip(prefix, old_scores)
+                ])
         else:
             indices = suffix
+            if include_optional_rank:
+                optional_ranks.append([[] for _ in range(num_heads)])
         selected.append(indices.contiguous())
-    return selected, {
+    metadata = {
         "algorithm_version": "pyramidkv_official_schedule_headwise_reference_v1",
         "per_layer_budget_tokens": realized_budgets,
         "requested_target_tokens": requested_target_tokens,
@@ -475,6 +484,9 @@ def select_pyramidkv_headwise(
         "per_head_selection": True,
         "reference_attention_backend": "torch_sdpa",
     }
+    if include_optional_rank:
+        metadata["_racer_native_optional_rank"] = optional_ranks
+    return selected, metadata
 
 
 def gather_reference_layer(

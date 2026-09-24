@@ -1635,6 +1635,24 @@ class OpenAIServingChat(OpenAIServingBase):
                     request, list(processed_messages.prompt_ids), c2kv_segments
                 )
             )
+            hint = request.c2kv_kv_memory_hint
+            if isinstance(hint, dict):
+                persistent = hint.get("persistent_history_session") or {}
+                extra = persistent.get("extra_protection") or {}
+                transaction = persistent.get("transaction") or {}
+                if (isinstance(extra, dict) and extra.get("enabled") is True
+                    and extra.get("schema") == "racer-native-protection-v1"
+                    and transaction.get("phase") == "draft"):
+                    requested = set(extra.get("source_message_indices") or [])
+                    spans = [item for item in hint.get("history_kv_event_token_spans") or []
+                             if item.get("message_index") in requested]
+                    hint["racer_native_protection_source_spans"] = [
+                        [int(item["start"]), int(item["end"])] for item in spans]
+                    hint["racer_native_protection_span_status"] = (
+                        "resolved" if len(spans) == len(requested)
+                        and all(int(item["start"]) < int(item["end"]) for item in spans)
+                        else "source_span_unavailable"
+                    )
             if persistent_session_id is not None and c2kv_segments:
                 hint = request.c2kv_kv_memory_hint
                 input_prefix = int(hint.get("tool_memory_input_prefix_tokens") or 0)

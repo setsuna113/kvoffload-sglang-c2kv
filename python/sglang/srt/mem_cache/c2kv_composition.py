@@ -7,7 +7,7 @@ def remap_message_metadata(hint, removed, message_count):
     """Remove carrier rows from boundary counts and event metadata together."""
     removed = set(removed)
     persistent = hint.get("persistent_history_session") or {}
-    for name in ("recovery_append", "initial_s0_append", "racer_initial_allocation"):
+    for name in ("recovery_append", "initial_s0_append", "racer_initial_allocation", "extra_protection"):
         admission = persistent.get(name)
         if not isinstance(admission, dict):
             continue
