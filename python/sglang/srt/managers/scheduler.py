@@ -3240,6 +3240,24 @@ class Scheduler(
                 "selection_count": 0,
                 "applied_any": False,
             }
+        elif (isinstance(extra, dict) and extra.get("enabled") is True
+              and extra.get("schema") == "racer-native-protection-v2"
+              and transaction.get("phase") in {"draft", "regenerate"}):
+            report["racer_native_protection"] = {
+                "schema": "racer-native-protection-v2",
+                "decision_id": transaction.get("decision_id"),
+                "scope_id": extra.get("scope_id"),
+                "event_ids": list(extra.get("event_ids") or []),
+                "unit_ids": list(extra.get("unit_ids") or []),
+                "phase": transaction["phase"],
+                "applied": False,
+                "status": "no_selection",
+                "reason": "no_selection",
+                "changed_rows": 0,
+                "selection_count": 0,
+                "units": [],
+                "event_coverage": [],
+            }
         history_eviction = hint.get("history_kv_eviction")
         if isinstance(history_eviction, dict):
             req.history_kv_eviction = dict(history_eviction)
@@ -3311,6 +3329,8 @@ class Scheduler(
                         reference_config.get("target_tokens") or 2048
                     ),
                 )
+            if method == "commitkv" and req.history_kv_runtime_state is not None:
+                req.history_kv_runtime_state.policy.retirement_veto_positions = frozenset()
         req.c2kv_kv_memory_hint = dict(hint)
         req.kv_memory_report = report
         if isinstance(tool_eviction, dict) and req.history_kv_eviction.get("tool_no_op"):
@@ -3927,6 +3947,9 @@ class Scheduler(
         serving_state = getattr(req, "history_kv_runtime_state", None)
         if not isinstance(serving_state, CommitKVServingState):
             raise RuntimeError("COMMITKV_RUNTIME_STATE_UNAVAILABLE")
+        if not getattr(req, "_racer_native_protection_scope_initialized", False):
+            serving_state.policy.retirement_veto_positions = frozenset()
+            req._racer_native_protection_scope_initialized = True
         reference_config = getattr(req, "history_kv_reference_config", None)
         declared_target_tokens = (
             int(reference_config.get("target_tokens") or 2048)
@@ -4019,14 +4042,40 @@ class Scheduler(
                            for position in page.token_indices}
             rows = [resident_positions for layer in selected for _ in layer]
             native_rows = [row for layer in selected for row in layer]
+            receipt = req.kv_memory_report["racer_native_protection"]
+            units_override = None
+            if receipt.get("schema") == "racer-native-protection-v2":
+                from sglang.srt.mem_cache.racer_native_protection import (
+                    commitkv_recovery_page_spans, expand_commitkv_page_units,
+                )
+                from sglang.srt.mem_cache.commitkv import partition_event_span
+
+                units = (getattr(req, "c2kv_kv_memory_hint", None) or {}).get(
+                    "racer_native_protection_units") or []
+                protection_pages = list(serving_state.event_pages)
+                recovery_spans = commitkv_recovery_page_spans(
+                    units, serving_state.policy.config.page_size,
+                )
+                for index, (start, end) in enumerate(recovery_spans):
+                    protection_pages.extend(partition_event_span(
+                        ("racer_recovery_protection", index), start, end,
+                        page_size=serving_state.policy.config.page_size,
+                    ))
+                units_override = expand_commitkv_page_units(
+                    units, protection_pages,
+                )
             patched = self._protect_native_history_rows(
                 req, rows, native_rows, config=config, forbidden_positions=retired,
-                fixed_positions=pending,
+                fixed_positions=pending, units_override=units_override,
             )
             cursor = 0
             for index, layer in enumerate(selected):
                 selected[index] = torch.stack(patched[cursor:cursor + layer.shape[0]])
                 cursor += layer.shape[0]
+            if receipt.get("schema") == "racer-native-protection-v2":
+                serving_state.policy.retirement_veto_positions = frozenset(
+                    getattr(req, "racer_native_protection_admitted_positions", ())
+                ) if receipt["phase"] == "draft" else frozenset()
         metadata.update(
             method="commitkv",
             history_kv_backend="reference_attention",
@@ -4093,7 +4142,7 @@ class Scheduler(
 
     def _protect_native_history_rows(
         self, req, candidate_rows, native_rows, *, config=None, forbidden_positions=(),
-        fixed_positions=(), fixed_rows=None, drop_order=None,
+        fixed_positions=(), fixed_rows=None, drop_order=None, units_override=None,
     ):
         """Apply an optional draft-only pin across every actual selection row."""
         receipt = (getattr(req, "kv_memory_report", None) or {}).get(
@@ -4101,6 +4150,13 @@ class Scheduler(
         )
         if receipt is None:
             return native_rows
+        if receipt.get("schema") == "racer-native-protection-v2":
+            return self._protect_native_history_units(
+                req, candidate_rows, native_rows, config=config,
+                forbidden_positions=forbidden_positions,
+                fixed_positions=fixed_positions, fixed_rows=fixed_rows,
+                drop_order=drop_order, units_override=units_override,
+            )
         from sglang.srt.mem_cache.racer_native_protection import (
             protect_native_rows, requested_positions,
         )
@@ -4147,12 +4203,67 @@ class Scheduler(
         )
         return patched
 
+    def _protect_native_history_units(
+        self, req, candidate_rows, native_rows, *, config=None,
+        forbidden_positions=(), fixed_positions=(), fixed_rows=None,
+        drop_order=None, units_override=None,
+    ):
+        from sglang.srt.mem_cache.racer_native_protection import protect_native_units
+
+        receipt = req.kv_memory_report["racer_native_protection"]
+        hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
+        config = config or getattr(req, "history_kv_eviction", None) or {}
+        positions = getattr(req, "history_kv_resident_positions", None)
+        if positions is None:
+            positions = list(range(len(getattr(req, "c2kv_virtual_input_ids", ()))))
+        start = int(config.get("history_start") or 0)
+        end = int(config.get("history_end") or 0)
+        common = list(positions[:start]) + list(positions[end:])
+        result = protect_native_units(
+            candidate_rows, native_rows,
+            (units_override if units_override is not None else
+             hint.get("racer_native_protection_units") or []),
+            hint.get("racer_native_protection_events") or [],
+            phase=receipt["phase"], common_positions=common,
+            forbidden_positions=forbidden_positions,
+            fixed_positions=fixed_positions, fixed_rows=fixed_rows,
+            drop_order=drop_order,
+        )
+        changed = result["changed_rows"]
+        units = result["units"]
+        admitted = sum(item["admitted_rows"] for item in units)
+        status = ("applied" if changed else "already_retained" if admitted else
+                  "coverage_only" if receipt["phase"] == "regenerate" else
+                  "no_units_admitted")
+        receipt.update(
+            applied=bool(changed), status=status,
+            reason=None if changed else status,
+            changed_rows=changed,
+            selection_count=int(receipt.get("selection_count") or 0) + 1,
+            native_row_count=len(native_rows),
+            native_row_budgets=[int(row.numel()) for row in native_rows],
+            target_tokens=int(config.get("target_tokens") or 0),
+            units=units,
+            event_coverage=result["event_coverage"],
+            admitted_unit_rows=admitted,
+        )
+        req.racer_native_protection_admitted_positions = result[
+            "admitted_positions_all_rows"
+        ]
+        return result["selected"]
+
     def _apply_history_kv_eviction(self, req: "Req") -> bool:
         from sglang.srt.managers.schedule_batch import FINISH_ABORT as _FA
 
         config = getattr(req, "history_kv_eviction", None)
         if not isinstance(config, dict):
             return True
+        if (str(config.get("method") or "").lower() == "commitkv"
+            and not getattr(req, "_racer_native_protection_scope_initialized", False)):
+            runtime = getattr(req, "history_kv_runtime_state", None)
+            if runtime is not None and getattr(runtime, "policy", None) is not None:
+                runtime.policy.retirement_veto_positions = frozenset()
+                req._racer_native_protection_scope_initialized = True
         paper_telemetry.set_phase("selection")
         session_error = _persistent_history_session_error(req, config)
         if session_error is not None:
@@ -4292,7 +4403,19 @@ class Scheduler(
                 protection_receipt["requested_source_tokens"] = len(requested_positions(
                     getattr(req, "c2kv_kv_memory_hint", None) or {}
                 ))
-                if method == "streamingllm":
+                if (method == "streamingllm" and
+                    protection_receipt.get("schema") == "racer-native-protection-v2"):
+                    ledger = getattr(req, "history_kv_resident_positions", None)
+                    if ledger is None:
+                        ledger = list(range(len(req.c2kv_virtual_input_ids)))
+                    candidates = ledger[history_start:history_end]
+                    target = int(config.get("target_tokens") or 0)
+                    selected = list(range(max(0, len(candidates) - target), len(candidates)))
+                    selected = self._protect_native_history_rows(
+                        req, [candidates], [torch.tensor(selected, dtype=torch.long)],
+                        config=config, drop_order=[list(selected)],
+                    )[0].tolist()
+                elif method == "streamingllm":
                     protection_receipt.update(
                         status="native_recent_only", reason="native_recent_only",
                         native_row_count=1,
@@ -4306,12 +4429,28 @@ class Scheduler(
                     candidates = ledger[history_start:history_end]
                     target = int(config.get("target_tokens") or 0)
                     if target > 0 and len(selected) > target:
-                        protection_receipt.update(
-                            applied=False, changed_rows=0,
-                            status="native_over_budget", reason="native_over_budget",
-                            native_row_count=1, native_row_budgets=[len(selected)],
-                            target_tokens=target,
-                        )
+                        if protection_receipt.get("schema") == "racer-native-protection-v2":
+                            phase = protection_receipt["phase"]
+                            protection_receipt["phase"] = "regenerate"
+                            try:
+                                self._protect_native_history_rows(
+                                    req, [candidates],
+                                    [torch.tensor(selected, dtype=torch.long)],
+                                    config=config,
+                                )
+                            finally:
+                                protection_receipt["phase"] = phase
+                            protection_receipt.update(
+                                status="native_over_budget", reason="native_over_budget",
+                                applied=False, changed_rows=0,
+                            )
+                        else:
+                            protection_receipt.update(
+                                applied=False, changed_rows=0,
+                                status="native_over_budget", reason="native_over_budget",
+                                native_row_count=1, native_row_budgets=[len(selected)],
+                                target_tokens=target,
+                            )
                     else:
                         selected_tensor = torch.tensor(selected, dtype=torch.long)
                         fixed = [candidates[index] for index in config.get("protected_history_indices") or []

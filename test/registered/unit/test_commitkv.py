@@ -508,3 +508,34 @@ def test_invalid_budget_and_index_contracts_fail_closed():
         [2], resident_token_count=3, budget=2, pending_indices=[0, 1]
     )
     assert exactly_full.tolist() == [0, 1]
+
+
+def test_v2_admitted_complete_page_vetoes_retirement_before_joint_test_and_expires():
+    import copy
+
+    state = commitkv.CommitKVRuntimeState(commitkv.CommitKVConfig(
+        measurement_layer_id=0, joint_threshold=0.01,
+    ))
+    pages = tuple(commitkv.EventPage(name, 0, index, index + 1)
+                  for index, name in enumerate(("source", "dormant", "active", "uncertain")))
+    page = pages[0]
+    pre = _EffectWindow({frozenset({0}): 0.2, frozenset({1}): 0.001,
+                         frozenset({2}): 0.2, frozenset({3}): 0.02})
+    post = _EffectWindow({frozenset({0}): 0.001, frozenset({1}): 0.001,
+                          frozenset({2}): 0.2, frozenset({3}): 0.02,
+                          frozenset({0, 1}): 0.02, frozenset({0, 2}): 0.2,
+                          frozenset({0, 3}): 0.02})
+    state.record_pre("first", pages, pre, range(6), total_budget=8)
+    state.retirement_veto_positions = frozenset({0})
+    held = copy.deepcopy(state)
+    assert held.retirement_veto_positions == frozenset({0})
+    receipt = state.record_post("first", post, range(6))
+    assert receipt["retirement_vetoed_page_ids"] == [page.page_id]
+    assert receipt["accepted_page_ids"] == []
+    assert state.retired_pages == {}
+
+    state.retirement_veto_positions = frozenset()
+    state.record_pre("second", pages, pre, range(6), total_budget=8)
+    receipt = state.record_post("second", post, range(6))
+    assert receipt.get("retirement_vetoed_page_ids", []) == []
+    assert receipt["accepted_page_ids"] == [page.page_id]

@@ -124,6 +124,7 @@ class CommitKVRuntimeState:
     retired_pages: Dict[tuple[Hashable, int], EventPage] = field(default_factory=dict)
     completed_transitions: int = 0
     incomplete_transitions: int = 0
+    retirement_veto_positions: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         if self.config.measurement_layer_id is None:
@@ -239,8 +240,17 @@ class CommitKVRuntimeState:
         evidence = pair_lifecycle_evidence(
             pending.pre_effects, post_effects, config=self.config
         )
+        vetoed_page_ids = [
+            page.page_id for page in pending.pages
+            if page.page_id in evidence
+            and set(page.token_indices).issubset(self.retirement_veto_positions)
+        ]
+        eligible_evidence = {
+            page_id: item for page_id, item in evidence.items()
+            if page_id not in vetoed_page_ids
+        }
         accepted, tested_effects = greedy_joint_retirement(
-            evidence,
+            eligible_evidence,
             mapped,
             window,
             joint_threshold=self.config.joint_threshold,
@@ -250,7 +260,7 @@ class CommitKVRuntimeState:
             self.retired_pages[page_id] = page_by_id[page_id]
         self.pending = None
         self.completed_transitions += 1
-        return {
+        receipt = {
             "commit_id": commit_id,
             "measurement_phase": "post_commit",
             "measurement_layer_id": self.config.measurement_layer_id,
@@ -262,6 +272,9 @@ class CommitKVRuntimeState:
             "joint_test_effects": tested_effects,
             "retired_page_count": len(self.retired_pages),
         }
+        if vetoed_page_ids:
+            receipt["retirement_vetoed_page_ids"] = vetoed_page_ids
+        return receipt
 
     def record_incomplete_post(
         self, commit_id: Hashable, *, observed_query_count: int

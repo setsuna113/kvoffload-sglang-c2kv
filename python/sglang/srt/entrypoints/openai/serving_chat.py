@@ -326,6 +326,8 @@ class OpenAIServingChat(OpenAIServingBase):
         hint.pop("persistent_session_drop_generation_prefix_tokens", None)
         for key in ("racer_ephemeral_source_span", "racer_internal_source_spans", "racer_replacement_source_spans", "racer_active_ephemeral_source_spans", "racer_initial_replaced_source_spans", "racer_protected_pending_source_positions"):
             hint.pop(key, None)
+        for key in ("racer_native_protection_units", "racer_native_protection_events", "racer_promoted_recovery_source_spans"):
+            hint.pop(key, None)
         if isinstance(config, dict):
             config.pop("racer_excluded_history_indices", None)
         if previous is None:
@@ -341,6 +343,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 hint["persistent_session_delta_tokens"] = len(full_prompt_ids)
                 hint["persistent_session_canonical_prompt_tokens"] = len(full_prompt_ids)
             params["drop_previous_output"] = True
+            if ((hint.get("persistent_history_session") or {}).get("extra_protection") or {}).get("schema") == "racer-native-protection-v2":
+                from sglang.srt.mem_cache.native_protection_spans import resolve_native_protection
+
+                resolve_native_protection(hint, self.tokenizer_manager.tokenizer, full_prompt_ids)
             self._translate_tool_session_coordinates(request, 0, len(full_prompt_ids))
             return full_prompt_ids, session_id, full_prompt_ids
 
@@ -476,6 +482,10 @@ class OpenAIServingChat(OpenAIServingBase):
             config["persistent_delta_history_tokens"] = max(0, history_end - logical_prefix)
             config["persistent_canonical_history_end"] = history_end
             config["persistent_canonical_prompt_tokens"] = len(full_prompt_ids)
+        if ((hint.get("persistent_history_session") or {}).get("extra_protection") or {}).get("schema") == "racer-native-protection-v2":
+            from sglang.srt.mem_cache.native_protection_spans import resolve_native_protection
+
+            resolve_native_protection(hint, self.tokenizer_manager.tokenizer, full_prompt_ids)
         self._translate_tool_session_coordinates(request, logical_prefix, len(full_prompt_ids))
         if held is not None:
             internal_spans = list(held.get("internal_source_spans") or [])

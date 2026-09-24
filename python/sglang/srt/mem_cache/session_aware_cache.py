@@ -588,13 +588,58 @@ class SessionAwareCache(BasePrefixCache):
             return
         from sglang.srt.mem_cache.history_kv_eviction import PhysicalHistoryKVEvictor
 
+        hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
+        persistent = hint.get("persistent_history_session") or {}
+        recovery = persistent.get("recovery_append") or {}
+        transaction = persistent.get("transaction") or {}
+        protection = persistent.get("extra_protection") or {}
+        history = hint.get("history_kv_eviction") or {}
+        history_start = history.get("persistent_protected_prefix_tokens")
+        history_end = history.get("persistent_canonical_history_end")
         state = getattr(slot, "history_kv_reference_state", None)
         if state is not None:
             for layer in state.layers.values():
                 if any(bool(((layer.positions >= start) & (layer.positions < end)).any()) for start, end in spans):
                     raise RuntimeError("RACER_EVIDENCE_MUST_REMAIN_NATIVE_TAIL")
         positions = list(slot.history_kv_resident_positions)
-        keep = [i for i, p in enumerate(positions) if not any(start <= p < end for start, end in spans)]
+        resident = set(positions)
+        promoted = set()
+        promoted_unit_ids = []
+        if (
+            transaction.get("phase") == "draft"
+            and not recovery.get("replace_previous_evidence")
+            and protection.get("schema") == "racer-native-protection-v2"
+            and protection.get("enabled") is True
+            and type(history_start) is int
+            and type(history_end) is int
+            and 0 <= history_start <= history_end
+        ):
+            # The prior recovery lease ends now.  A requested resident alias
+            # can survive only as ordinary, budgeted history on this draft.
+            # Keep at most one whole alias per unit; all other copied pieces
+            # still expire before the native selector sees the row.
+            for unit in hint.get("racer_native_protection_units") or []:
+                for instance in unit.get("instances") or []:
+                    if instance.get("kind") != "recovery":
+                        continue
+                    ranges = instance.get("spans") or []
+                    if not ranges or any(
+                        not isinstance(span, (list, tuple))
+                        or len(span) != 2
+                        or type(span[0]) is not int
+                        or type(span[1]) is not int
+                        or not 0 <= span[0] < span[1]
+                        for span in ranges
+                    ):
+                        continue
+                    alias = {p for start, end in ranges for p in range(start, end)}
+                    if alias <= resident and all(
+                        any(start <= p < end for start, end in spans) for p in alias
+                    ) and all(history_start <= p < history_end for p in alias):
+                        promoted.update(alias)
+                        promoted_unit_ids.append(unit.get("unit_id"))
+                        break
+        keep = [i for i, p in enumerate(positions) if p in promoted or not any(start <= p < end for start, end in spans)]
         old_len = len(positions)
         if len(keep) != old_len:
             result = PhysicalHistoryKVEvictor(self.req_to_token_pool, self.token_to_kv_pool_allocator).evict(
@@ -613,14 +658,42 @@ class SessionAwareCache(BasePrefixCache):
                 layer: {p: score for p, score in scores.items() if p in resident}
                 for layer, scores in (slot.history_kv_score_state or {}).items()
             }
+        if promoted:
+            # Future held checkpoints must not keep classifying these ordinary
+            # resident history tokens as internal recovery frames.
+            promoted_spans = []
+            for p in sorted(promoted):
+                if promoted_spans and promoted_spans[-1][1] == p:
+                    promoted_spans[-1][1] = p + 1
+                else:
+                    promoted_spans.append([p, p + 1])
+            internal = []
+            for start, end in hint.get("racer_internal_source_spans") or []:
+                run_start = None
+                for p in range(start, end):
+                    if p not in promoted and run_start is None:
+                        run_start = p
+                    elif p in promoted and run_start is not None:
+                        internal.append([run_start, p])
+                        run_start = None
+                if run_start is not None:
+                    internal.append([run_start, end])
+            hint["racer_internal_source_spans"] = internal
+            hint["racer_promoted_recovery_source_spans"] = promoted_spans
         report = getattr(req, "kv_memory_report", None)
         if isinstance(report, dict):
-            report["racer_evidence_expiry"] = {
+            expiry = {
                 "source_spans": spans, "expired_native_tokens": old_len - len(keep),
-                "retained_original_tokens": len(keep), "canonical_ledger_preserved": True,
+                "retained_original_tokens": sum(not any(start <= positions[i] < end for start, end in spans) for i in keep),
+                "canonical_ledger_preserved": True,
                 "full_history_reprefill_performed": False,
-                "trigger": "recovery_replacement" if (((getattr(req, "c2kv_kv_memory_hint", None) or {}).get("persistent_history_session") or {}).get("recovery_append") or {}).get("replace_previous_evidence") else "next_decision",
+                "trigger": "recovery_replacement" if recovery.get("replace_previous_evidence") else "next_decision",
             }
+            if promoted:
+                expiry["promoted_recovery_tokens"] = len(promoted)
+                expiry["promoted_recovery_unit_ids"] = promoted_unit_ids
+                expiry["promoted_recovery_source_spans"] = promoted_spans
+            report["racer_evidence_expiry"] = expiry
         slot.racer_ephemeral_spans = []
 
     def _replace_racer_sources(self, slot: SessionSlot, req: Req) -> None:

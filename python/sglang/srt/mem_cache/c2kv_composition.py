@@ -18,6 +18,17 @@ def remap_message_metadata(hint, removed, message_count):
             if any(type(index) is not int or not 0 <= index < message_count or index in removed for index in indices):
                 raise ValueError("RACER_SOURCE_REPLACEMENT_MESSAGE_INVALID")
             admission[field] = [index - sum(previous < index for previous in removed) for index in indices]
+        if name == "extra_protection" and admission.get("schema") == "racer-native-protection-v2":
+            def remap(index):
+                if type(index) is not int or not 0 <= index < message_count or index in removed:
+                    raise ValueError("RACER_SOURCE_REPLACEMENT_MESSAGE_INVALID")
+                return index - sum(previous < index for previous in removed)
+
+            for item in [*(admission.get("units") or []), *(admission.get("events") or [])]:
+                for instance in item.get("instances") or []:
+                    instance["source_message_indices"] = [remap(index) for index in instance["source_message_indices"]]
+                    for fragment in instance.get("fragments") or []:
+                        fragment["message_index"] = remap(fragment["message_index"])
     for name in ("history_kv_eviction", "history_kv_reference_config"):
         config = hint.get(name)
         if not isinstance(config, dict):
