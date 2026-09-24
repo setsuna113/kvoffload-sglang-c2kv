@@ -383,11 +383,16 @@ def select_pyramidkv_headwise(
     if not scores_by_layer:
         raise ValueError("PyramidKV requires layer scores")
     shape = tuple(scores_by_layer[0].shape)
-    if len(shape) != 2 or min(shape) < 1:
+    if len(shape) != 2 or shape[0] < 1:
         raise ValueError("PyramidKV scores must have shape [Hkv, history]")
     num_heads = shape[0]
     if any(scores.ndim != 2 or scores.shape[0] != num_heads for scores in scores_by_layer):
         raise ValueError("PyramidKV layers must have the same KV-head count")
+    # A layer can have no candidate left (RACER source replacement emptied its
+    # headwise history and the source exclusion removed every ordinary token);
+    # like any later empty layer it keeps nothing.  Some layer must have one.
+    if max(int(scores.shape[1]) for scores in scores_by_layer) < 1:
+        raise ValueError("PyramidKV scores must have shape [Hkv, history]")
     if pooling not in {"avgpool", "maxpool"} or kernel_size < 1:
         raise ValueError("invalid PyramidKV pooling configuration")
     history_tokens = int(

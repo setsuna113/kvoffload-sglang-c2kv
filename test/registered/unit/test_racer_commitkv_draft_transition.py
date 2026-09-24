@@ -25,8 +25,18 @@ SRT = ROOT / "python" / "sglang" / "srt"
 
 
 def _load(relative):
-    """Load one CPU-only engine module under its package name, without sglang/__init__."""
+    """Import one engine module; without the serving dependencies, load its file.
+
+    The fallback registers the file under its package name, so the lazy
+    in-function imports of production code resolve to the same module.
+    """
     name = "sglang.srt." + relative[:-3].replace("/", ".")
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        pass
+    if name in sys.modules:
+        return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, SRT / relative)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -34,8 +44,11 @@ def _load(relative):
     return module
 
 
-_telemetry = SimpleNamespace(sample=lambda *args, **kwargs: None)
-sys.modules.setdefault("sglang.srt.observability", SimpleNamespace(paper_telemetry=_telemetry))
+try:
+    importlib.import_module("sglang.srt.observability.paper_telemetry")
+except ImportError:
+    sys.modules.setdefault("sglang.srt.observability", SimpleNamespace(
+        paper_telemetry=SimpleNamespace(sample=lambda *args, **kwargs: None)))
 commitkv = _load("mem_cache/commitkv.py")
 reference = _load("mem_cache/history_kv_reference.py")
 racer_transaction = _load("mem_cache/racer_transaction.py")
