@@ -29,6 +29,8 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.mem_cache.gist_utils import (
     C2KV_KERNEL_OPTIONS,
+    C2KV_SMALL_SMEM_KERNEL_OPTIONS,
+    FlexAttentionSharedMemoryFallback,
     GistConfig,
     get_apply_gist_residual_func,
     get_prepare_gist_input_func,
@@ -294,11 +296,20 @@ class Qwen3Attention(nn.Module):
                     ) from e
                 self.flash_attention_2 = flash_attn_func
             else:
-                self.flex_attention = torch.compile(
-                    partial(
-                        flex_attention, kernel_options=C2KV_KERNEL_OPTIONS
+                self.flex_attention = FlexAttentionSharedMemoryFallback(
+                    torch.compile(
+                        partial(
+                            flex_attention, kernel_options=C2KV_KERNEL_OPTIONS
+                        ),
+                        dynamic=True,
                     ),
-                    dynamic=True,
+                    lambda: torch.compile(
+                        partial(
+                            flex_attention,
+                            kernel_options=C2KV_SMALL_SMEM_KERNEL_OPTIONS,
+                        ),
+                        dynamic=True,
+                    ),
                 )
 
         self.rotary_emb = get_rope(

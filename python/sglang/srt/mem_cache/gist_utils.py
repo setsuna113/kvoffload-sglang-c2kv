@@ -5,6 +5,7 @@ Builds the custom attention mask, position IDs, and optional residual
 connections used during the gist extraction forward pass.
 """
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -16,6 +17,55 @@ from torch.nn.attention.flex_attention import create_block_mask
 C2KV_KERNEL_OPTIONS = {
     "FORCE_USE_FLEX_ATTENTION": True,
 }
+
+# Tiles that fit the 99 KB per-block shared memory of sm_89/sm_120 GPUs. Only
+# used for an input whose default Triton config cannot be compiled there.
+C2KV_SMALL_SMEM_KERNEL_OPTIONS = {
+    **C2KV_KERNEL_OPTIONS,
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "num_stages": 2,
+    "num_warps": 4,
+}
+
+
+def is_triton_shared_memory_failure(error: BaseException) -> bool:
+    """Inductor could not compile any Triton config within shared memory."""
+    text = str(error)
+    return "No valid triton configs" in text and "out of resource" in text
+
+
+class FlexAttentionSharedMemoryFallback:
+    """Compiled FlexAttention that keeps its default kernel wherever it compiles.
+
+    Inductor picks one default tile config per GPU family; on sm_89 it reuses
+    the A100 config, which some input shapes cannot fit into 99 KB of shared
+    memory. Those exact shapes, and only those, use a smaller-tile compile.
+    """
+
+    def __init__(self, primary: Callable, fallback_factory: Callable[[], Callable]):
+        self.primary = primary
+        self._fallback_factory = fallback_factory
+        self._fallback = None
+        self.fallback_shapes = set()
+
+    def __call__(self, query, key, value, **kwargs):
+        shape = (tuple(query.shape), tuple(key.shape), tuple(value.shape),
+                 query.dtype, str(query.device))
+        if shape not in self.fallback_shapes:
+            try:
+                return self.primary(query, key, value, **kwargs)
+            except Exception as error:
+                if not is_triton_shared_memory_failure(error):
+                    raise
+                self.fallback_shapes.add(shape)
+                logging.getLogger(__name__).warning(
+                    "C2KV FlexAttention default config exceeds shared memory for "
+                    "q=%s k=%s; using %s for this shape",
+                    shape[0], shape[1], C2KV_SMALL_SMEM_KERNEL_OPTIONS)
+        if self._fallback is None:
+            self._fallback = self._fallback_factory()
+        return self._fallback(query, key, value, **kwargs)
 
 
 def resolve_c2kv_compression_ratio(
