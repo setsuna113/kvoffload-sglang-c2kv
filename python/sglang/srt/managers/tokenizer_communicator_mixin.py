@@ -465,19 +465,24 @@ class TokenizerCommunicatorMixin:
         *,
         outer_request_id: Optional[str] = None,
         measurement_phase: Optional[str] = None,
+        materialize_first_miss: bool = False,
     ) -> C2KVBulkCacheLookupReqOutput:
-        """Return the cache-hit prefix without scheduling extraction on a miss."""
+        """Return the cache-hit prefix and optionally extract its first miss."""
         if not 1 <= len(items) <= 32:
             raise ValueError("C2KV bulk cache lookup requires 1 to 32 items")
         self.auto_create_handle_loop()
         req = C2KVBulkCacheLookupReqInput(
+            materialize_first_miss=materialize_first_miss,
             items=[
                 TokenizedExtractReqInput(
                     rid=item["rid"],
                     input_ids=list(item["input_ids"]),
                     input_text="",
                     compression_ratio=item["compression_ratio"],
-                    allow_cache_miss=False,
+                    allow_cache_miss=(
+                        bool(item.get("allow_cache_miss", False))
+                        if materialize_first_miss else False
+                    ),
                     projection_set=item["projection_set"],
                     c2kv_outer_request_id=outer_request_id,
                     c2kv_measurement_phase=measurement_phase,

@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
@@ -32,6 +33,7 @@ def _load_functions(*names, **bindings):
     namespace = {
         "Any": Any,
         "Dict": Dict,
+        "time": time,
         "C2KVNativePackedGenerateRequest": object,
         "Request": object,
         **bindings,
@@ -137,15 +139,25 @@ def test_capability_advertises_both_named_profiles():
         "raw_prefix_cache": None,
         "background_extras": None,
         "bulk_cache_lookup": None,
+        "bulk_first_miss": None,
         "cross_turn_prewarm": None,
+        "async_compression": None,
     }
     namespace["get_bool_env_var"] = lambda name: True
     assert namespace["_c2kv_native_capability"]()["serving_features"] == {
         "raw_prefix_cache": "raw-prefix-v1",
         "background_extras": "selected-first-response-barrier-v1",
         "bulk_cache_lookup": "bulk-cache-lookup-v1",
+        "bulk_first_miss": "bulk-first-miss-v1",
         "cross_turn_prewarm": "cross-turn-prewarm-v1",
+        "async_compression": "nonblocking-history-v1",
     }
+    namespace["get_bool_env_var"] = lambda name: name == "C2KV_NATIVE_ASYNC_COMPRESSION"
+    features = namespace["_c2kv_native_capability"]()["serving_features"]
+    assert features["cross_turn_prewarm"] is None
+    assert features["async_compression"] == "nonblocking-history-v1"
+    assert features["bulk_first_miss"] is None
+    namespace["get_bool_env_var"] = lambda name: True
     server_args.disable_finished_insert = True
     assert namespace["_c2kv_native_capability"]()["serving_features"]["raw_prefix_cache"] is None
     server_args.disable_finished_insert = False
@@ -153,9 +165,11 @@ def test_capability_advertises_both_named_profiles():
     assert namespace["_c2kv_native_capability"]()["serving_features"]["raw_prefix_cache"] is None
     server_args.tokenizer_worker_num = 2
     assert namespace["_c2kv_native_capability"]()["serving_features"]["cross_turn_prewarm"] is None
+    assert namespace["_c2kv_native_capability"]()["serving_features"]["async_compression"] is None
     server_args.tokenizer_worker_num = 1
     server_args.dp_size = 2
     assert namespace["_c2kv_native_capability"]()["serving_features"]["cross_turn_prewarm"] is None
+    assert namespace["_c2kv_native_capability"]()["serving_features"]["async_compression"] is None
 
 
 @pytest.mark.parametrize("tool_layout", ["prefix_chunk", "anchored_segment", "raw_segment"])

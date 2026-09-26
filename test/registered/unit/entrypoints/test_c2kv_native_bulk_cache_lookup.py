@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import importlib.util
+from collections import OrderedDict
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Optional
@@ -162,6 +163,115 @@ def test_scheduler_returns_only_hit_prefix_with_exact_projection_keys():
     assert pool.seen[1][2]["projection_identity"] == "tool-checkpoint"
 
 
+@pytest.mark.parametrize("allowed", [False, True])
+def test_scheduler_fuses_hit_prefix_and_only_first_miss(allowed):
+    methods = _scheduler_methods()
+
+    class Pool:
+        _cache = {"history:4:11": object(), "history:4:14": object()}
+
+        def compute_hash(self, ids, *, compression_ratio, extractor_config):
+            projection = extractor_config.get("projection_set", "history")
+            identity = extractor_config.get("projection_identity")
+            prefix = f"{projection}:{identity}:" if identity else f"{projection}:"
+            return f"{prefix}{compression_ratio}:{ids[0]}"
+
+    scheduler = SimpleNamespace(
+        c2kv_pool=Pool(),
+        tp_size=1,
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                get_c2kv_compression_ratio=int,
+                model=SimpleNamespace(c2kv_tool_gist_identity="tool-checkpoint"),
+            )
+        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        server_args=SimpleNamespace(),
+    )
+    scheduler._c2kv_extract_cache_key = MethodType(
+        methods["_c2kv_extract_cache_key"], scheduler
+    )
+    calls = []
+
+    def extract(item):
+        calls.append((item.rid, item.compression_ratio, item.projection_set,
+                      item.allow_cache_miss))
+        hit = item.input_ids[0] in (11, 14)
+        return SimpleNamespace(
+            success=hit or item.allow_cache_miss,
+            cache_hit=hit,
+            key_hash=item.rid,
+            error="C2KV_EXTRACTION_BUDGET_EXHAUSTED" if not hit and not allowed else "",
+        )
+
+    scheduler.handle_extract_request = extract
+    items = [
+        SimpleNamespace(rid="hit", input_ids=[11], compression_ratio=4,
+                        projection_set="history", allow_cache_miss=False),
+        SimpleNamespace(rid="miss", input_ids=[12], compression_ratio=8,
+                        projection_set="tool", allow_cache_miss=allowed),
+        SimpleNamespace(rid="trailing", input_ids=[14], compression_ratio=4,
+                        projection_set="history", allow_cache_miss=False),
+    ]
+    reply = methods["handle_c2kv_bulk_cache_lookup"](
+        scheduler, SimpleNamespace(items=items, materialize_first_miss=True)
+    )
+    assert reply.success and reply.first_miss_index == 1
+    assert [result.key_hash for result in reply.hits] == ["hit"]
+    assert reply.first_miss_result.key_hash == "miss"
+    assert reply.first_miss_result.success is allowed
+    assert calls == [
+        ("hit", 4, "history", False),
+        ("miss", 8, "tool", allowed),
+    ]
+
+
+def test_fused_miss_preserves_hit_touch_then_unpinned_eviction_order():
+    methods = _scheduler_methods()
+    items = [
+        SimpleNamespace(rid=str(token), input_ids=[token], compression_ratio=4,
+                        projection_set="history", allow_cache_miss=True)
+        for token in (11, 12, 13)
+    ]
+
+    def run(materialize_first_miss):
+        class Pool:
+            def __init__(self):
+                self._cache = OrderedDict((str(token), object()) for token in (11, 12))
+
+        pool = Pool()
+        scheduler = SimpleNamespace(c2kv_pool=pool, tp_size=1)
+        scheduler._c2kv_extract_cache_key = lambda item: (
+            str(item.input_ids[0]), item.compression_ratio, None
+        )
+        calls = []
+
+        def extract(item):
+            key = str(item.input_ids[0])
+            hit = key in pool._cache
+            calls.append((key, hit))
+            if hit:
+                pool._cache.move_to_end(key)
+            else:
+                assert item.allow_cache_miss
+                pool._cache.popitem(last=False)
+                pool._cache[key] = object()
+            return SimpleNamespace(success=True, cache_hit=hit, key_hash=key)
+
+        scheduler.handle_extract_request = extract
+        reply = methods["handle_c2kv_bulk_cache_lookup"](
+            scheduler,
+            SimpleNamespace(items=items, materialize_first_miss=materialize_first_miss),
+        )
+        if not materialize_first_miss:
+            scheduler.handle_extract_request(items[reply.first_miss_index])
+        return calls, list(pool._cache)
+
+    expected = ([("11", True), ("12", True), ("13", False)], ["12", "13"])
+    assert run(False) == expected
+    assert run(True) == expected
+
+
 def test_real_extract_miss_keeps_projection_set_for_model_forward():
     methods = _scheduler_methods()
     forward_projections = []
@@ -271,6 +381,31 @@ async def test_cancelled_bulk_lookup_drains_reply_before_next_request():
     assert completed == ["first", "second"]
     with pytest.raises(ValueError, match="1 to 32 items"):
         await method(manager, [item("oversize")] * 33)
+
+
+@pytest.mark.asyncio
+async def test_communicator_only_forwards_miss_permission_in_fused_mode():
+    method = _communicator_bulk_method()
+    sent = []
+
+    async def communicator(req):
+        sent.append(req)
+        return [SimpleNamespace(success=True)]
+
+    manager = SimpleNamespace(
+        auto_create_handle_loop=lambda: None,
+        c2kv_bulk_cache_lookup_communicator=communicator,
+    )
+    item = {
+        "rid": "tool-miss", "input_ids": [12], "compression_ratio": 8,
+        "projection_set": "tool", "allow_cache_miss": True,
+    }
+    await method(manager, [item])
+    await method(manager, [item], materialize_first_miss=True)
+    assert sent[0].materialize_first_miss is False
+    assert sent[0].items[0].allow_cache_miss is False
+    assert sent[1].materialize_first_miss is True
+    assert sent[1].items[0].allow_cache_miss is True
 
 
 @pytest.mark.asyncio
@@ -403,6 +538,151 @@ async def test_bulk_hits_do_not_charge_projection_miss_budgets():
     assert response["extraction"]["history_model_calls"] == 0
     assert response["extraction"]["tool_model_calls"] == 1
     assert response["serving_execution"]["bulk_cache_hit_chunks"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "history_budget,tool_budget,expect_success",
+    [(0, 1, True), (0, None, False)],
+)
+async def test_native_fused_first_miss_keeps_projection_and_budget_semantics(
+    history_budget, tool_budget, expect_success
+):
+    helpers = _native_helpers()
+    plan = helpers._plan(with_extra=False)
+    plan.unique_chunks = [
+        {"handle": "history-hit", "chunk_id": "history-hit", "token_ids": [11] * 8},
+        {"handle": "tool-miss", "chunk_id": "tool-miss", "token_ids": [12] * 8,
+         "projection_set": "tool", "compression_ratio": 4},
+        {"handle": "history-tail", "chunk_id": "history-tail", "token_ids": [14] * 8},
+    ]
+    plan.selected_handles = [chunk["handle"] for chunk in plan.unique_chunks]
+    plan.segment_boundaries = [(1, 2), (2, 3), (3, 4)]
+    plan.compression_handles = []
+    plan.logical_input_ids = [1, 11, 12, 14, 2]
+    request = helpers._request(budget=history_budget)
+    request.max_tool_extraction_calls = tool_budget
+    request.compression_chunks = []
+
+    class Manager:
+        server_args = SimpleNamespace(incremental_streaming_output=False)
+
+        def __init__(self):
+            self.calls = []
+            self.generated = False
+
+        async def c2kv_bulk_cache_lookup(self, items, **kwargs):
+            self.calls.append(("bulk", [item["rid"] for item in items], kwargs))
+            assert kwargs["materialize_first_miss"] is True
+            assert [item["allow_cache_miss"] for item in items] == [
+                False, expect_success, False
+            ]
+            hit = helpers._extract_result("history-hit")
+            hit.cache_hit = True
+            miss = helpers._extract_result("tool-miss", success=expect_success)
+            miss.gist_len = 2
+            return SimpleNamespace(
+                success=True, error="", hits=[hit], first_miss_index=1,
+                first_miss_result=miss,
+            )
+
+        async def c2kv_extract(self, **kwargs):
+            self.calls.append(("extract", kwargs))
+            assert kwargs["rid"] == "native-1:extract:2"
+            assert kwargs["allow_cache_miss"] is False
+            result = helpers._extract_result("history-tail")
+            result.cache_hit = True
+            return result
+
+        async def generate_request(self, request, raw_request):
+            self.generated = True
+            yield helpers._generation_output([41, 42], True)
+
+    manager = Manager()
+    namespace = helpers._namespace(manager, plan, enabled=False)
+    namespace["get_bool_env_var"] = lambda name: name in {
+        "C2KV_NATIVE_BULK_CACHE_LOOKUP", "C2KV_NATIVE_BULK_FIRST_MISS"
+    }
+    response = await namespace["v1_c2kv_native_generate"](
+        request, SimpleNamespace(headers={})
+    )
+    assert len(manager.calls) == (2 if expect_success else 1)
+    assert manager.generated is expect_success
+    if expect_success:
+        assert response["extraction"]["history_model_calls"] == 0
+        assert response["extraction"]["tool_model_calls"] == 1
+        assert response["costs"]["materialized_encoder_tokens"] == 8
+        assert response["costs"]["scope_reused_encoder_tokens"] == 16
+        assert response["serving_execution"]["bulk_cache_lookup_calls"] == 1
+        assert response["serving_execution"]["bulk_cache_hit_chunks"] == 1
+        assert response["serving_execution"]["bulk_first_miss_calls"] == 1
+        assert [chunk["cache_hit"] for chunk in response["encoder_chunks"]] == [
+            True, False, True
+        ]
+        assert response["encoder_chunks"][1]["gist_len"] == 2
+    else:
+        assert "C2KV_EXTRACTION_BUDGET_EXHAUSTED" in response["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "history_budget,tool_budget,trailing_projection",
+    [(1, None, "history"), (0, 1, "tool")],
+)
+async def test_fused_miss_consumes_the_finite_budget_before_trailing_miss(
+    history_budget, tool_budget, trailing_projection
+):
+    helpers = _native_helpers()
+    plan = helpers._plan(with_extra=False)
+    plan.unique_chunks = [
+        {"handle": "hit", "chunk_id": "hit", "token_ids": [11] * 8},
+        {"handle": "first-miss", "chunk_id": "first-miss", "token_ids": [12] * 8,
+         "projection_set": "tool"},
+        {"handle": "trailing-miss", "chunk_id": "trailing-miss",
+         "token_ids": [13] * 8, "projection_set": trailing_projection},
+    ]
+    plan.selected_handles = [chunk["handle"] for chunk in plan.unique_chunks]
+    plan.segment_boundaries = [(1, 2), (2, 3), (3, 4)]
+    plan.compression_handles = []
+    plan.logical_input_ids = [1, 11, 12, 13, 2]
+    request = helpers._request(budget=history_budget)
+    request.max_tool_extraction_calls = tool_budget
+    request.compression_chunks = []
+
+    class Manager:
+        server_args = SimpleNamespace(incremental_streaming_output=False)
+
+        def __init__(self):
+            self.trailing_allow = None
+
+        async def c2kv_bulk_cache_lookup(self, items, **kwargs):
+            assert kwargs["materialize_first_miss"] is True
+            assert items[1]["allow_cache_miss"] is True
+            hit = helpers._extract_result("hit")
+            hit.cache_hit = True
+            return SimpleNamespace(
+                success=True, error="", hits=[hit], first_miss_index=1,
+                first_miss_result=helpers._extract_result("first-miss"),
+            )
+
+        async def c2kv_extract(self, **kwargs):
+            self.trailing_allow = kwargs["allow_cache_miss"]
+            return helpers._extract_result("trailing-miss", success=False)
+
+        async def generate_request(self, request, raw_request):
+            raise AssertionError("Generation must not run after budget exhaustion")
+            yield
+
+    manager = Manager()
+    namespace = helpers._namespace(manager, plan, enabled=False)
+    namespace["get_bool_env_var"] = lambda name: name in {
+        "C2KV_NATIVE_BULK_CACHE_LOOKUP", "C2KV_NATIVE_BULK_FIRST_MISS"
+    }
+    response = await namespace["v1_c2kv_native_generate"](
+        request, SimpleNamespace(headers={})
+    )
+    assert manager.trailing_allow is False
+    assert "C2KV_EXTRACTION_BUDGET_EXHAUSTED" in response["error"]
 
 
 @pytest.mark.asyncio

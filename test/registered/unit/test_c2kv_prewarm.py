@@ -92,6 +92,206 @@ async def test_all_foreground_requests_exit_before_background_resumes():
 
 
 @pytest.mark.asyncio
+async def test_overlap_foreground_skips_inflight_job_and_runs_during_generation():
+    first_started, first_release = asyncio.Event(), asyncio.Event()
+    second_started, second_release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def extract(**kwargs):
+        calls.append(kwargs["rid"])
+        if len(calls) == 1:
+            first_started.set()
+            await first_release.wait()
+        else:
+            second_started.set()
+            await second_release.wait()
+        return result(kwargs)
+
+    queue = NativePrewarmQueue(extract)
+    job = payload()
+    job["scheduling"] = MODULE.OVERLAP_SCHEDULING
+    queue.submit(job)
+    await asyncio.wait_for(first_started.wait(), 1)
+    await asyncio.wait_for(queue.enter_foreground(overlap=True), 1)
+    first_release.set()
+    await asyncio.sleep(0)
+    assert len(calls) == 1
+    queue.enter_generation()
+    await asyncio.wait_for(second_started.wait(), 1)
+    assert queue.foreground_count == queue.generation_count == 1
+    running = queue.poll("owner", "job", "session")
+    assert running["completed_chunks"] == 1 and running["pending_chunks"] == 1
+    assert running["model_calls"] == 1
+    second_release.set()
+    await asyncio.wait_for(queue.jobs[("owner", "job")].done.wait(), 1)
+    receipt = queue.poll("owner", "job", "session")
+    assert receipt["status"] == "completed" and receipt["pending_chunks"] == 0
+    assert receipt["model_calls"] == 2 and receipt["completed_chunks"] == 2
+    assert receipt["started_monotonic_ns"] >= receipt["submitted_monotonic_ns"]
+    assert receipt["finished_monotonic_ns"] >= receipt["last_completed_monotonic_ns"]
+    assert receipt["extraction_wall_duration_ns"] > 0
+    assert queue.poll("owner", "job", "session") == receipt
+    queue.exit_generation()
+    queue.exit_foreground()
+    await queue.close()
+
+
+@pytest.mark.asyncio
+async def test_rid_gated_overlap_waits_for_matching_admission_and_foreground_preparation():
+    first_started, first_release = asyncio.Event(), asyncio.Event()
+    second_started = asyncio.Event()
+    calls = []
+
+    async def extract(**kwargs):
+        calls.append(kwargs["rid"])
+        if len(calls) == 1:
+            first_started.set()
+            await first_release.wait()
+        else:
+            second_started.set()
+        return result(kwargs)
+
+    queue = NativePrewarmQueue(extract, max_jobs=2)
+    job = payload(count=2)
+    job.update(scheduling=MODULE.OVERLAP_SCHEDULING, after_native_rid="selected-rid")
+    assert queue.submit(job)["status"] == "queued"
+    await asyncio.sleep(0)
+    assert not calls
+
+    await queue.enter_foreground(overlap=True)
+    queue.enter_generation("unrelated-rid")
+    await asyncio.sleep(0)
+    assert not calls
+    queue.exit_generation()
+
+    queue.enter_generation("selected-rid")
+    await asyncio.wait_for(first_started.wait(), 1)
+    await queue.enter_foreground(overlap=True)
+    first_release.set()
+    async def first_chunk_completed():
+        while not queue.jobs[("owner", "job")].results:
+            await asyncio.sleep(0)
+    await asyncio.wait_for(first_chunk_completed(), 1)
+    assert not second_started.is_set()
+    await queue.enter_foreground(overlap=True)
+    queue.enter_generation("second-rid")
+    await asyncio.sleep(0)
+    assert not second_started.is_set()
+    queue.enter_generation("third-rid")
+    await asyncio.wait_for(second_started.wait(), 1)
+    assert "selected-rid" not in queue.recent_admissions
+    await asyncio.wait_for(queue.jobs[("owner", "job")].done.wait(), 1)
+    assert queue.poll("owner", "job", "session")["status"] == "completed"
+    queue.exit_generation()
+    queue.exit_generation()
+    queue.exit_generation()
+    queue.exit_foreground()
+    queue.exit_foreground()
+    queue.exit_foreground()
+    await queue.close()
+
+
+@pytest.mark.asyncio
+async def test_rid_gated_late_submission_and_unadmitted_cancel():
+    calls = []
+
+    async def extract(**kwargs):
+        calls.append(kwargs["rid"])
+        return result(kwargs)
+
+    queue = NativePrewarmQueue(extract, max_jobs=2)
+    await queue.enter_foreground(overlap=True)
+    queue.enter_generation("already-admitted")
+    queue.exit_generation()
+    queue.exit_foreground()
+    late = payload(owner="late", count=1)
+    late.update(scheduling=MODULE.OVERLAP_SCHEDULING, after_native_rid="already-admitted")
+    queue.submit(late)
+    await asyncio.wait_for(queue.jobs[("late", "job")].done.wait(), 1)
+    assert queue.poll("late", "job", "session")["status"] == "completed"
+
+    never = payload(owner="never", count=1)
+    never.update(scheduling=MODULE.OVERLAP_SCHEDULING, after_native_rid="never-admitted")
+    queue.submit(never)
+    receipt = await asyncio.wait_for(queue.drain("never", "job", "session"), 1)
+    assert receipt["status"] == "cancelled" and receipt["model_calls"] == 0
+    assert receipt["started_monotonic_ns"] is None
+    assert len(calls) == 1
+    for native_rid in ("later-one", "later-two"):
+        await queue.enter_foreground(overlap=True)
+        queue.enter_generation(native_rid)
+        queue.exit_generation()
+        queue.exit_foreground()
+    assert list(queue.recent_admissions) == ["later-one", "later-two"]
+    await queue.close()
+
+
+@pytest.mark.asyncio
+async def test_mixed_modes_preserve_legacy_pause_and_foreground_priority():
+    overlap_started, release = asyncio.Event(), asyncio.Event()
+    legacy_started = asyncio.Event()
+    overlap_calls = 0
+
+    async def extract(**kwargs):
+        nonlocal overlap_calls
+        if kwargs["rid"].startswith("prewarm:overlap:"):
+            overlap_calls += 1
+            overlap_started.set()
+            await release.wait()
+        else:
+            legacy_started.set()
+        return result(kwargs)
+
+    queue = NativePrewarmQueue(extract)
+    overlap = payload(owner="overlap", count=2)
+    overlap["scheduling"] = MODULE.OVERLAP_SCHEDULING
+    queue.submit(overlap)
+    await asyncio.wait_for(overlap_started.wait(), 1)
+    await queue.enter_foreground(overlap=True)
+    queue.submit(payload(owner="legacy", count=1))
+    release.set()
+    await asyncio.sleep(0)
+    assert overlap_calls == 1 and not legacy_started.is_set()
+    queue.enter_generation()
+    await asyncio.wait_for(queue.jobs[("overlap", "job")].done.wait(), 1)
+    assert overlap_calls == 2 and not legacy_started.is_set()
+    queue.exit_generation()
+    queue.exit_foreground()
+    await asyncio.wait_for(legacy_started.wait(), 1)
+    assert (await queue.drain("legacy", "job", "session"))["status"] == "completed"
+    await queue.close()
+
+
+@pytest.mark.asyncio
+async def test_poll_keeps_identity_and_partial_cost_before_cancel():
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def extract(**kwargs):
+        started.set()
+        await release.wait()
+        return result(kwargs)
+
+    queue = NativePrewarmQueue(extract)
+    queued = payload(count=2)
+    queued["scheduling"] = MODULE.OVERLAP_SCHEDULING
+    queue.submit(queued)
+    await asyncio.wait_for(started.wait(), 1)
+    with pytest.raises(ValueError, match="different session"):
+        queue.poll("owner", "job", "wrong-session")
+    assert queue.poll("owner", "job", "session")["pending_chunks"] == 2
+    draining = asyncio.create_task(queue.drain("owner", "job", "session"))
+    await asyncio.sleep(0)
+    assert not draining.done()
+    release.set()
+    receipt = await asyncio.wait_for(draining, 1)
+    assert receipt["status"] == "cancelled"
+    assert receipt["model_calls"] == 1 and receipt["cancelled_chunks"] == 1
+    assert receipt["pending_chunks"] == 0
+    assert queue.poll("owner", "job", "session") == receipt
+    await queue.close()
+
+
+@pytest.mark.asyncio
 async def test_completed_cache_result_is_reusable_and_budget_is_exact():
     cache, forward_calls = {}, []
 
@@ -177,6 +377,8 @@ async def test_failure_retains_receipt_and_does_not_hide_unknown_budget():
     receipt = await queue.drain("owner", "job", "session")
     assert receipt["status"] == "failed" and receipt["budget_known"] is False
     assert "lost scheduler response" in receipt["error"]
+    assert receipt["extraction_wall_duration_ns"] > 0
+    assert receipt["finished_monotonic_ns"] >= receipt["started_monotonic_ns"]
     await queue.close()
 
 
@@ -217,6 +419,9 @@ async def test_idempotency_and_close_cancel_only_owned_pending_work():
     {"chunks": [{"handle": "h", "token_ids": [1], "compression_ratio": 0}]},
     {"chunks": [{"handle": "h", "token_ids": [1], "compression_ratio": 8,
                  "projection_set": "tool"}]},
+    {"after_native_rid": "selected-rid"},
+    {"scheduling": MODULE.OVERLAP_SCHEDULING, "after_native_rid": ""},
+    {"scheduling": MODULE.OVERLAP_SCHEDULING, "after_native_rid": "x" * 4097},
 ])
 def test_invalid_or_unbounded_submissions_are_rejected(change):
     with pytest.raises(ValueError):

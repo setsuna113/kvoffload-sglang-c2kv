@@ -2407,7 +2407,7 @@ class Scheduler(
         return key_hash, compression_ratio, None
 
     def handle_c2kv_bulk_cache_lookup(self, recv_req: C2KVBulkCacheLookupReqInput):
-        """Return a consecutive hit prefix without starting an encoder pass."""
+        """Return a consecutive hit prefix and optionally its first miss."""
         if self.c2kv_pool is None:
             return C2KVBulkCacheLookupReqOutput(
                 success=False, error="C2KV not enabled."
@@ -2446,8 +2446,15 @@ class Scheduler(
             return C2KVBulkCacheLookupReqOutput(
                 success=False, error="C2KV bulk cache lookup lost a cache hit"
             )
+        first_miss_result = None
+        if getattr(recv_req, "materialize_first_miss", False) and hit_count < len(recv_req.items):
+            # Keep the original single-document path for the mask, projection,
+            # cache admission, telemetry, and per-item error semantics.
+            first_miss_result = self.handle_extract_request(recv_req.items[hit_count])
         return C2KVBulkCacheLookupReqOutput(
-            hits=hits, first_miss_index=hit_count
+            hits=hits,
+            first_miss_index=hit_count,
+            first_miss_result=first_miss_result,
         )
 
     @paper_telemetry.measure_synchronous_request("c2kv_extract", "extraction")

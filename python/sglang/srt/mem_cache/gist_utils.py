@@ -12,9 +12,14 @@ from typing import Callable, Optional
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
 
-# PyTorch 2.8 accepts kernel_options as a plain dict.
+# FlexAttention accepts kernel_options as a plain dict.
 C2KV_KERNEL_OPTIONS = {
     "FORCE_USE_FLEX_ATTENTION": True,
+    # BLOCK_M=128, BLOCK_N=64 exceeds Ada's shared-memory limit for Qwen3.
+    # Halve the query tile without changing the attention computation.
+    # Both dimensions divide create_block_mask's default 128-token blocks.
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
 }
 
 

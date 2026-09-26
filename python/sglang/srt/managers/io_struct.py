@@ -2144,14 +2144,16 @@ class C2KVBulkCacheLookupReqInput(BaseReq):
     """Probe a bounded, ordered prefix of native extraction cache entries."""
 
     items: List[TokenizedExtractReqInput] = field(default_factory=list)
+    materialize_first_miss: bool = False
 
 
 @dataclass
 class C2KVBulkCacheLookupReqOutput(BaseReq):
-    """Hits before the first miss; the miss itself has not been extracted."""
+    """Hits before the first miss and, optionally, its extraction result."""
 
     hits: List[C2KVExtractReqOutput] = field(default_factory=list)
     first_miss_index: int = 0
+    first_miss_result: Optional[C2KVExtractReqOutput] = None
     success: bool = True
     error: str = ""
 
