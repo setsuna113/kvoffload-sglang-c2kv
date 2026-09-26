@@ -991,8 +991,8 @@ def test_closed_persistent_session_aborts_before_physical_eviction(monkeypatch):
     monkeypatch.setitem(sys.modules, schedule_batch.__name__, schedule_batch)
     events = []
     telemetry = SimpleNamespace(
-        set_phase=lambda phase: events.append(("phase", phase)),
-        sample=lambda event: events.append(("sample", event)),
+        set_phase=lambda phase, *, req: events.append(("phase", phase, req)),
+        sample=lambda event, *, req: events.append(("sample", event, req)),
     )
     apply_eviction = method(
         scheduler,
@@ -1028,11 +1028,12 @@ def test_closed_persistent_session_aborts_before_physical_eviction(monkeypatch):
     assert req.kv_memory_report["persistent_history_session_error"] == (
         "PERSISTENT_HISTORY_SESSION_UNAVAILABLE"
     )
-    assert events == [
+    assert [(kind, value) for kind, value, _ in events] == [
         ("phase", "selection"),
         ("sample", "history_kv_eviction_failed"),
         ("phase", "prefill"),
     ]
+    assert all(event_req is req for _, _, event_req in events)
 
 
 def test_closed_persistent_request_uses_ordinary_cache_cleanup():

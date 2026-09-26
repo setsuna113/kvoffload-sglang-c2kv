@@ -2140,6 +2140,23 @@ class C2KVExtractReqOutput(BaseReq):
 
 
 @dataclass
+class C2KVPinLeaseReqInput(BaseReq):
+    """Hold exact selected C2KV keys across background extraction."""
+
+    owner_id: str = ""
+    action: str = "acquire"
+    key_hashes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class C2KVPinLeaseReqOutput(BaseReq):
+    owner_id: str = ""
+    action: str = ""
+    success: bool = True
+    error: str = ""
+
+
+@dataclass
 class TokenizedRepairExtractReqInput(BaseReq):
     """Internal request type for C2KV repair raw/sham KV extraction."""
 

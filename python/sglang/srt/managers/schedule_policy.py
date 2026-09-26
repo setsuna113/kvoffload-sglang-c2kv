@@ -43,6 +43,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.c2kv_raw_prefix_cache import (
+    match_c2kv_first_raw_prefix,
+    native_raw_prefix_cache_enabled,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -118,6 +122,14 @@ class SchedulePolicy:
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
     ) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
+            if native_raw_prefix_cache_enabled():
+                for req in waiting_queue:
+                    if (
+                        getattr(req, "c2kv_rounds", None) is not None
+                        and getattr(req, "c2kv_round_idx", 0) == 0
+                        and req.kv_committed_len == 0
+                    ):
+                        match_c2kv_first_raw_prefix(req, self.tree_cache)
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
@@ -141,6 +153,14 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
+            if native_raw_prefix_cache_enabled():
+                for req in waiting_queue:
+                    if (
+                        getattr(req, "c2kv_rounds", None) is not None
+                        and getattr(req, "c2kv_round_idx", 0) == 0
+                        and req.kv_committed_len == 0
+                    ):
+                        match_c2kv_first_raw_prefix(req, self.tree_cache)
             if policy == CacheAgnosticPolicy.FCFS:
                 pass
             elif policy == CacheAgnosticPolicy.LOF:
@@ -196,6 +216,10 @@ class SchedulePolicy:
             c2kv_rounds = getattr(r, "c2kv_rounds", None)
             c2kv_round_idx = getattr(r, "c2kv_round_idx", 0)
             if c2kv_rounds is not None and c2kv_round_idx < len(c2kv_rounds):
+                if native_raw_prefix_cache_enabled():
+                    if c2kv_round_idx == 0 and r.kv_committed_len == 0:
+                        match_c2kv_first_raw_prefix(r, self.tree_cache)
+                    continue
                 # Before the first gist injection, the first round is just a
                 # normal real-token prefix and can safely hit the radix cache.
                 # Later rounds already carry C2KV-injected KV slots in
@@ -586,6 +610,8 @@ class PrefillAdder:
         self._update_prefill_budget(prefix_len, trunc_len, 0)
 
     def _req_inc_lock_ref(self, req: Req):
+        if getattr(req, "c2kv_raw_prefix_lock_held", False):
+            return
         result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock

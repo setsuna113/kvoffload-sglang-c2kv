@@ -558,3 +558,112 @@ def test_generation_start_excludes_overlap_decode_reservation(monkeypatch):
                          metrics["generation_active_kv_bytes"]))
         assert req.kv_committed_len == 125 + reserved_decode_tokens
     assert measured == [(128, 125 * 64 + reference_bytes)] * 2
+
+
+def test_concurrent_generation_and_extraction_keep_request_identity(monkeypatch, tmp_path):
+    log_path = tmp_path / "concurrent.jsonl"
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.setenv("C2KV_PAPER_CONCURRENT", "1")
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY_LOG", str(log_path))
+    telemetry = _PaperTelemetry()
+    telemetry.configure(_Allocator(), _C2KVPool(), bytes_per_kv_token=4)
+    monkeypatch.setattr(paper_telemetry, "start_request", telemetry.start)
+    monkeypatch.setattr(paper_telemetry, "finish_request", telemetry.finish)
+
+    def generation(rid, tokens):
+        telemetry.start(server_request_id=rid, outer_request_id=f"outer-{rid}",
+                        phase="prefill", kind="generation")
+        req = SimpleNamespace(rid=rid, kv_committed_len=tokens,
+                              finished_reason=SimpleNamespace(to_json=lambda: {"type": "stop"}))
+        telemetry.bind_request(req)
+        return req
+
+    first = generation("first", 11)
+    second = generation("second", 22)
+    telemetry.set_phase("selection", req=first)
+    telemetry.mark_generation_start(second)
+    telemetry.mark_generation_start(first)
+
+    class Handler:
+        @paper_telemetry.measure_synchronous_request("c2kv_extract", "extraction")
+        def extract(self, recv_req):
+            assert set(telemetry._actives) == {"first", "second", "extract"}
+            telemetry.sample("extract_temporary", tensors=[torch.zeros((2, 3))],
+                             temporary_kv=True)
+            return SimpleNamespace(success=True, error=None, cache_hit=False,
+                                   gist_generation_duration_ns=7,
+                                   extraction_duration_ns=None, paper_measurement=None)
+
+    extraction = Handler().extract(SimpleNamespace(
+        rid="extract", c2kv_outer_request_id="outer-extract",
+        c2kv_measurement_phase="extraction", input_ids=[1, 2, 3]))
+    assert set(telemetry._actives) == {"first", "second"}
+    assert extraction.paper_measurement["server_request_id"] == "extract"
+    assert extraction.paper_measurement["metrics"]["gist_generation_duration_ns"] == 7
+    assert extraction.paper_measurement["metrics"]["temporary_extraction_recovery_peak_kv_tokens"] == 6
+
+    second_result = telemetry.report(second, finalize=True)
+    first_result = telemetry.report(first, finalize=True)
+    assert [second_result["server_request_id"], first_result["server_request_id"]] == ["second", "first"]
+    assert second_result["metrics"]["generation_active_kv_tokens"] == 22
+    assert first_result["metrics"]["generation_active_kv_tokens"] == 11
+    assert first_result["metrics"]["temporary_extraction_recovery_peak_kv_tokens"] == 0
+    assert second_result["metrics"]["temporary_extraction_recovery_peak_kv_tokens"] == 0
+    assert {phase["name"] for phase in first_result["phases"]} == {"prefill", "selection", "decode"}
+    assert {phase["name"] for phase in second_result["phases"]} == {"prefill", "decode"}
+    assert all(row["metrics"]["memory_scope"] == "process_shared_during_overlap"
+               for row in (first_result, second_result, extraction.paper_measurement))
+    assert all(row["metrics"]["torch_peak_scope"] == "process_since_idle_reset"
+               for row in (first_result, second_result, extraction.paper_measurement))
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert {row["server_request_id"] for row in rows} == {"first", "second", "extract"}
+    assert all(row["error"] != "superseded_by_next_request" for row in rows)
+    assert telemetry._actives == {}
+
+
+def test_concurrent_start_does_not_reset_global_peak_for_overlapping_request(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.setenv("C2KV_PAPER_CONCURRENT", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    resets = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: resets.append(1))
+    telemetry = _PaperTelemetry()
+    monkeypatch.setattr(telemetry, "_torch_snapshot", lambda: {
+        "allocated_bytes": 10, "reserved_bytes": 20,
+        "peak_allocated_bytes": 30, "peak_reserved_bytes": 40,
+    })
+    monkeypatch.setattr(telemetry, "_nvml_process_bytes", lambda: None)
+    telemetry.start(server_request_id="a", outer_request_id="a", phase="prefill", kind="generation")
+    telemetry.start(server_request_id="b", outer_request_id="b", phase="prefill", kind="generation")
+    assert len(resets) == 1
+    assert telemetry.finish(server_request_id="a")["metrics"]["memory_scope"] == "process_shared_during_overlap"
+    telemetry.finish(server_request_id="b")
+    telemetry.start(server_request_id="c", outer_request_id="c", phase="prefill", kind="generation")
+    assert len(resets) == 2
+
+
+def test_default_single_flight_still_supersedes_previous_request(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.delenv("C2KV_PAPER_CONCURRENT", raising=False)
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    telemetry = _PaperTelemetry()
+    telemetry.start(server_request_id="a", outer_request_id="a", phase="prefill", kind="generation")
+    telemetry.start(server_request_id="b", outer_request_id="b", phase="prefill", kind="generation")
+    assert telemetry.report(SimpleNamespace(rid="a"), finalize=False)["error"] == "superseded_by_next_request"
+    assert list(telemetry._actives) == ["b"]
+
+
+def test_raw_prefix_receipt_is_copied_into_the_request_ledger(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    telemetry = _PaperTelemetry()
+    req = SimpleNamespace(rid="raw-prefix", c2kv_raw_prefix_cache={
+        "enabled": True, "status": "hit", "hit_tokens": 4,
+        "inserted_tokens": 0, "prefix_tokens": 4, "reason": None})
+    telemetry.start(server_request_id=req.rid, outer_request_id=req.rid,
+                    phase="prefill", kind="generation")
+    receipt = telemetry.finish(req=req)["metrics"]["c2kv_raw_prefix_cache"]
+    assert receipt == req.c2kv_raw_prefix_cache
+    req.c2kv_raw_prefix_cache["hit_tokens"] = 0
+    assert receipt["hit_tokens"] == 4

@@ -19,6 +19,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.c2kv_raw_prefix_cache import cache_c2kv_first_raw_prefix
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.observability import paper_telemetry
 from sglang.srt.server_args import get_global_server_args
@@ -249,6 +250,9 @@ class SchedulerOutputProcessorMixin:
             stats["c2kv_query_proj_graph_eligible"] = graph_eligible
             stats["c2kv_query_proj_decode_verified"] = True
         if req is not None:
+            raw_prefix_cache = getattr(req, "c2kv_raw_prefix_cache", None)
+            if raw_prefix_cache is not None:
+                stats["c2kv_raw_prefix_cache"] = dict(raw_prefix_cache)
             layout = getattr(req, "c2kv_layout", None)
             if layout:
                 stats["c2kv_layout"] = list(layout)
@@ -514,13 +518,15 @@ class SchedulerOutputProcessorMixin:
                         # Inject all gist segments scheduled after this round
                         abort = False
                         logical_kv_start = int(batch.seq_lens_cpu[i].item())
+                        if req.c2kv_round_idx == 0:
+                            cache_c2kv_first_raw_prefix(req, self.tree_cache)
                         for seg_idx in cur_round.post_inject_seg_indices:
-                            paper_telemetry.set_phase("injection")
+                            paper_telemetry.set_phase("injection", req=req)
                             if not self._inject_c2kv_gist_segment(
                                 req, seg_idx, logical_kv_start
                             ):
-                                paper_telemetry.sample("c2kv_injection_failed")
-                                paper_telemetry.set_phase("prefill")
+                                paper_telemetry.sample("c2kv_injection_failed", req=req)
+                                paper_telemetry.set_phase("prefill", req=req)
                                 logger.warning(
                                     f"C2KV injection failed for {req.rid}; aborting"
                                 )
@@ -567,8 +573,8 @@ class SchedulerOutputProcessorMixin:
                                 self.stream_output([req], req.return_logprob)
                                 abort = True
                                 break
-                            paper_telemetry.sample("c2kv_injection_applied")
-                            paper_telemetry.set_phase("prefill")
+                            paper_telemetry.sample("c2kv_injection_applied", req=req)
+                            paper_telemetry.set_phase("prefill", req=req)
                             logical_kv_start = req.kv_committed_len
                         if abort:
                             continue
@@ -596,7 +602,10 @@ class SchedulerOutputProcessorMixin:
 
                             # Release the tree lock from this round's PrefillAdder;
                             # the next round's PrefillAdder will re-acquire it.
-                            if req.last_node is not None:
+                            if (
+                                req.last_node is not None
+                                and not getattr(req, "c2kv_raw_prefix_lock_held", False)
+                            ):
                                 self.tree_cache.dec_lock_ref(req.last_node)
 
                             self._log_c2kv_token_usage(
@@ -930,7 +939,7 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        paper_telemetry.set_phase("decode")
+        paper_telemetry.set_phase("decode", reqs=batch.reqs)
         paper_telemetry.sample("decode_step")
         if result.copy_done is not None:
             result.copy_done.synchronize()

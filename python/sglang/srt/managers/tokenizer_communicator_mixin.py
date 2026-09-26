@@ -24,6 +24,8 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     C2KVExtractReqOutput,
+    C2KVPinLeaseReqInput,
+    C2KVPinLeaseReqOutput,
     C2KVRepairExtractReqOutput,
     TokenizedExtractReqInput,
     TokenizedRepairExtractReqInput,
@@ -262,6 +264,9 @@ class TokenizerCommunicatorMixin:
         self.c2kv_extract_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.c2kv_pin_lease_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.c2kv_repair_extract_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -352,6 +357,10 @@ class TokenizerCommunicatorMixin:
                     self.c2kv_extract_communicator.handle_recv,
                 ),
                 (
+                    C2KVPinLeaseReqOutput,
+                    self.c2kv_pin_lease_communicator.handle_recv,
+                ),
+                (
                     C2KVRepairExtractReqOutput,
                     self.c2kv_repair_extract_communicator.handle_recv,
                 ),
@@ -440,6 +449,51 @@ class TokenizerCommunicatorMixin:
             projection_set=projection_set or "history",
         )
         return (await self.c2kv_extract_communicator(req))[0]
+
+    async def c2kv_pin_lease(
+        self: TokenizerManager,
+        *,
+        owner_id: str,
+        action: str,
+        key_hashes: Optional[List[str]] = None,
+    ) -> C2KVPinLeaseReqOutput:
+        """Acquire/release a selected-key lease on every scheduler DP shard."""
+        self.auto_create_handle_loop()
+        req = C2KVPinLeaseReqInput(
+            owner_id=owner_id, action=action, key_hashes=key_hashes or []
+        )
+        async def protected_call(lease_req):
+            call = asyncio.create_task(self.c2kv_pin_lease_communicator(lease_req))
+            try:
+                return await asyncio.shield(call)
+            except asyncio.CancelledError:
+                # The scheduler already owns this RPC. Drain its reply before
+                # propagating cancellation, including rollback releases.
+                await call
+                raise
+
+        try:
+            replies = await protected_call(req)
+        except asyncio.CancelledError:
+            # A sent acquire may complete after HTTP cancellation. Consume its
+            # acknowledgement and release by owner before returning control.
+            if action == "acquire":
+                await protected_call(
+                    C2KVPinLeaseReqInput(owner_id=owner_id, action="release")
+                )
+            raise
+        if action == "acquire" and not all(reply.success for reply in replies):
+            # DP shards own separate pools. Roll back shards that acquired.
+            await protected_call(
+                C2KVPinLeaseReqInput(owner_id=owner_id, action="release")
+            )
+        error = next((reply.error for reply in replies if not reply.success), "")
+        return C2KVPinLeaseReqOutput(
+            owner_id=owner_id,
+            action=action,
+            success=all(reply.success for reply in replies),
+            error=error,
+        )
 
     async def c2kv_repair_extract(
         self: TokenizerManager,

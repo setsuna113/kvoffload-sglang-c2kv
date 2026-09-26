@@ -120,6 +120,7 @@ def test_capability_advertises_both_named_profiles():
     namespace = _load_functions(
         "_c2kv_native_capability",
         "_c2kv_tool_gist_capability",
+        get_bool_env_var=lambda name: False,
         _global_state=SimpleNamespace(tokenizer_manager=manager),
         canonical_model_binding=lambda **kwargs: {
             **kwargs,
@@ -132,6 +133,20 @@ def test_capability_advertises_both_named_profiles():
     )
     capability = namespace["_c2kv_native_capability"]()
     assert capability["sampling_profiles"] == ["greedy-v1", "acebench-agent-v1"]
+    assert capability["serving_features"] == {
+        "raw_prefix_cache": None,
+        "background_extras": None,
+    }
+    namespace["get_bool_env_var"] = lambda name: True
+    assert namespace["_c2kv_native_capability"]()["serving_features"] == {
+        "raw_prefix_cache": "raw-prefix-v1",
+        "background_extras": "selected-first-response-barrier-v1",
+    }
+    server_args.disable_finished_insert = True
+    assert namespace["_c2kv_native_capability"]()["serving_features"]["raw_prefix_cache"] is None
+    server_args.disable_finished_insert = False
+    server_args.speculative_algorithm = "EAGLE"
+    assert namespace["_c2kv_native_capability"]()["serving_features"]["raw_prefix_cache"] is None
 
 
 @pytest.mark.parametrize("tool_layout", ["prefix_chunk", "anchored_segment", "raw_segment"])
@@ -192,7 +207,10 @@ def test_endpoint_forwards_acebench_sampling_to_generation_request(shadow_enable
     namespace = _load_functions(
         "_c2kv_native_sampling_params",
         "_c2kv_native_whole_full_measurement",
+        "_c2kv_native_background_extras_fallback_reason",
+        "_c2kv_native_background_extras_eligible",
         "v1_c2kv_native_generate",
+        get_bool_env_var=lambda name: False,
         _global_state=SimpleNamespace(tokenizer_manager=manager),
         _c2kv_native_capability=lambda: {
             "enabled": True,

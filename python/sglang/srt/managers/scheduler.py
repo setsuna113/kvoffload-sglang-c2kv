@@ -94,6 +94,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     CheckWeightsReqInput,
+    C2KVPinLeaseReqInput,
+    C2KVPinLeaseReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
@@ -902,6 +904,7 @@ class Scheduler(
             )
 
         self.c2kv_pool = None
+        self.c2kv_native_pin_leases = {}
         if server_args.enable_c2kv:
             from sglang.srt.mem_cache.c2kv_pool import (
                 C2KVPool,
@@ -1381,6 +1384,7 @@ class Scheduler(
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (TokenizedExtractReqInput, self.handle_extract_request),
+                (C2KVPinLeaseReqInput, self.handle_c2kv_pin_lease),
                 (
                     TokenizedRepairExtractReqInput,
                     self.handle_repair_extract_request,
@@ -2309,6 +2313,51 @@ class Scheduler(
             and not req.kv_committed_freed
         ):
             release_kv_cache(req, self.tree_cache, is_insert=False)
+
+    def handle_c2kv_pin_lease(self, recv_req: C2KVPinLeaseReqInput):
+        """Atomically pin selected keys for one native request lifecycle."""
+        owner_id = recv_req.owner_id
+        action = recv_req.action
+
+        def output(success=True, error=""):
+            return C2KVPinLeaseReqOutput(
+                owner_id=owner_id, action=action, success=success, error=error
+            )
+
+        if not owner_id:
+            return output(False, "C2KV_PIN_LEASE_OWNER_REQUIRED")
+        if action == "release":
+            keys = self.c2kv_native_pin_leases.pop(owner_id, None)
+            if keys is not None:
+                self.c2kv_pool.unpin_many(keys)
+            return output()
+        if action != "acquire":
+            return output(False, "C2KV_PIN_LEASE_ACTION_INVALID")
+        if self.c2kv_pool is None:
+            return output(False, "C2KV not enabled.")
+        keys = tuple(dict.fromkeys(recv_req.key_hashes))
+        if not keys:
+            return output(False, "C2KV_PIN_LEASE_KEYS_REQUIRED")
+        existing = self.c2kv_native_pin_leases.get(owner_id)
+        local_ready = (
+            (existing is None or existing == keys)
+            and all(key in self.c2kv_pool._cache for key in keys)
+        )
+        if self.tp_size > 1 and torch.distributed.is_initialized():
+            all_ready = torch.tensor([int(local_ready)], dtype=torch.long)
+            torch.distributed.all_reduce(
+                all_ready,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            local_ready = bool(all_ready.item())
+        if not local_ready:
+            return output(False, "C2KV_PIN_LEASE_KEYS_MISSING_OR_OWNER_CONFLICT")
+        if existing is None:
+            if not self.c2kv_pool.pin_many(keys):
+                return output(False, "C2KV_PIN_LEASE_KEYS_MISSING")
+            self.c2kv_native_pin_leases[owner_id] = keys
+        return output()
 
     @paper_telemetry.measure_synchronous_request("c2kv_extract", "extraction")
     def handle_extract_request(self, recv_req: "TokenizedExtractReqInput"):
@@ -3699,6 +3748,7 @@ class Scheduler(
 
         paper_telemetry.sample(
             "pyramidkv_reference_state_materialized",
+            req=req,
             tensors=[
                 tensor
                 for layer in state.layers.values()
@@ -3817,6 +3867,7 @@ class Scheduler(
 
         paper_telemetry.sample(
             "agentkv_reference_state_materialized",
+            req=req,
             tensors=[
                 tensor
                 for layer in state.layers.values()
@@ -3950,6 +4001,7 @@ class Scheduler(
 
         paper_telemetry.sample(
             "commitkv_reference_state_materialized",
+            req=req,
             tensors=[
                 tensor
                 for layer in state.layers.values()
@@ -3977,7 +4029,7 @@ class Scheduler(
         config = getattr(req, "history_kv_eviction", None)
         if not isinstance(config, dict):
             return True
-        paper_telemetry.set_phase("selection")
+        paper_telemetry.set_phase("selection", req=req)
         session_error = _persistent_history_session_error(req, config)
         if session_error is not None:
             report = getattr(req, "kv_memory_report", None)
@@ -4001,8 +4053,8 @@ class Scheduler(
             req.persistent_history_eviction_failed = True
             req.to_finish = _FA(session_error)
             req.check_finished()
-            paper_telemetry.sample("history_kv_eviction_failed")
-            paper_telemetry.set_phase("prefill")
+            paper_telemetry.sample("history_kv_eviction_failed", req=req)
+            paper_telemetry.set_phase("prefill", req=req)
             return False
         score_info = getattr(req, "history_kv_selection_scores", None)
         selection_query_tokens_observed = (
@@ -4173,8 +4225,8 @@ class Scheduler(
             req.persistent_history_eviction_failed = True
             req.to_finish = _FA(error or "Physical history KV eviction failed")
             req.check_finished()
-            paper_telemetry.sample("history_kv_eviction_failed")
-            paper_telemetry.set_phase("prefill")
+            paper_telemetry.sample("history_kv_eviction_failed", req=req)
+            paper_telemetry.set_phase("prefill", req=req)
             return False
 
         if reference_state is not None:
@@ -4256,8 +4308,8 @@ class Scheduler(
             if not (0 <= history_start <= history_end <= len(virtual_ids)):
                 req.to_finish = _FA("PERSISTENT_HISTORY_ACTIVE_SEQUENCE_INVALID")
                 req.check_finished()
-                paper_telemetry.sample("history_kv_active_sequence_invalid")
-                paper_telemetry.set_phase("prefill")
+                paper_telemetry.sample("history_kv_active_sequence_invalid", req=req)
+                paper_telemetry.set_phase("prefill", req=req)
                 return False
             active_input_ids = (
                 virtual_ids[:history_start]
@@ -4272,8 +4324,8 @@ class Scheduler(
                     f"committed_len={req.kv_committed_len}"
                 )
                 req.check_finished()
-                paper_telemetry.sample("history_kv_active_sequence_length_mismatch")
-                paper_telemetry.set_phase("prefill")
+                paper_telemetry.sample("history_kv_active_sequence_length_mismatch", req=req)
+                paper_telemetry.set_phase("prefill", req=req)
                 return False
             req.c2kv_persistent_active_input_ids = active_input_ids
             req.c2kv_virtual_input_ids = list(active_input_ids)
@@ -4350,8 +4402,8 @@ class Scheduler(
             req=req,
             **result.as_dict(),
         )
-        paper_telemetry.sample("history_kv_eviction_applied")
-        paper_telemetry.set_phase("prefill")
+        paper_telemetry.sample("history_kv_eviction_applied", req=req)
+        paper_telemetry.set_phase("prefill", req=req)
         return True
 
     def _apply_reference_decode_checkpoint(self, req: "Req") -> int:
