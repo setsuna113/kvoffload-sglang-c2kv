@@ -54,6 +54,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.mem_cache.c2kv_semantics import is_c2kv_graph_compatible
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -579,6 +580,11 @@ class CudaGraphRunner:
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
+        self.c2kv_base_query_graph = (
+            get_bool_env_var("C2KV_BASE_QUERY_GRAPH")
+            and getattr(model_runner.server_args, "enable_c2kv", False)
+            and not getattr(model_runner.model, "full_length_pic", False)
+        )
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -680,6 +686,7 @@ class CudaGraphRunner:
             enable_c2kv_query_projection=(
                 getattr(model_runner.server_args, "enable_c2kv", False)
                 and not getattr(model_runner.model, "full_length_pic", False)
+                and not self.c2kv_base_query_graph
             ),
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
@@ -715,6 +722,9 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        if self.c2kv_base_query_graph and not is_c2kv_graph_compatible(forward_batch):
+            return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -1198,6 +1208,11 @@ class CudaGraphRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if self.c2kv_base_query_graph and not is_c2kv_graph_compatible(forward_batch):
+            raise RuntimeError(
+                "C2KV base-query CUDA graph cannot replay a projection mask"
+            )
+
         self.deepep_adapter.replay()
 
         if not skip_attn_backend_init:

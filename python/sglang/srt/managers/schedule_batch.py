@@ -920,6 +920,8 @@ class Req(ReqDllmMixin):
         self.c2kv_requeued = False              # True while waiting for next round
         self.c2kv_pinned_keys = None        # Unique C2KV keys pinned while rounds inject
         self.c2kv_tree_cache_prefix_len = 0  # Prefix slots owned by radix/tree cache
+        self.c2kv_raw_prefix_lock_held = False
+        self.c2kv_raw_prefix_cache = None
         self.c2kv_kv_memory_hint = None
         self.history_kv_eviction = None
         self.history_kv_eviction_result = None
@@ -1375,6 +1377,9 @@ class Req(ReqDllmMixin):
             return
 
     def reset_for_retract(self):
+        self.c2kv_raw_prefix_lock_held = False
+        self.c2kv_tree_cache_prefix_len = 0
+        self.c2kv_raw_prefix_cache = None
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1

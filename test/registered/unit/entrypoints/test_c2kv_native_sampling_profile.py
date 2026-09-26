@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
@@ -32,6 +33,7 @@ def _load_functions(*names, **bindings):
     namespace = {
         "Any": Any,
         "Dict": Dict,
+        "time": time,
         "C2KVNativePackedGenerateRequest": object,
         "Request": object,
         **bindings,
@@ -120,6 +122,7 @@ def test_capability_advertises_both_named_profiles():
     namespace = _load_functions(
         "_c2kv_native_capability",
         "_c2kv_tool_gist_capability",
+        get_bool_env_var=lambda name: False,
         _global_state=SimpleNamespace(tokenizer_manager=manager),
         canonical_model_binding=lambda **kwargs: {
             **kwargs,
@@ -132,6 +135,41 @@ def test_capability_advertises_both_named_profiles():
     )
     capability = namespace["_c2kv_native_capability"]()
     assert capability["sampling_profiles"] == ["greedy-v1", "acebench-agent-v1"]
+    assert capability["serving_features"] == {
+        "raw_prefix_cache": None,
+        "background_extras": None,
+        "bulk_cache_lookup": None,
+        "bulk_first_miss": None,
+        "cross_turn_prewarm": None,
+        "async_compression": None,
+    }
+    namespace["get_bool_env_var"] = lambda name: True
+    assert namespace["_c2kv_native_capability"]()["serving_features"] == {
+        "raw_prefix_cache": "raw-prefix-v1",
+        "background_extras": "selected-first-response-barrier-v1",
+        "bulk_cache_lookup": "bulk-cache-lookup-v1",
+        "bulk_first_miss": "bulk-first-miss-v1",
+        "cross_turn_prewarm": "cross-turn-prewarm-v1",
+        "async_compression": "nonblocking-history-v1",
+    }
+    namespace["get_bool_env_var"] = lambda name: name == "C2KV_NATIVE_ASYNC_COMPRESSION"
+    features = namespace["_c2kv_native_capability"]()["serving_features"]
+    assert features["cross_turn_prewarm"] is None
+    assert features["async_compression"] == "nonblocking-history-v1"
+    assert features["bulk_first_miss"] is None
+    namespace["get_bool_env_var"] = lambda name: True
+    server_args.disable_finished_insert = True
+    assert namespace["_c2kv_native_capability"]()["serving_features"]["raw_prefix_cache"] is None
+    server_args.disable_finished_insert = False
+    server_args.speculative_algorithm = "EAGLE"
+    assert namespace["_c2kv_native_capability"]()["serving_features"]["raw_prefix_cache"] is None
+    server_args.tokenizer_worker_num = 2
+    assert namespace["_c2kv_native_capability"]()["serving_features"]["cross_turn_prewarm"] is None
+    assert namespace["_c2kv_native_capability"]()["serving_features"]["async_compression"] is None
+    server_args.tokenizer_worker_num = 1
+    server_args.dp_size = 2
+    assert namespace["_c2kv_native_capability"]()["serving_features"]["cross_turn_prewarm"] is None
+    assert namespace["_c2kv_native_capability"]()["serving_features"]["async_compression"] is None
 
 
 @pytest.mark.parametrize("tool_layout", ["prefix_chunk", "anchored_segment", "raw_segment"])
@@ -156,8 +194,20 @@ def test_tool_native_full_denominator_needs_client_renderer_count(tool_layout):
 
 
 @pytest.mark.parametrize("shadow_enabled", [False, True])
-def test_endpoint_forwards_acebench_sampling_to_generation_request(shadow_enabled):
+@pytest.mark.parametrize("compact_response", [False, True])
+def test_endpoint_forwards_acebench_sampling_to_generation_request(
+    shadow_enabled, compact_response
+):
     captured = {}
+    paper_measurement = {
+        "duration_ns": 123,
+        "metrics": {"gist_generation_duration_ns": 0},
+    }
+    runtime_stats = {
+        "paper_measurement": paper_measurement,
+        "c2kv_raw_prefix_cache": {"status": "cached", "hit_tokens": 7},
+        "kv_resident_tokens": 9,
+    }
 
     async def generate_request(request, raw_request):
         captured["sampling_params"] = request.sampling_params
@@ -169,6 +219,7 @@ def test_endpoint_forwards_acebench_sampling_to_generation_request(shadow_enable
             "text": "answer",
             "meta_info": {
                 "output_token_logprobs": [(-0.5, 42)],
+                "kv_runtime_stats": runtime_stats,
                 **({"hidden_states": [[1.0, 2.0]]} if shadow_enabled else {}),
             },
         }
@@ -192,7 +243,12 @@ def test_endpoint_forwards_acebench_sampling_to_generation_request(shadow_enable
     namespace = _load_functions(
         "_c2kv_native_sampling_params",
         "_c2kv_native_whole_full_measurement",
+        "_c2kv_native_background_extras_fallback_reason",
+        "_c2kv_native_background_extras_eligible",
         "v1_c2kv_native_generate",
+        get_bool_env_var=lambda name: (
+            compact_response and name == "C2KV_NATIVE_COMPACT_RESPONSE"
+        ),
         _global_state=SimpleNamespace(tokenizer_manager=manager),
         _c2kv_native_capability=lambda: {
             "enabled": True,
@@ -245,6 +301,23 @@ def test_endpoint_forwards_acebench_sampling_to_generation_request(shadow_enable
     assert captured["whole_full"] == 17
     assert captured["whole_full_source"] == "client_native_full_renderer"
     assert captured["return_hidden_states"] is shadow_enabled
+    assert response["paper_measurement"] == paper_measurement
+    assert response["sglang_runtime"] == (
+        {
+            "c2kv_raw_prefix_cache": runtime_stats["c2kv_raw_prefix_cache"],
+            "kv_resident_tokens": 9,
+        }
+        if compact_response
+        else runtime_stats
+    )
+    assert response["telemetry"]["generation"] == {
+        "outer_request_id": response["outer_request_id"],
+        "server_request_id": response["rid"],
+        "phase": "c2kv_native:generation",
+        **({} if compact_response else {"paper_measurement": paper_measurement}),
+    }
+    assert "execution_timing" in response["telemetry"]
+    assert runtime_stats["paper_measurement"] is paper_measurement
     assert response["sampling_profile"] == "acebench-agent-v1"
     assert response["output_ids"] == [42]
     assert (response["shadow_features"] is not None) is shadow_enabled

@@ -6,6 +6,7 @@ import copy
 import unittest
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Generic, TypeVar
 
 
@@ -40,6 +41,30 @@ exec(compile(module, str(SOURCE), "exec"), namespace)
 Communicator = namespace["_Communicator"]
 
 
+extract_method = next(
+    node
+    for cls in tree.body
+    if isinstance(cls, ast.ClassDef) and cls.name == "TokenizerCommunicatorMixin"
+    for node in cls.body
+    if isinstance(node, ast.AsyncFunctionDef) and node.name == "c2kv_extract"
+)
+extract_module = ast.Module(
+    body=[
+        ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        ),
+        extract_method,
+    ],
+    type_ignores=[],
+)
+ast.fix_missing_locations(extract_module)
+extract_namespace = {
+    "TokenizedExtractReqInput": lambda **kwargs: SimpleNamespace(**kwargs),
+}
+exec(compile(extract_module, str(SOURCE), "exec"), extract_namespace)
+c2kv_extract = extract_namespace["c2kv_extract"]
+
+
 class Sender:
     def __init__(self):
         self.sent = []
@@ -49,6 +74,33 @@ class Sender:
 
 
 class TestTokenizerCommunicator(unittest.IsolatedAsyncioTestCase):
+    async def test_background_extraction_bypasses_batch_collector(self):
+        direct_requests = []
+        packed_requests = []
+
+        async def direct(req):
+            direct_requests.append(req)
+            return [SimpleNamespace(success=True)]
+
+        async def packed(req):
+            packed_requests.append(req)
+            return SimpleNamespace(success=True)
+
+        manager = SimpleNamespace(
+            auto_create_handle_loop=lambda: None,
+            c2kv_gist_batch_size=4,
+            c2kv_extract_communicator=direct,
+            c2kv_extract_batch_collector=SimpleNamespace(submit=packed),
+        )
+        await c2kv_extract(manager, [1], "", rid="foreground")
+        await c2kv_extract(
+            manager, [2], "", rid="background", background_extraction=True
+        )
+        self.assertEqual([req.rid for req in packed_requests], ["foreground"])
+        self.assertFalse(packed_requests[0].background_extraction)
+        self.assertEqual([req.rid for req in direct_requests], ["background"])
+        self.assertTrue(direct_requests[0].background_extraction)
+
     async def test_queueing_call_keeps_fifo_and_fan_out_results(self):
         sender = Sender()
         communicator = Communicator(sender, fan_out=2)

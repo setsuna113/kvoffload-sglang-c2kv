@@ -1050,8 +1050,8 @@ def test_closed_persistent_session_aborts_before_physical_eviction(monkeypatch):
     monkeypatch.setitem(sys.modules, schedule_batch.__name__, schedule_batch)
     events = []
     telemetry = SimpleNamespace(
-        set_phase=lambda phase: events.append(("phase", phase)),
-        sample=lambda event: events.append(("sample", event)),
+        set_phase=lambda phase, *, req: events.append(("phase", phase, req)),
+        sample=lambda event, *, req: events.append(("sample", event, req)),
     )
     apply_eviction = method(
         scheduler,
@@ -1087,11 +1087,12 @@ def test_closed_persistent_session_aborts_before_physical_eviction(monkeypatch):
     assert req.kv_memory_report["persistent_history_session_error"] == (
         "PERSISTENT_HISTORY_SESSION_UNAVAILABLE"
     )
-    assert events == [
+    assert [(kind, value) for kind, value, _ in events] == [
         ("phase", "selection"),
         ("sample", "history_kv_eviction_failed"),
         ("phase", "prefill"),
     ]
+    assert all(event_req is req for _, _, event_req in events)
 
 
 @pytest.mark.parametrize("method_name", ["commitkv", "pyramidkv"])
@@ -1119,9 +1120,10 @@ def test_reference_recovery_with_no_selectable_history_keeps_empty_state(
         "sglang.srt.mem_cache.history_kv_lifecycle",
         ledger,
     )
+    observed_phases = []
     telemetry = SimpleNamespace(
-        set_phase=lambda *_: None,
-        sample=lambda *_: None,
+        set_phase=lambda phase, **kwargs: observed_phases.append((phase, kwargs)),
+        sample=lambda *args, **kwargs: None,
     )
     apply_eviction = method(
         ROOT / "python/sglang/srt/managers/scheduler.py",
@@ -1192,6 +1194,7 @@ def test_reference_recovery_with_no_selectable_history_keeps_empty_state(
 
     assert apply_eviction(owner, req)
     assert req.history_kv_reference_state is empty_state
+    assert observed_phases[0] == ("selection", {"req": req})
     assert req.history_kv_resident_positions == [27, 28]
     assert req.c2kv_persistent_active_input_ids == [100, 101]
     assert req.kv_memory_report["selection_query_tokens_observed"] == 0

@@ -2806,6 +2806,57 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             projection_set=projection_set,
         )
 
+    def create_c2kv_extract_stepper(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        compression_ratio: int,
+        projection_set: str = "history",
+    ):
+        """Create a TP1 Qwen3 gist pass; GPU work starts with step()."""
+        if self.tp_size != 1:
+            raise NotImplementedError("Incremental C2KV gist extraction requires TP1.")
+        if self.model.__class__.__name__ != "Qwen3ForCausalLM":
+            raise NotImplementedError(
+                "Incremental C2KV gist extraction supports Qwen3ForCausalLM only."
+            )
+        if getattr(self.model, "full_length_pic", False):
+            raise NotImplementedError(
+                "Incremental C2KV gist extraction does not support PIC."
+            )
+        compression_ratio = self.get_c2kv_compression_ratio(compression_ratio)
+        return self.model.create_gist_stepper(
+            input_ids,
+            attention_mask,
+            ratio=compression_ratio,
+            projection_set=projection_set,
+        )
+
+    def forward_c2kv_extract_many(
+        self,
+        input_id_lists: List[List[int]],
+        compression_ratio: int,
+        projection_set: str = "history",
+    ):
+        """Prototype packed extraction for independent Qwen3 gist documents.
+
+        Returns a list of singleton-shaped (per-layer KV, mask, positions)
+        tuples in input order. All documents use the same effective ratio and
+        projection set; this entry point does not modify the scheduler.
+        """
+        if self.model.__class__.__name__ != "Qwen3ForCausalLM":
+            raise NotImplementedError(
+                "Packed C2KV extraction currently supports Qwen3ForCausalLM only."
+            )
+        if getattr(self.model, "full_length_pic", False):
+            raise NotImplementedError("Packed C2KV extraction does not support PIC.")
+        compression_ratio = self.get_c2kv_compression_ratio(compression_ratio)
+        return self.model.generate_gist_many(
+            input_id_lists,
+            ratio=compression_ratio,
+            projection_set=projection_set,
+        )
+
     def forward_c2kv_repair_extract(
         self,
         input_ids: torch.Tensor,

@@ -2122,6 +2122,8 @@ class TokenizedExtractReqInput(BaseReq):
     # Gist encoder: "history" (served checkpoint) or "tool"
     # (--c2kv-tool-gist-weights).  Part of the cache key when not "history".
     projection_set: str = "history"
+    # Internal hint for opt-in prewarm extraction during native generation.
+    background_extraction: bool = False
 
 
 @dataclass
@@ -2134,9 +2136,70 @@ class C2KVExtractReqOutput(BaseReq):
     cache_hit: bool = False
     extraction_duration_ns: Optional[int] = None
     gist_generation_duration_ns: Optional[int] = None
+    # Shared encoder time belongs to one batch, never to each item's cost sum.
+    extraction_batch_id: Optional[str] = None
+    extraction_batch_size: Optional[int] = None
+    shared_gist_generation_duration_ns: Optional[int] = None
     error: str = ""
     success: bool = True
     paper_measurement: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class C2KVExtractBatchReqInput(BaseReq):
+    """Bounded FIFO envelope of extraction or fused hit-prefix requests."""
+
+    items: List[Union[TokenizedExtractReqInput, "C2KVBulkCacheLookupReqInput"]] = field(
+        default_factory=list
+    )
+
+
+@dataclass
+class C2KVExtractBatchReqOutput(BaseReq):
+    """Results retain the envelope's item order and per-chunk accounting."""
+
+    items: List[Union[C2KVExtractReqOutput, "C2KVBulkCacheLookupReqOutput"]] = field(
+        default_factory=list
+    )
+    success: bool = True
+    error: str = ""
+    paper_measurement: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class C2KVBulkCacheLookupReqInput(BaseReq):
+    """Probe a bounded, ordered prefix of native extraction cache entries."""
+
+    items: List[TokenizedExtractReqInput] = field(default_factory=list)
+    materialize_first_miss: bool = False
+
+
+@dataclass
+class C2KVBulkCacheLookupReqOutput(BaseReq):
+    """Hits before the first miss and, optionally, its extraction result."""
+
+    hits: List[C2KVExtractReqOutput] = field(default_factory=list)
+    first_miss_index: int = 0
+    first_miss_result: Optional[C2KVExtractReqOutput] = None
+    success: bool = True
+    error: str = ""
+
+
+@dataclass
+class C2KVPinLeaseReqInput(BaseReq):
+    """Hold exact selected C2KV keys across background extraction."""
+
+    owner_id: str = ""
+    action: str = "acquire"
+    key_hashes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class C2KVPinLeaseReqOutput(BaseReq):
+    owner_id: str = ""
+    action: str = ""
+    success: bool = True
+    error: str = ""
 
 
 @dataclass

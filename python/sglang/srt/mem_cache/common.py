@@ -518,6 +518,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
         if req.last_node is not None:
             tree_cache.dec_lock_ref(req.last_node)
+        req.c2kv_raw_prefix_lock_held = False
         tree_cache.req_to_token_pool.free(req)
         req.kv_committed_freed = True
         req.kv_overallocated_freed = True

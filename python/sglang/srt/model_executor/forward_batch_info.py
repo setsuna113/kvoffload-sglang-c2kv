@@ -608,8 +608,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # C2KV position corrections: shift positions by the original-compressed gap
         if batch.c2kv_position_corrections is not None:
             corr = torch.tensor(
-                batch.c2kv_position_corrections, dtype=torch.int64, device=device
-            )
+                batch.c2kv_position_corrections, dtype=torch.int64
+            ).to(device, non_blocking=True)
             if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
                 ret.positions = ret.positions + corr
             elif ret.positions is not None and batch.extend_seq_lens is not None:

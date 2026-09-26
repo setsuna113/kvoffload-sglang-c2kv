@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import os
 import time
 import uuid
 from contextlib import nullcontext
@@ -20,10 +21,17 @@ from typing import (
 import fastapi
 import zmq
 
+from sglang.srt.managers.c2kv_extract_batch import C2KVExtractBatchCollector
 from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    C2KVBulkCacheLookupReqInput,
+    C2KVBulkCacheLookupReqOutput,
+    C2KVExtractBatchReqInput,
+    C2KVExtractBatchReqOutput,
     C2KVExtractReqOutput,
+    C2KVPinLeaseReqInput,
+    C2KVPinLeaseReqOutput,
     C2KVRepairExtractReqOutput,
     TokenizedExtractReqInput,
     TokenizedRepairExtractReqInput,
@@ -262,6 +270,32 @@ class TokenizerCommunicatorMixin:
         self.c2kv_extract_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        try:
+            self.c2kv_gist_batch_size = int(os.getenv("C2KV_GIST_BATCH_SIZE", "1"))
+        except ValueError as exc:
+            raise ValueError("C2KV_GIST_BATCH_SIZE must be an integer from 1 to 4") from exc
+        if not 1 <= self.c2kv_gist_batch_size <= 4:
+            raise ValueError("C2KV_GIST_BATCH_SIZE must be an integer from 1 to 4")
+        if self.c2kv_gist_batch_size > 1 and server_args.dp_size != 1:
+            raise ValueError("C2KV_GIST_BATCH_SIZE > 1 requires dp_size=1")
+        self.c2kv_extract_batch_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.c2kv_extract_batch_collector = (
+            C2KVExtractBatchCollector(
+                self.c2kv_extract_batch_communicator,
+                C2KVExtractBatchReqInput,
+                self.c2kv_gist_batch_size,
+            )
+            if self.c2kv_gist_batch_size > 1
+            else None
+        )
+        self.c2kv_bulk_cache_lookup_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.c2kv_pin_lease_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.c2kv_repair_extract_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -352,6 +386,18 @@ class TokenizerCommunicatorMixin:
                     self.c2kv_extract_communicator.handle_recv,
                 ),
                 (
+                    C2KVExtractBatchReqOutput,
+                    self.c2kv_extract_batch_communicator.handle_recv,
+                ),
+                (
+                    C2KVBulkCacheLookupReqOutput,
+                    self.c2kv_bulk_cache_lookup_communicator.handle_recv,
+                ),
+                (
+                    C2KVPinLeaseReqOutput,
+                    self.c2kv_pin_lease_communicator.handle_recv,
+                ),
+                (
                     C2KVRepairExtractReqOutput,
                     self.c2kv_repair_extract_communicator.handle_recv,
                 ),
@@ -424,6 +470,7 @@ class TokenizerCommunicatorMixin:
         outer_request_id: Optional[str] = None,
         measurement_phase: Optional[str] = None,
         projection_set: str = "history",
+        background_extraction: bool = False,
     ) -> C2KVExtractReqOutput:
         """Run C2KV gist extraction via the scheduler."""
         import uuid
@@ -435,11 +482,110 @@ class TokenizerCommunicatorMixin:
             input_text=input_text,
             compression_ratio=compression_ratio,
             allow_cache_miss=allow_cache_miss,
+            background_extraction=background_extraction,
             c2kv_outer_request_id=outer_request_id,
             c2kv_measurement_phase=measurement_phase,
             projection_set=projection_set or "history",
         )
+        if not background_extraction and getattr(self, "c2kv_gist_batch_size", 1) > 1:
+            return await self.c2kv_extract_batch_collector.submit(req)
         return (await self.c2kv_extract_communicator(req))[0]
+
+    async def c2kv_bulk_cache_lookup(
+        self: TokenizerManager,
+        items: List[Dict[str, Any]],
+        *,
+        outer_request_id: Optional[str] = None,
+        measurement_phase: Optional[str] = None,
+        materialize_first_miss: bool = False,
+    ) -> C2KVBulkCacheLookupReqOutput:
+        """Return the cache-hit prefix and optionally extract its first miss."""
+        import uuid
+
+        if not 1 <= len(items) <= 32:
+            raise ValueError("C2KV bulk cache lookup requires 1 to 32 items")
+        self.auto_create_handle_loop()
+        batch_enabled = getattr(self, "c2kv_gist_batch_size", 1) > 1
+        req = C2KVBulkCacheLookupReqInput(
+            rid=uuid.uuid4().hex,
+            materialize_first_miss=materialize_first_miss,
+            items=[
+                TokenizedExtractReqInput(
+                    rid=item["rid"],
+                    input_ids=list(item["input_ids"]),
+                    input_text="",
+                    compression_ratio=item["compression_ratio"],
+                    allow_cache_miss=(
+                        bool(item.get("allow_cache_miss", False))
+                        if materialize_first_miss
+                        else False
+                    ),
+                    projection_set=item["projection_set"],
+                    c2kv_outer_request_id=outer_request_id,
+                    c2kv_measurement_phase=measurement_phase,
+                )
+                for item in items
+            ]
+        )
+        if batch_enabled and materialize_first_miss:
+            # Queue the lookup before the first miss so concurrent requests can
+            # reach the same scheduler envelope even while an extract is busy.
+            return await self.c2kv_extract_batch_collector.submit(req)
+
+        call = asyncio.create_task(self.c2kv_bulk_cache_lookup_communicator(req))
+        try:
+            reply = (await asyncio.shield(call))[0]
+        except asyncio.CancelledError:
+            # A cancelled HTTP request must not leave a bulk reply waiting in
+            # this communicator's slot before the next native request.
+            await call
+            raise
+        return reply
+
+    async def c2kv_pin_lease(
+        self: TokenizerManager,
+        *,
+        owner_id: str,
+        action: str,
+        key_hashes: Optional[List[str]] = None,
+    ) -> C2KVPinLeaseReqOutput:
+        """Acquire/release a selected-key lease on every scheduler DP shard."""
+        self.auto_create_handle_loop()
+        req = C2KVPinLeaseReqInput(
+            owner_id=owner_id, action=action, key_hashes=key_hashes or []
+        )
+        async def protected_call(lease_req):
+            call = asyncio.create_task(self.c2kv_pin_lease_communicator(lease_req))
+            try:
+                return await asyncio.shield(call)
+            except asyncio.CancelledError:
+                # The scheduler already owns this RPC. Drain its reply before
+                # propagating cancellation, including rollback releases.
+                await call
+                raise
+
+        try:
+            replies = await protected_call(req)
+        except asyncio.CancelledError:
+            # A sent acquire may complete after HTTP cancellation. Consume its
+            # acknowledgement and release by owner before returning control.
+            if action == "acquire":
+                await protected_call(
+                    C2KVPinLeaseReqInput(owner_id=owner_id, action="release")
+                )
+            raise
+        if action == "acquire" and not all(reply.success for reply in replies):
+            # DP shards own separate pools. Roll back shards that acquired.
+            await protected_call(
+                C2KVPinLeaseReqInput(owner_id=owner_id, action="release")
+            )
+        error = next((reply.error for reply in replies if not reply.success), "")
+        return C2KVPinLeaseReqOutput(
+            owner_id=owner_id,
+            action=action,
+            success=all(reply.success for reply in replies),
+            error=error,
+        )
 
     async def c2kv_repair_extract(
         self: TokenizerManager,

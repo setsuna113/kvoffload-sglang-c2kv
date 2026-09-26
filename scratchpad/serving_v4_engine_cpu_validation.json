@@ -1,0 +1,104 @@
+{
+  "schema": "serving-v4-engine-migration-cpu-validation-v1",
+  "v4_head": "4189e2f123a423f32d8463c02fcad0f47ff9aee0",
+  "merge_base": "b6aaca177fc52237e67216da3820644c5a086479",
+  "donor_head": "68373c189ae868a02ecd0217635dd10d26db1395",
+  "donor_manifest_sha256": "b09091fe9c21f08a3c32bf885fc09f09f52277d70064d74919941e7e68b6c816",
+  "source_files": [
+    "python/sglang/srt/entrypoints/http_server.py",
+    "python/sglang/srt/managers/c2kv_async_extract.py",
+    "python/sglang/srt/managers/c2kv_extract_batch.py",
+    "python/sglang/srt/managers/c2kv_prewarm.py",
+    "python/sglang/srt/managers/io_struct.py",
+    "python/sglang/srt/managers/schedule_batch.py",
+    "python/sglang/srt/managers/schedule_policy.py",
+    "python/sglang/srt/managers/scheduler.py",
+    "python/sglang/srt/managers/scheduler_output_processor_mixin.py",
+    "python/sglang/srt/managers/tokenizer_communicator_mixin.py",
+    "python/sglang/srt/mem_cache/c2kv_raw_prefix_cache.py",
+    "python/sglang/srt/mem_cache/common.py",
+    "python/sglang/srt/mem_cache/gist_utils.py",
+    "python/sglang/srt/model_executor/cuda_graph_runner.py",
+    "python/sglang/srt/model_executor/forward_batch_info.py",
+    "python/sglang/srt/model_executor/model_runner.py",
+    "python/sglang/srt/models/qwen3.py",
+    "python/sglang/srt/observability/paper_telemetry.py",
+    "python/sglang/srt/sampling/penaltylib/min_new_tokens.py"
+  ],
+  "test_files": [
+    "test/registered/unit/entrypoints/test_c2kv_native_background_extras.py",
+    "test/registered/unit/entrypoints/test_c2kv_native_bulk_cache_lookup.py",
+    "test/registered/unit/entrypoints/test_c2kv_native_prewarm_api.py",
+    "test/registered/unit/entrypoints/test_c2kv_native_sampling_profile.py",
+    "test/registered/unit/managers/test_c2kv_async_extract.py",
+    "test/registered/unit/managers/test_c2kv_extract_batch_collector.py",
+    "test/registered/unit/managers/test_tokenizer_communicator.py",
+    "test/registered/unit/mem_cache/test_c2kv_extract_batch.py",
+    "test/registered/unit/mem_cache/test_c2kv_flex_kernel_options.py",
+    "test/registered/unit/mem_cache/test_c2kv_gist_stepper.py",
+    "test/registered/unit/mem_cache/test_c2kv_packed_gist.py",
+    "test/registered/unit/sampling/test_penaltylib.py",
+    "test/registered/unit/test_c2kv_position_correction_transfer.py",
+    "test/registered/unit/test_c2kv_prewarm.py",
+    "test/registered/unit/test_c2kv_raw_prefix_cache.py",
+    "test/registered/unit/test_c2kv_serving_contract.py",
+    "test/registered/unit/test_paper_telemetry.py",
+    "test/registered/unit/test_persistent_history_lifecycle.py"
+  ],
+  "donor_exact_except_scheduler": true,
+  "scheduler_merge": {
+    "path": "python/sglang/srt/managers/scheduler.py",
+    "sha256": "26722dc9fd7282eec90ad46c465e394ac3922df188a6a491e67016f45710a291",
+    "conflicts_resolved": 1,
+    "resolution": "retain v4 CommitKV retirement-veto scope reset and donor req-aware telemetry phase"
+  },
+  "scope_excluded": [
+    "prefill graph",
+    "selected async foreground",
+    "pool snapshot",
+    "mixed/paired candidate",
+    "partial-leaf/shortfall allocator candidate"
+  ],
+  "cpu_results": {
+    "sync_pytest_passed": 363,
+    "sync_runs": [
+      {
+        "passed": 97,
+        "note": "prewarm async cases need pytest-asyncio; run directly below"
+      },
+      {
+        "passed": 204,
+        "deselected_async_cases": 35,
+        "subtests_passed": 2
+      },
+      {
+        "passed": 62
+      }
+    ],
+    "asyncio_direct_passed": 51,
+    "asyncio_direct_runs": [
+      {
+        "passed": 38,
+        "zero_fixture_cases": true
+      },
+      {
+        "passed": 13,
+        "fixture_and_parameter_cases": true
+      }
+    ],
+    "total_unique_passed": 414,
+    "source_ast_parse": true,
+    "py_compile_critical_files": true,
+    "git_diff_check": true
+  },
+  "environment_limits": [
+    "pytest-asyncio absent from CPU venv; all 51 async cases were executed with asyncio.run, including pytest.MonkeyPatch and parameter sets",
+    "three additional modules were not collected because CPU venv lacks tqdm: test_c2kv_flex_kernel_options.py, test_penaltylib.py, test_history_kv_reference.py"
+  ],
+  "gpu_validation": "not_run_by_this_agent",
+  "native_smoke_seam": {
+    "capability": "GET /get_model_info -> c2kv_native_packed",
+    "generation": "POST /v1/c2kv/native_generate",
+    "prewarm": "POST /c2kv_native_prewarm"
+  }
+}
