@@ -26,6 +26,8 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     C2KVExtractReqOutput,
+    C2KVExactStateReqInput,
+    C2KVExactStateReqOutput,
     C2KVRepairExtractReqOutput,
     TokenizedExtractReqInput,
     TokenizedRepairExtractReqInput,
@@ -253,6 +255,9 @@ class TokenizerCommunicatorMixin:
         self.c2kv_extract_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.c2kv_exact_state_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.c2kv_repair_extract_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -343,6 +348,10 @@ class TokenizerCommunicatorMixin:
                     self.c2kv_extract_communicator.handle_recv,
                 ),
                 (
+                    C2KVExactStateReqOutput,
+                    self.c2kv_exact_state_communicator.handle_recv,
+                ),
+                (
                     C2KVRepairExtractReqOutput,
                     self.c2kv_repair_extract_communicator.handle_recv,
                 ),
@@ -405,12 +414,19 @@ class TokenizerCommunicatorMixin:
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
 
+    async def c2kv_exact_state(self, operation, snapshot_id=None):
+        self.auto_create_handle_loop()
+        return (await self.c2kv_exact_state_communicator(
+            C2KVExactStateReqInput(operation=operation, snapshot_id=snapshot_id)
+        ))[0]
+
     async def c2kv_extract(
         self: TokenizerManager,
         input_ids: list,
         input_text: str,
         compression_ratio: int = 4,
         rid: Optional[str] = None,
+        allow_cache_miss: bool = True,
     ) -> C2KVExtractReqOutput:
         """Run C2KV gist extraction via the scheduler."""
         import uuid
@@ -421,6 +437,7 @@ class TokenizerCommunicatorMixin:
             input_ids=input_ids,
             input_text=input_text,
             compression_ratio=compression_ratio,
+            allow_cache_miss=allow_cache_miss,
         )
         return (await self.c2kv_extract_communicator(req))[0]
 

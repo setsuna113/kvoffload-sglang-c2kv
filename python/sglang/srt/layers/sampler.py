@@ -36,12 +36,44 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+C2KV_STRICT_NONFINITE_SAMPLING = "C2KV_STRICT_NONFINITE_SAMPLING"
+NONFINITE_LOGITS_ERROR_CODE = "C2KV_NATIVE_NONFINITE_LOGITS"
+
+
+def _raise_on_c2kv_nonfinite_logits(logits: torch.Tensor) -> None:
+    rows = logits.reshape(logits.shape[0], -1)
+    nan = torch.isnan(rows)
+    positive_infinity = torch.isposinf(rows)
+    has_finite_candidate = torch.any(torch.isfinite(rows), dim=1)
+    invalid_rows = (
+        torch.any(nan, dim=1)
+        | torch.any(positive_infinity, dim=1)
+        | ~has_finite_candidate
+    )
+    if not bool(torch.any(invalid_rows)):
+        return
+
+    batch_rows = int(invalid_rows.sum().item())
+    no_finite_candidate_rows = int((~has_finite_candidate).sum().item())
+    nan_values = int(nan.sum().item())
+    positive_infinity_values = int(positive_infinity.sum().item())
+    masked_negative_infinity_values = int(torch.isneginf(rows).sum().item())
+    raise ValueError(
+        f"{NONFINITE_LOGITS_ERROR_CODE}: invalid logits before sampling "
+        f"(batch_rows={batch_rows}, nan={nan_values}, "
+        f"posinf={positive_infinity_values}, "
+        f"no_finite_candidate_rows={no_finite_candidate_rows}, "
+        f"masked_neginf={masked_negative_infinity_values})"
+    )
 
 
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detection = get_global_server_args().enable_nan_detection
+        self.use_c2kv_strict_nonfinite_sampling = get_bool_env_var(
+            C2KV_STRICT_NONFINITE_SAMPLING
+        )
         self.tp_sync_group = get_tp_group().device_group
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
@@ -62,6 +94,11 @@ class Sampler(nn.Module):
         # Apply the custom logit processors if registered in the sampling info
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
+
+        # C2KV evidence collection must retain a numerical failure as a failure.
+        # Never replace invalid logits or let argmax silently select token zero.
+        if self.use_c2kv_strict_nonfinite_sampling:
+            _raise_on_c2kv_nonfinite_logits(logits)
 
         # Detect and handle NaN values in logits
         if self.use_nan_detection and torch.any(torch.isnan(logits)):
