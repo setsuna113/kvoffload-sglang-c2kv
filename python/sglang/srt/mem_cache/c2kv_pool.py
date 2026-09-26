@@ -7,6 +7,7 @@ indices and lightweight metadata, avoiding long-lived per-entry CUDA tensors.
 """
 
 import struct
+import threading
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -133,6 +134,10 @@ class C2KVPool:
         )
 
         self._current_tokens = 0
+        self._pinned_tokens = 0
+        self._evictable_tokens = 0
+        self._accounting_lock = threading.Lock()
+        self._token_accounting = (0, 0, 0)
         # OrderedDict: LRU order (MRU at end)
         self._cache: OrderedDict[str, C2KVEntry] = OrderedDict()
         self._pin_counts: Counter[str] = Counter()
@@ -226,9 +231,16 @@ class C2KVPool:
         for key_hash, entry in list(self._cache.items()):
             if key_hash == exclude_key or self._pin_counts.get(key_hash, 0) > 0:
                 continue
-            del self._cache[key_hash]
+            with self._accounting_lock:
+                del self._cache[key_hash]
+                self._evictable_tokens -= entry.gist_len
+                self._publish_token_accounting()
+            # Allocator callbacks sample telemetry. Keep them outside our lock
+            # and preserve their existing view before current_tokens decreases.
             self.allocator.free(entry.token_indices)
-            self._current_tokens -= entry.gist_len
+            with self._accounting_lock:
+                self._current_tokens -= entry.gist_len
+                self._publish_token_accounting()
             return True
         return False
 
@@ -317,8 +329,11 @@ class C2KVPool:
             raise
 
         if existing is not None:
-            self._cache.pop(key_hash)
-            self._current_tokens -= existing.gist_len
+            with self._accounting_lock:
+                self._cache.pop(key_hash)
+                self._current_tokens -= existing.gist_len
+                self._account_entry_tokens(key_hash, -existing.gist_len)
+                self._publish_token_accounting()
         if old_tail is not None and old_tail.numel():
             self.allocator.free(old_tail)
 
@@ -328,8 +343,11 @@ class C2KVPool:
             gist_len=gist_len,
             original_seq_len=original_seq_len,
         )
-        self._cache[key_hash] = entry
-        self._current_tokens += gist_len
+        with self._accounting_lock:
+            self._cache[key_hash] = entry
+            self._current_tokens += gist_len
+            self._account_entry_tokens(key_hash, gist_len)
+            self._publish_token_accounting()
         paper_telemetry.sample(
             "c2kv_pool_store", tensors=gist_key_values, temporary_kv=True
         )
@@ -427,8 +445,11 @@ class C2KVPool:
             raise
 
         if existing is not None:
-            self._cache.pop(key_hash)
-            self._current_tokens -= existing.gist_len
+            with self._accounting_lock:
+                self._cache.pop(key_hash)
+                self._current_tokens -= existing.gist_len
+                self._account_entry_tokens(key_hash, -existing.gist_len)
+                self._publish_token_accounting()
         if old_tail is not None and old_tail.numel():
             self.allocator.free(old_tail)
 
@@ -443,8 +464,11 @@ class C2KVPool:
             source_doc_index=source_doc_index,
             repair_metadata=dict(repair_metadata or {}),
         )
-        self._cache[key_hash] = entry
-        self._current_tokens += token_len
+        with self._accounting_lock:
+            self._cache[key_hash] = entry
+            self._current_tokens += token_len
+            self._account_entry_tokens(key_hash, token_len)
+            self._publish_token_accounting()
         paper_telemetry.sample(
             "c2kv_pool_store_repair", tensors=key_values, temporary_kv=True
         )
@@ -460,7 +484,13 @@ class C2KVPool:
     def pin(self, key_hash: str) -> bool:
         if key_hash not in self._cache:
             return False
-        self._pin_counts[key_hash] += 1
+        with self._accounting_lock:
+            if self._pin_counts.get(key_hash, 0) == 0:
+                length = self._cache[key_hash].gist_len
+                self._pinned_tokens += length
+                self._evictable_tokens -= length
+            self._pin_counts[key_hash] += 1
+            self._publish_token_accounting()
         return True
 
     def pin_many(self, key_hashes: List[str]) -> bool:
@@ -468,16 +498,28 @@ class C2KVPool:
         missing = [key_hash for key_hash in unique_keys if key_hash not in self._cache]
         if missing:
             return False
-        for key_hash in unique_keys:
-            self._pin_counts[key_hash] += 1
+        with self._accounting_lock:
+            for key_hash in unique_keys:
+                if self._pin_counts.get(key_hash, 0) == 0:
+                    length = self._cache[key_hash].gist_len
+                    self._pinned_tokens += length
+                    self._evictable_tokens -= length
+                self._pin_counts[key_hash] += 1
+            self._publish_token_accounting()
         return True
 
     def unpin(self, key_hash: str) -> None:
-        count = self._pin_counts.get(key_hash, 0)
-        if count <= 1:
-            self._pin_counts.pop(key_hash, None)
-        else:
-            self._pin_counts[key_hash] = count - 1
+        with self._accounting_lock:
+            count = self._pin_counts.get(key_hash, 0)
+            if count == 1:
+                length = self._cache[key_hash].gist_len
+                self._pinned_tokens -= length
+                self._evictable_tokens += length
+            if count <= 1:
+                self._pin_counts.pop(key_hash, None)
+            else:
+                self._pin_counts[key_hash] = count - 1
+            self._publish_token_accounting()
 
     def unpin_many(self, key_hashes: List[str]) -> None:
         for key_hash in dict.fromkeys(key_hashes):
@@ -501,12 +543,36 @@ class C2KVPool:
     def current_tokens(self) -> int:
         return self._current_tokens
 
+    def _publish_token_accounting(self) -> None:
+        # Only the scheduler mutates pool metadata. Publish one immutable value
+        # after each completed mutation so worker samples cannot mix revisions.
+        self._token_accounting = (
+            self._current_tokens,
+            self._pinned_tokens,
+            self._evictable_tokens,
+        )
+
+    def _account_entry_tokens(self, key_hash: str, delta: int) -> None:
+        if self._pin_counts.get(key_hash, 0) > 0:
+            self._pinned_tokens += delta
+        else:
+            self._evictable_tokens += delta
+
+    def token_accounting(self) -> Tuple[int, int, int]:
+        """Return one published (resident, pinned, evictable) token snapshot."""
+        with self._accounting_lock:
+            return self._token_accounting
+
     def num_entries(self) -> int:
         return len(self._cache)
 
     def clear(self) -> None:
         self.allocator.clear()
-        self._cache.clear()
-        self._pin_counts.clear()
-        self._current_tokens = 0
+        with self._accounting_lock:
+            self._cache.clear()
+            self._pin_counts.clear()
+            self._current_tokens = 0
+            self._pinned_tokens = 0
+            self._evictable_tokens = 0
+            self._publish_token_accounting()
         paper_telemetry.sample("c2kv_pool_clear")

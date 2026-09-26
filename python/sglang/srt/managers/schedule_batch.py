@@ -2135,21 +2135,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # For overlap scheduler, the output_ids has one step delay
         delta = 0 if self.enable_overlap else -1
 
-        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        # For C2KV requests, origin_input_ids doesn't account for gist KV slots;
-        # use kv_committed_len which does.
+        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step.
+        # C2KV's logical input IDs omit gist KV slots. prepare_for_decode has
+        # already advanced seq_lens_cpu by one for the token being mixed here.
         self.prefix_lens.extend(
             [
-                (r.kv_committed_len + delta)
+                (int(running_batch.seq_lens_cpu[i].item()) - 1)
                 if getattr(r, "c2kv_virtual_input_ids", None) is not None
                 else (len(r.origin_input_ids) + len(r.output_ids) + delta)
-                for r in running_batch.reqs
+                for i, r in enumerate(running_batch.reqs)
             ]
         )
         self.extend_lens.extend([1] * running_bs)
         self.extend_num_tokens += running_bs
-        # TODO (lianmin): Revisit this. It should be seq_len - 1
-        self.extend_logprob_start_lens.extend([0] * running_bs)
+        # The appended decode rows have no input-token logprobs. Their sampled
+        # output-token logprobs are still returned by the generation result.
+        self.extend_logprob_start_lens.extend([1] * running_bs)
         self.is_prefill_only = False
 
     def new_tokens_required_next_decode(

@@ -1,6 +1,7 @@
 # Adapted from qwen2.py
 import logging
 import os
+from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -30,8 +31,10 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.mem_cache.gist_utils import (
     C2KV_KERNEL_OPTIONS,
     GistConfig,
+    apply_gist_residual_per_document,
     get_apply_gist_residual_func,
     get_prepare_gist_input_func,
+    prepare_packed_gist_input,
     prepare_pic_input,
 )
 from sglang.srt.mem_cache.history_kv_selection import (
@@ -1214,10 +1217,17 @@ class Qwen3Attention(nn.Module):
         _c2kv_corr = None
 
         if (
-            forward_batch.extend_prefix_lens_cpu is not None
+            _c2kv_diff_path
+            and self.attn.layer_id == 0
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            and forward_batch.extend_prefix_lens_cpu is not None
             and positions is not None
             and positions.numel() > 0
+            and positions.numel() >= _c2kv_min_qlen
+            and not os.path.exists(_c2kv_diff_path)
         ):
+            # Reading a CUDA scalar synchronizes the stream. Only inspect it
+            # when this layer is eligible to emit the explicitly enabled dump.
             _c2kv_prefix_len = int(
                 forward_batch.extend_prefix_lens_cpu[0]
             )
@@ -1888,6 +1898,100 @@ def _c2kv_gist_weight_files(source: str) -> List[str]:
     )
 
 
+class C2KVGistStepper:
+    """Advance one Qwen3 gist extraction through bounded GPU launch phases.
+
+    Construction only retains references. Each call to step performs the
+    prelude, one decoder layer, or result finalization, respectively.
+    """
+
+    def __init__(
+        self, model, input_ids, attention_mask, ratio=4, projection_set="history"
+    ):
+        self.model = model
+        self.input_ids = input_ids
+        self.attention_mask = attention_mask
+        self.ratio = ratio
+        self.projection_set = projection_set
+        self.gist_cfg, self.gist_embed_tokens, self.prepare_gist_input = (
+            model._c2kv_gist_set(projection_set)
+        )
+        self.layer_index = 0
+        self.layers_completed = 0
+        self.gist_key_values = []
+        self._phase = "prelude"
+        self._result = None
+
+    @property
+    def result(self):
+        if self._phase != "done":
+            raise RuntimeError("C2KV gist extraction is not complete")
+        return self._result
+
+    def step(self) -> bool:
+        """Execute one phase and return whether the result is ready."""
+        if self._phase == "done":
+            return True
+
+        base_dtype = self.model.model.embed_tokens.weight.dtype
+        autocast = (
+            torch.autocast(device_type=self.input_ids.device.type, dtype=base_dtype)
+            if self.gist_embed_tokens.weight.dtype != base_dtype
+            else nullcontext()
+        )
+        with autocast:
+            if self._phase == "prelude":
+                self.block_mask, self.gist_mask, self.position_ids = (
+                    self.prepare_gist_input(
+                        self.input_ids, self.attention_mask, ratio=self.ratio
+                    )
+                )
+                gist_len = self.gist_mask.shape[1]
+                gist_embed = self.gist_embed_tokens(
+                    torch.zeros(
+                        (1, gist_len), dtype=torch.long, device=self.input_ids.device
+                    )
+                ).to(dtype=base_dtype)
+                self.hidden_states = torch.cat(
+                    [self.model.model.embed_tokens(self.input_ids), gist_embed], dim=1
+                )
+                self._phase = "layers" if len(self.model.model.layers) else "finalize"
+                return False
+
+            if self._phase == "layers":
+                layer_idx = self.layer_index
+                layer = self.model.model.layers[layer_idx]
+                layer_residual = get_apply_gist_residual_func(
+                    self.gist_cfg, layer_idx
+                )
+                self.hidden_states, layer_kv = layer.forward_with_gist(
+                    self.hidden_states,
+                    self.gist_mask,
+                    positions=self.position_ids.squeeze(0),
+                    attention_mask=self.block_mask,
+                    apply_gist_residual=layer_residual,
+                    projection_set=self.projection_set,
+                    ratio=self.ratio,
+                )
+                self.gist_key_values.append(layer_kv)
+                self.layer_index += 1
+                self.layers_completed += 1
+                if self.layer_index == len(self.model.model.layers):
+                    self._phase = "finalize"
+                return False
+
+            # No model layer runs during this phase.
+            gist_len = self.gist_mask.shape[1]
+            gist_position_ids = self.position_ids[:, -gist_len:].contiguous()
+            self._result = (
+                self.gist_key_values,
+                self.gist_mask,
+                gist_position_ids,
+            )
+            self._phase = "done"
+            return True
+
+
 class Qwen3ForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
@@ -2131,6 +2235,18 @@ class Qwen3ForCausalLM(nn.Module):
             )
         raise ValueError(f"Unknown C2KV projection set {projection_set!r}")
 
+    def create_gist_stepper(
+        self, input_ids, attention_mask, ratio=4, projection_set="history"
+    ):
+        """Create an incremental gist pass without launching model operations."""
+        if self.full_length_pic:
+            raise NotImplementedError(
+                "Incremental C2KV gist extraction does not support PIC."
+            )
+        return C2KVGistStepper(
+            self, input_ids, attention_mask, ratio=ratio, projection_set=projection_set
+        )
+
     def generate_gist(
         self, input_ids, attention_mask, ratio=4, projection_set="history", **kwargs
     ):
@@ -2230,6 +2346,122 @@ class Qwen3ForCausalLM(nn.Module):
             )
 
         return gist_key_values, gist_mask, gist_position_ids
+
+    @torch.no_grad()
+    def generate_gist_many(
+        self,
+        input_id_lists,
+        ratio=4,
+        projection_set="history",
+        _c2kv_fp32_autocast_active=False,
+        on_layer_kv=None,
+    ):
+        """Extract independent documents in one packed Qwen3 forward pass.
+
+        Returns one (per-layer pre-RoPE KV, gist mask, local gist positions)
+        tuple per document, in input order, with the singleton return shapes.
+        """
+        if self.full_length_pic:
+            raise ValueError("Packed gist extraction is unavailable for PIC.")
+        gist_cfg, gist_embed_tokens, _ = self._c2kv_gist_set(projection_set)
+        base_dtype = self.model.embed_tokens.weight.dtype
+        if (
+            gist_embed_tokens.weight.dtype != base_dtype
+            and not _c2kv_fp32_autocast_active
+        ):
+            with torch.autocast(
+                device_type=self.model.embed_tokens.weight.device.type,
+                dtype=base_dtype,
+            ):
+                return self.generate_gist_many(
+                    input_id_lists,
+                    ratio=ratio,
+                    projection_set=projection_set,
+                    _c2kv_fp32_autocast_active=True,
+                    on_layer_kv=on_layer_kv,
+                )
+
+        (
+            input_ids,
+            block_mask,
+            gist_mask,
+            position_ids,
+            raw_lengths,
+            gist_lengths,
+        ) = prepare_packed_gist_input(
+            input_id_lists,
+            ratio=ratio,
+            gist_overlap=gist_cfg.gist_overlap,
+            device=self.model.embed_tokens.weight.device,
+        )
+        gist_embed = gist_embed_tokens(
+            torch.zeros_like(gist_mask, dtype=torch.long)
+        ).to(dtype=base_dtype)
+        hidden_states = torch.cat(
+            [self.model.embed_tokens(input_ids), gist_embed], dim=1
+        )
+
+        # forward_with_gist expects one raw region and one gist region. Its
+        # attention and QKV path can be shared; residual means must be local.
+        per_document_kv = [[] for _ in raw_lengths]
+        for layer_idx, layer in enumerate(self.model.layers):
+            layer_residual = get_apply_gist_residual_func(gist_cfg, layer_idx)
+
+            def apply_packed_residual(input_hidden, gist_hidden, **kwargs):
+                return apply_gist_residual_per_document(
+                    input_hidden,
+                    gist_hidden,
+                    raw_lengths,
+                    gist_lengths,
+                    layer_residual,
+                    **kwargs,
+                )
+
+            hidden_states, (packed_k, packed_v) = layer.forward_with_gist(
+                hidden_states,
+                gist_mask,
+                positions=position_ids.squeeze(0),
+                attention_mask=block_mask,
+                apply_gist_residual=apply_packed_residual,
+                projection_set=projection_set,
+                ratio=ratio,
+            )
+            gist_offset = 0
+            for doc_kv, gist_length in zip(per_document_kv, gist_lengths):
+                doc_kv.append(
+                    (
+                        packed_k.narrow(0, gist_offset, gist_length)
+                        .contiguous()
+                        .clone(),
+                        packed_v.narrow(0, gist_offset, gist_length)
+                        .contiguous()
+                        .clone(),
+                    )
+                )
+                gist_offset += gist_length
+            if on_layer_kv is not None:
+                on_layer_kv(per_document_kv)
+            paper_telemetry.sample(
+                "forward_with_gist",
+                tensors=per_document_kv,
+                temporary_kv=True,
+            )
+
+        results = []
+        gist_offset = 0
+        raw_len = sum(raw_lengths)
+        for doc_kv, gist_length in zip(per_document_kv, gist_lengths):
+            results.append(
+                (
+                    doc_kv,
+                    gist_mask[:, gist_offset : gist_offset + gist_length].contiguous(),
+                    position_ids[
+                        :, raw_len + gist_offset : raw_len + gist_offset + gist_length
+                    ].contiguous(),
+                )
+            )
+            gist_offset += gist_length
+        return results
 
     @torch.no_grad()
     def generate_raw_repair_kv(

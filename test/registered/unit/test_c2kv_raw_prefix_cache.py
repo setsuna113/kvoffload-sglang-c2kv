@@ -1,5 +1,6 @@
 """CPU ownership tests for the native first-raw-prefix RadixCache path."""
 
+import argparse
 import ast
 import heapq
 import logging
@@ -96,6 +97,11 @@ radix = _source_defs(
 )
 RadixCache = radix["RadixCache"]
 RadixKey = radix["RadixKey"]
+PriorityStrategy = _source_defs(
+    MEM_CACHE / "evict_policy.py",
+    {"EvictionStrategy": object},
+    names={"PriorityStrategy"},
+)["PriorityStrategy"]
 
 
 class SessionAwareCache:
@@ -198,6 +204,12 @@ def make_cache():
     )
     cache.update_eviction_metrics = lambda *_: None
     cache.reset()
+    return cache
+
+
+def make_priority_cache():
+    cache = make_cache()
+    cache.eviction_strategy = PriorityStrategy()
     return cache
 
 
@@ -338,6 +350,148 @@ def test_existing_matched_node_lock_moves_to_new_prefix(monkeypatch):
     release_kv_cache(longer, cache, is_insert=False)
     assert cache.protected_size() == 0
     assert cache.token_to_kv_pool_allocator.owned == {1, 2, 3}
+
+
+@pytest.mark.parametrize("priority_enabled", [False, True])
+def test_priority_policy_eviction_prefers_native_raw_prefix_when_enabled(
+    monkeypatch, priority_enabled
+):
+    monkeypatch.setenv("C2KV_NATIVE_RAW_PREFIX_CACHE", "1")
+    if priority_enabled:
+        monkeypatch.setenv("C2KV_NATIVE_RAW_PREFIX_CACHE_PRIORITY", "1")
+    else:
+        monkeypatch.delenv("C2KV_NATIVE_RAW_PREFIX_CACHE_PRIORITY", raising=False)
+    cache = make_priority_cache()
+    raw = make_req(cache, 0, [10, 11, 12], [1, 2, 3])
+    assert commit_first_round(raw, cache)
+    assert raw.c2kv_raw_prefix_cache["eviction_priority"] == (
+        1 if priority_enabled else 0
+    )
+    assert raw.priority == 0
+    release_kv_cache(raw, cache, is_insert=False)
+
+    cache.token_to_kv_pool_allocator.allocate(4, 5, 6)
+    cache.insert(
+        InsertParams(RadixKey([20, 21, 22], "adapter-a"), torch.tensor([4, 5, 6]))
+    )
+    raw_node = cache.match_prefix(
+        MatchPrefixParams(RadixKey([10, 11, 12], "adapter-a"))
+    ).last_device_node
+    ordinary_node = cache.match_prefix(
+        MatchPrefixParams(RadixKey([20, 21, 22], "adapter-a"))
+    ).last_device_node
+    raw_node.last_access_time = 1.0
+    ordinary_node.last_access_time = 2.0
+    assert raw_node.priority == (1 if priority_enabled else 0)
+    assert ordinary_node.priority == 0
+
+    assert cache.evict(SimpleNamespace(num_tokens=1)).num_tokens_evicted == 3
+    assert cache.token_to_kv_pool_allocator.freed == (
+        [4, 5, 6] if priority_enabled else [1, 2, 3]
+    )
+    assert cache.evict(SimpleNamespace(num_tokens=1)).num_tokens_evicted == 3
+    assert cache.token_to_kv_pool_allocator.owned == set()
+
+
+def test_priority_policy_respects_explicit_priority_after_split_and_duplicate(
+    monkeypatch,
+):
+    monkeypatch.setenv("C2KV_NATIVE_RAW_PREFIX_CACHE", "1")
+    monkeypatch.setenv("C2KV_NATIVE_RAW_PREFIX_CACHE_PRIORITY", "1")
+    cache = make_priority_cache()
+    raw = make_req(cache, 0, [10, 11, 12], [1, 2, 3])
+    assert commit_first_round(raw, cache)
+    release_kv_cache(raw, cache, is_insert=False)
+
+    cache.token_to_kv_pool_allocator.allocate(4)
+    result = cache.insert(
+        InsertParams(RadixKey([10, 11, 13], "adapter-a"), torch.tensor([1, 2, 4]))
+    )
+    assert result.prefix_len == 2
+    raw_node = cache.match_prefix(
+        MatchPrefixParams(RadixKey([10, 11, 12], "adapter-a"))
+    ).last_device_node
+    ordinary_node = cache.match_prefix(
+        MatchPrefixParams(RadixKey([10, 11, 13], "adapter-a"))
+    ).last_device_node
+    shared_node = raw_node.parent
+    assert (shared_node.priority, raw_node.priority, ordinary_node.priority) == (
+        1, 1, 0
+    )
+
+    duplicate = make_req(cache, 1, [10, 11, 12], [5, 6, 7])
+    duplicate.priority = 3
+    assert commit_first_round(duplicate, cache)
+    assert duplicate.c2kv_raw_prefix_cache["inserted_tokens"] == 0
+    assert duplicate.c2kv_raw_prefix_cache["eviction_priority"] == 3
+    assert duplicate.priority == 3
+    release_kv_cache(duplicate, cache, is_insert=False)
+    assert (shared_node.priority, raw_node.priority, ordinary_node.priority) == (
+        3, 3, 0
+    )
+    assert cache.evict(SimpleNamespace(num_tokens=1)).num_tokens_evicted == 1
+    assert cache.token_to_kv_pool_allocator.freed[-1] == 4
+    assert cache.evict(SimpleNamespace(num_tokens=1)).num_tokens_evicted == 1
+    assert cache.token_to_kv_pool_allocator.freed[-1] == 3
+
+
+def test_priority_policy_does_not_evict_locked_raw_prefix(monkeypatch):
+    monkeypatch.setenv("C2KV_NATIVE_RAW_PREFIX_CACHE", "1")
+    monkeypatch.setenv("C2KV_NATIVE_RAW_PREFIX_CACHE_PRIORITY", "1")
+    cache = make_priority_cache()
+    raw = make_req(cache, 0, [10, 11, 12], [1, 2, 3])
+    assert commit_first_round(raw, cache)
+    assert cache.protected_size() == 3
+
+    cache.token_to_kv_pool_allocator.allocate(4)
+    cache.insert(InsertParams(RadixKey([20], "adapter-a"), torch.tensor([4])))
+    assert cache.evict(SimpleNamespace(num_tokens=100)).num_tokens_evicted == 1
+    assert cache.token_to_kv_pool_allocator.owned == {1, 2, 3}
+    release_kv_cache(raw, cache, is_insert=False)
+    assert cache.evict(SimpleNamespace(num_tokens=100)).num_tokens_evicted == 3
+    assert cache.token_to_kv_pool_allocator.owned == set()
+
+
+def test_server_cli_accepts_priority_eviction_policy():
+    path = ROOT / "python/sglang/srt/server_args.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    choices_assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "RADIX_EVICTION_POLICY_CHOICES"
+            for target in node.targets
+        )
+    )
+    cli_call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "--radix-eviction-policy"
+    )
+    parser = argparse.ArgumentParser()
+    cli_expression = ast.fix_missing_locations(ast.Expression(body=cli_call))
+    eval(
+        compile(cli_expression, str(path), "eval"),
+        {
+            "parser": parser,
+            "RADIX_EVICTION_POLICY_CHOICES": ast.literal_eval(choices_assignment.value),
+            "ServerArgs": SimpleNamespace(radix_eviction_policy="lru"),
+        },
+    )
+    assert (
+        parser.parse_args(["--radix-eviction-policy", "priority"]).radix_eviction_policy
+        == "priority"
+    )
+    assert "priority" in parser.format_help()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--radix-eviction-policy", "fifo"])
 
 
 @pytest.mark.parametrize(

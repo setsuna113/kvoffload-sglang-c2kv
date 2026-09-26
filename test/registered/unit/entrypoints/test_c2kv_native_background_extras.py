@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import time
 from collections import Counter
 import uuid
 from pathlib import Path
@@ -40,6 +41,7 @@ def _load(*names, **bindings):
         "Any": Any,
         "Dict": Dict,
         "asyncio": asyncio,
+        "time": time,
         "uuid": uuid,
         "HTTPException": HTTPException,
         "C2KVNativePackedGenerateRequest": object,
@@ -179,6 +181,7 @@ def _namespace(manager, plan, enabled, shadow_layer=None):
         "_c2kv_native_background_extras_fallback_reason",
         "_c2kv_native_background_extras_eligible",
         "_c2kv_native_generate_with_background_extras",
+        "_c2kv_native_generate_with_prewarm",
         "v1_c2kv_native_generate",
         _global_state=SimpleNamespace(tokenizer_manager=manager),
         _c2kv_native_capability=lambda: {

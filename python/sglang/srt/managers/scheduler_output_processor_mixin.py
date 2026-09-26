@@ -43,6 +43,42 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _process_mixed_decode_req(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        i: int,
+        req: Req,
+        next_token_id: int,
+    ) -> None:
+        """Complete a decode row appended to a mixed prefill batch."""
+        logits_output = result.logits_output
+        paper_telemetry.set_phase("decode", req=req)
+        req.output_ids.append(next_token_id)
+        self._maybe_update_reasoning_tokens(req, next_token_id)
+        self._mamba_prefix_cache_update(req, batch, result, i)
+        req.time_stats.set_last_decode_finish_time()
+        req.check_finished()
+        self._handle_finished_req(req, i, logits_output)
+
+        if req.return_logprob:
+            req.output_token_logprobs_val.append(
+                logits_output.next_token_logprobs[i]
+            )
+            req.output_token_logprobs_idx.append(next_token_id)
+
+        if req.grammar is not None:
+            try:
+                req.grammar.accept_token(next_token_id)
+            except ValueError as e:
+                logger.error(
+                    f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                )
+                self.abort_request(AbortReq(rid=req.rid))
+            req.grammar.finished = req.finished()
+
+        self.num_generated_tokens += 1
+
     def _accumulate_history_kv_selection_scores(self, req: Req, result) -> None:
         """Merge score sums from every chunk of the selection-query round."""
         score_map = getattr(result, "history_kv_selection_scores", None)
@@ -485,10 +521,21 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions
             logprob_pt = 0
+            decode_start = len(batch.reqs) - len(batch.decoding_reqs or ())
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
+                    continue
+
+                if (
+                    batch.decoding_reqs is not None
+                    and i >= decode_start
+                    and getattr(req, "c2kv_output_only_logprob", False)
+                ):
+                    self._process_mixed_decode_req(
+                        batch, result, i, req, next_token_id
+                    )
                     continue
 
                 if (

@@ -182,3 +182,110 @@ def is_c2kv_graph_compatible(forward_batch) -> bool:
     """
 
     return getattr(forward_batch, "c2kv_use_gist_projection", None) is None
+
+
+def validate_c2kv_prefill_graph_512_setup(server_args, model, device) -> None:
+    """Reject unsupported C2KV prefill captures before compiling any graph."""
+
+    expected = {
+        "enable_c2kv": True,
+        "disable_piecewise_cuda_graph": False,
+        "piecewise_cuda_graph_tokens": [512],
+        "piecewise_cuda_graph_compiler": "eager",
+        "chunked_prefill_size": 512,
+        "attention_backend": "flashinfer",
+        "page_size": 1,
+        "c2kv_query_proj": "base",
+        "c2kv_gist_type": "dynamic-interleave",
+        "c2kv_gist_param": "qkv",
+        "c2kv_shadow_feature_layer": -2,
+        "enable_return_hidden_states": True,
+        "tp_size": 1,
+        "pp_size": 1,
+        "dp_size": 1,
+        "speculative_algorithm": None,
+    }
+    errors = [
+        f"{name}={getattr(server_args, name, None)!r}, expected {value!r}"
+        for name, value in expected.items()
+        if getattr(server_args, name, None) != value
+    ]
+    if device != "cuda":
+        errors.append(f"device={device!r}, expected 'cuda'")
+    if type(model).__name__ != "Qwen3ForCausalLM":
+        errors.append(f"model={type(model).__name__}, expected Qwen3ForCausalLM")
+    if getattr(model, "full_length_pic", False):
+        errors.append("full_length_pic=True, expected False")
+    if errors:
+        raise ValueError("C2KV_PREFILL_GRAPH_512_UNSUPPORTED: " + "; ".join(errors))
+
+
+def is_c2kv_prefill_graph_512_eligible(forward_batch) -> bool:
+    """Pure-Python gate for the one native prompt-last C2KV prefill shape."""
+
+    if getattr(getattr(forward_batch, "forward_mode", None), "name", None) != "EXTEND":
+        return False
+    if getattr(forward_batch, "batch_size", None) != 1:
+        return False
+    input_ids = getattr(forward_batch, "input_ids", None)
+    if input_ids is None or len(input_ids) != 512:
+        return False
+    if getattr(forward_batch, "extend_num_tokens", None) != 512:
+        return False
+    if getattr(getattr(forward_batch, "capture_hidden_mode", None), "name", None) != "LAST":
+        return False
+    if not is_c2kv_graph_compatible(forward_batch):
+        return False
+    if getattr(forward_batch, "input_embeds", None) is not None:
+        return False
+    if getattr(forward_batch, "spec_info", None) is not None:
+        return False
+    if getattr(forward_batch, "is_prefill_only", False):
+        return False
+
+    # replay_prepare does not copy these request-specific Python state objects.
+    if getattr(forward_batch, "c2kv_history_kv_eviction_configs", None) is not None:
+        return False
+    if getattr(forward_batch, "c2kv_history_kv_selection_scores", None) is not None:
+        return False
+    for name in (
+        "history_kv_reference_states",
+        "history_kv_reference_configs",
+        "history_kv_runtime_states",
+    ):
+        values = getattr(forward_batch, name, None)
+        if values is not None and (
+            not isinstance(values, (list, tuple))
+            or any(item is not None for item in values)
+        ):
+            return False
+
+    # Output-token logprobs use the next-token logits after forward; prompt
+    # logprobs need the distinct logits_processor input-logprob path.
+    if getattr(forward_batch, "return_logprob", False):
+        starts = getattr(forward_batch, "extend_logprob_start_lens_cpu", None)
+        lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if not isinstance(starts, (list, tuple)) or not isinstance(lengths, (list, tuple)):
+            return False
+        if len(starts) != 1 or len(lengths) != 1:
+            return False
+        if type(starts[0]) is not int or type(lengths[0]) is not int:
+            return False
+        if starts[0] < lengths[0]:
+            return False
+        token_ids_logprobs = getattr(forward_batch, "token_ids_logprobs", None)
+        if token_ids_logprobs is not None and (
+            not isinstance(token_ids_logprobs, (list, tuple))
+            or len(token_ids_logprobs) != 1
+            or token_ids_logprobs[0] is not None
+        ):
+            return False
+        top_nums = getattr(forward_batch, "top_logprobs_nums", None)
+        if top_nums is not None and (
+            not isinstance(top_nums, (list, tuple))
+            or len(top_nums) != 1
+            or type(top_nums[0]) is not int
+            or top_nums[0] != 0
+        ):
+            return False
+    return True

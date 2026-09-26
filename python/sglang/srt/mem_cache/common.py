@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import TYPE_CHECKING
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
@@ -226,6 +231,17 @@ def alloc_token_slots(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
+def _c2kv_shortfall_eviction_supported(tree_cache, allocator) -> bool:
+    if type(tree_cache) is SessionAwareCache:
+        tree_cache = tree_cache.inner
+    return (
+        type(tree_cache) is RadixCache
+        and tree_cache.page_size == 1
+        and type(allocator) is TokenToKVPoolAllocator
+        and allocator.page_size == 1
+    )
+
+
 def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return
@@ -248,8 +264,31 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             )
     else:
         # Standard allocator
-        if allocator.available_size() < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens))
+        available = allocator.available_size()
+        if available < num_tokens:
+            shortfall_only = os.environ.get(
+                "C2KV_RADIX_EVICT_SHORTFALL_ONLY", "false"
+            ).lower() in ("1", "true")
+            trace = os.environ.get("C2KV_RADIX_EVICT_TRACE", "false").lower() in (
+                "1", "true"
+            )
+            if shortfall_only or trace:
+                supported = _c2kv_shortfall_eviction_supported(tree_cache, allocator)
+                shortfall_only = shortfall_only and supported
+                trace = trace and supported
+            # Page-one allocation consumes any available slots, including released
+            # pages awaiting sorting. Other allocator/cache contracts stay unchanged.
+            target = num_tokens - available if shortfall_only else num_tokens
+            started = time.perf_counter() if trace else None
+            result = tree_cache.evict(EvictParams(num_tokens=target))
+            if trace:
+                elapsed = time.perf_counter() - started
+                logger.info(
+                    "C2KV_RADIX_EVICT requested=%d available_before=%d target=%d "
+                    "evicted=%d available_after=%d shortfall_only=%s elapsed_seconds=%.9f",
+                    num_tokens, available, target, result.num_tokens_evicted,
+                    allocator.available_size(), shortfall_only, elapsed,
+                )
 
 
 def alloc_paged_token_slots_extend(

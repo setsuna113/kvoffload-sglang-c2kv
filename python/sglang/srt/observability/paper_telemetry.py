@@ -10,8 +10,9 @@ also includes model weights, workspaces, Q tensors, and allocator reservation.
 
 from __future__ import annotations
 
-import copy
+import contextlib
 import contextvars
+import copy
 import functools
 import json
 import os
@@ -54,8 +55,14 @@ class _PaperTelemetry:
         self._active: Optional[Dict[str, Any]] = None
         self._actives: Dict[str, Dict[str, Any]] = {}
         self._completed: Dict[str, Dict[str, Any]] = {}
+        self._pending_tensors: Dict[str, Dict[str, Any]] = {}
+        self._pending_logical_bytes = 0
+        self._pending_storage_bytes = 0
+        self._pending_owner_ids: set[int] = set()
+        self._pending_storages: Dict[Any, int] = {}
         self._nvml = None
         self._nvml_handle = None
+        self._pool_snapshot_enabled = False
 
     def configure(
         self, main_allocator, c2kv_pool, bytes_per_kv_token: int, tree_cache=None
@@ -67,6 +74,9 @@ class _PaperTelemetry:
             self._c2kv_pool = c2kv_pool
             self._tree_cache = tree_cache
             self._bytes_per_kv_token = max(_as_int(bytes_per_kv_token), 0)
+            self._pool_snapshot_enabled = (
+                os.environ.get("C2KV_PAPER_POOL_SNAPSHOT", "").strip().lower() in _TRUE
+            )
 
     def _tree_cache_sizes(self) -> Dict[str, int]:
         """Prefix-cache slots inside the live pool, split by whether they are
@@ -95,11 +105,14 @@ class _PaperTelemetry:
         if not torch.cuda.is_available():
             return values
         try:
+            stats = torch.cuda.memory_stats_as_nested_dict()
+            allocated = stats.get("allocated_bytes", {}).get("all", {})
+            reserved = stats.get("reserved_bytes", {}).get("all", {})
             values.update(
-                allocated_bytes=int(torch.cuda.memory_allocated()),
-                reserved_bytes=int(torch.cuda.memory_reserved()),
-                peak_allocated_bytes=int(torch.cuda.max_memory_allocated()),
-                peak_reserved_bytes=int(torch.cuda.max_memory_reserved()),
+                allocated_bytes=int(allocated.get("current", 0)),
+                reserved_bytes=int(reserved.get("current", 0)),
+                peak_allocated_bytes=int(allocated.get("peak", 0)),
+                peak_reserved_bytes=int(reserved.get("peak", 0)),
             )
         except Exception:
             pass
@@ -154,6 +167,65 @@ class _PaperTelemetry:
             if active is not None:
                 active["req"] = req
 
+    def _rebuild_pending_accounting(self) -> None:
+        owners: Dict[int, int] = {}
+        storages: Dict[Any, int] = {}
+        for record in self._pending_tensors.values():
+            owners.update(record["owners"])
+            storages.update(record["storages"])
+        self._pending_owner_ids = set(owners)
+        self._pending_storages = storages
+        self._pending_logical_bytes = sum(owners.values())
+        self._pending_storage_bytes = sum(storages.values())
+
+    def set_pending_tensors(
+        self, rid: Any, tensors: Iterable[Any], *, append: bool = False
+    ) -> None:
+        """Register temporary KV that remains live between scheduler samples.
+
+        ``append`` accounts only new tensors. Previously registered tensors must
+        retain their shape and storage until replacement or clear; the gist
+        stepper satisfies this by retaining each completed layer unchanged.
+        """
+        if not enabled():
+            return
+        rid = str(getattr(rid, "rid", rid))
+        with self._lock:
+            if tensors is not None and not isinstance(tensors, (list, tuple)):
+                tensors = tuple(tensors)
+            owners, storages = self._tensor_accounting(tensors)
+            if append:
+                previous = self._pending_tensors.get(rid)
+                # Retain immutable source containers as well as tensor owners,
+                # so object/storage identities remain valid between samples.
+                tensors = tuple(tensors or ())
+                if previous is not None:
+                    tensors = tuple(previous["source"] or ()) + tensors
+                    owners = previous["owners"] | owners
+                    storages = previous["storages"] | storages
+            self._pending_tensors[rid] = {
+                "source": tensors,
+                "owners": owners,
+                "storages": storages,
+            }
+            self._rebuild_pending_accounting()
+            active = self._actives.get(rid)
+            if active is not None:
+                active["temporary_logical_peak_bytes"] = max(
+                    active["temporary_logical_peak_bytes"], sum(owners.values())
+                )
+                active["temporary_storage_peak_bytes"] = max(
+                    active["temporary_storage_peak_bytes"], sum(storages.values())
+                )
+
+    def clear_pending_tensors(self, rid: Any) -> None:
+        if not enabled():
+            return
+        rid = str(getattr(rid, "rid", rid))
+        with self._lock:
+            if self._pending_tensors.pop(rid, None) is not None:
+                self._rebuild_pending_accounting()
+
     def _targets(self, req: Any = None) -> list[Dict[str, Any]]:
         if req is not None:
             rid = str(getattr(req, "rid", req))
@@ -178,11 +250,12 @@ class _PaperTelemetry:
                 if state is not None:
                     states[id(state)] = state
             held = getattr(owner, "racer_held_generation", None)
-            if include_snapshots and held is not None and held.reference_state is not None:
-                states[id(held.reference_state)] = held.reference_state
+            held_state = getattr(held, "reference_state", None) if include_snapshots else None
+            if held_state is not None:
+                states[id(held_state)] = held_state
         kv_tensors, position_tensors = [], []
         for state in states.values():
-            for layer in state.layers.values():
+            for layer in tuple(state.layers.values()):
                 kv_tensors.extend((layer.key, layer.value))
                 position_tensors.append(layer.positions)
         kv_bytes = self._tensor_bytes(kv_tensors)["storage_bytes"]
@@ -210,10 +283,15 @@ class _PaperTelemetry:
         # resident, but unpinned entries can be evicted and must appear in the
         # cache line item even when the radix cache is disabled.
         c2kv_cache = getattr(c2kv_pool, "_cache", None)
-        c2kv_pins = getattr(c2kv_pool, "_pin_counts", {})
         c2kv_evictable = c2kv_pinned = 0
-        if c2kv_cache is not None:
-            for key, entry in c2kv_cache.items():
+        accounting = getattr(c2kv_pool, "token_accounting", None)
+        if self._pool_snapshot_enabled and callable(accounting):
+            c2kv_tokens, c2kv_pinned, c2kv_evictable = accounting()
+        elif c2kv_cache is not None:
+            c2kv_pins = dict(getattr(c2kv_pool, "_pin_counts", {}))
+            # A gist worker can sample while the scheduler changes the LRU.
+            # Retain the observed entries instead of iterating a live view.
+            for key, entry in tuple(c2kv_cache.items()):
                 if c2kv_pins.get(key, 0) > 0:
                     c2kv_pinned += _as_int(entry.gist_len)
                 else:
@@ -231,6 +309,9 @@ class _PaperTelemetry:
             if active.get("req") is not None:
                 owners.append(active["req"])
         reference = self._reference_payload(owners)
+        temporary_logical = self._pending_logical_bytes
+        temporary_storage = self._pending_storage_bytes
+        temporary_tokens = temporary_logical // bpt if bpt else 0
         return {
             "bytes_per_kv_token": bpt,
             "main_live_kv_tokens": main_tokens,
@@ -255,14 +336,18 @@ class _PaperTelemetry:
             # Canonical request peak includes temporary K/V payload that is
             # alive at this exact sample.  With no temporary tensors, it is
             # identical to the pooled live payload.
-            "simultaneous_temporary_kv_tokens": 0,
-            "simultaneous_temporary_kv_bytes": 0,
+            "simultaneous_temporary_kv_tokens": temporary_tokens,
+            "simultaneous_temporary_kv_bytes": temporary_logical,
             "reference_history_resident_bytes": reference["bytes"],
             "reference_history_kv_bytes": reference["kv_bytes"],
             "reference_history_position_bytes": reference["position_bytes"],
             "reference_history_token_equivalent": reference["tokens"],
-            "request_resident_kv_tokens": resident_tokens + reference["tokens"],
-            "request_resident_kv_bytes": resident_tokens * bpt + reference["bytes"],
+            "request_resident_kv_tokens": (
+                resident_tokens + reference["tokens"] + temporary_tokens
+            ),
+            "request_resident_kv_bytes": (
+                resident_tokens * bpt + reference["bytes"] + temporary_storage
+            ),
             "main_pool_capacity_tokens": main_capacity,
             "main_pool_capacity_bytes": main_capacity * bpt,
             "c2kv_pool_capacity_tokens": c2kv_capacity,
@@ -277,6 +362,36 @@ class _PaperTelemetry:
             "torch": self._torch_snapshot(),
             "nvml_process_bytes": self._nvml_process_bytes(),
         }
+
+    @staticmethod
+    def _tensor_accounting(
+        tensors: Optional[Iterable[Any]],
+    ) -> tuple[Dict[int, int], Dict[Any, int]]:
+        owners: Dict[int, int] = {}
+        storages: Dict[Any, int] = {}
+
+        def visit(value: Any) -> None:
+            if isinstance(value, (list, tuple)):
+                for nested in value:
+                    visit(nested)
+                return
+            if not isinstance(value, torch.Tensor):
+                return
+            owner = id(value)
+            if owner in owners:
+                return
+            logical = int(value.numel() * value.element_size())
+            owners[owner] = logical
+            try:
+                store = value.untyped_storage()
+                key = (str(value.device), int(store.data_ptr()))
+                storages[key] = int(store.nbytes())
+            except Exception:
+                storages[("tensor", owner)] = logical
+
+        for value in tensors or ():
+            visit(value)
+        return owners, storages
 
     @staticmethod
     def _tensor_bytes(tensors: Optional[Iterable[Any]]) -> Dict[str, int]:
@@ -423,38 +538,80 @@ class _PaperTelemetry:
             peak_targets = list(self._actives.values()) if concurrent_enabled() else targets
             snapshot = self._snapshot(event)
             if tensors is not None:
-                tensor_bytes = self._tensor_bytes(tensors)
+                if self._pending_tensors:
+                    registered = next(
+                        (
+                            record
+                            for record in self._pending_tensors.values()
+                            if tensors is record["source"]
+                        ),
+                        None,
+                    )
+                    if registered is not None:
+                        passed_owners = registered["owners"]
+                        passed_storages = registered["storages"]
+                    else:
+                        passed_owners, passed_storages = self._tensor_accounting(
+                            tensors
+                        )
+                    tensor_bytes = {
+                        "logical_bytes": sum(passed_owners.values()),
+                        "storage_bytes": sum(passed_storages.values()),
+                    }
+                else:
+                    tensor_bytes = self._tensor_bytes(tensors)
                 snapshot["temporary_kv_tensor_bytes"] = tensor_bytes
                 if temporary_kv:
+                    if self._pending_tensors:
+                        extra_logical = sum(
+                            size for owner, size in passed_owners.items()
+                            if owner not in self._pending_owner_ids
+                        )
+                        extra_storage = sum(
+                            size for key, size in passed_storages.items()
+                            if key not in self._pending_storages
+                        )
+                    else:
+                        extra_logical = tensor_bytes["logical_bytes"]
+                        extra_storage = tensor_bytes["storage_bytes"]
+                    total_logical = self._pending_logical_bytes + extra_logical
                     temporary_tokens = (
-                        tensor_bytes["logical_bytes"] // self._bytes_per_kv_token
-                        if self._bytes_per_kv_token
-                        else 0
+                        total_logical // self._bytes_per_kv_token
+                        if self._bytes_per_kv_token else 0
                     )
                     snapshot["kv"]["simultaneous_temporary_kv_tokens"] = (
                         temporary_tokens
                     )
-                    snapshot["kv"]["simultaneous_temporary_kv_bytes"] = (
-                        tensor_bytes["logical_bytes"]
+                    snapshot["kv"]["simultaneous_temporary_kv_bytes"] = total_logical
+                    pending_tokens = (
+                        self._pending_logical_bytes // self._bytes_per_kv_token
+                        if self._bytes_per_kv_token else 0
                     )
-                    snapshot["kv"]["request_resident_kv_tokens"] = (
-                        snapshot["kv"]["request_resident_kv_tokens"] + temporary_tokens
+                    snapshot["kv"]["request_resident_kv_tokens"] += (
+                        temporary_tokens - pending_tokens
                     )
                     snapshot["kv"]["request_resident_kv_bytes"] = (
                         snapshot["kv"]["request_resident_kv_bytes"]
-                        + tensor_bytes["storage_bytes"]
+                        + extra_storage
                     )
                     # Without a request identifier, temporary tensors belong
                     # to the shared process, not to any one request's work.
                     temporary_targets = targets if req is not None or len(targets) == 1 else []
                     for active in temporary_targets:
+                        own = self._pending_tensors.get(active["server_request_id"])
+                        owned_logical = (
+                            sum(own["owners"].values()) if own else 0
+                        ) + extra_logical
+                        owned_storage = (
+                            sum(own["storages"].values()) if own else 0
+                        ) + extra_storage
                         active["temporary_logical_peak_bytes"] = max(
                             active["temporary_logical_peak_bytes"],
-                            tensor_bytes["logical_bytes"],
+                            owned_logical,
                         )
                         active["temporary_storage_peak_bytes"] = max(
                             active["temporary_storage_peak_bytes"],
-                            tensor_bytes["storage_bytes"],
+                            owned_storage,
                         )
             for active in peak_targets:
                 self._update_peak(snapshot, active)
@@ -792,6 +949,8 @@ class _PaperTelemetry:
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(result, sort_keys=True) + "\n")
         self._actives.pop(active["server_request_id"], None)
+        if self._pending_tensors.pop(active["server_request_id"], None) is not None:
+            self._rebuild_pending_accounting()
         if self._active is active:
             self._active = None
         return result
@@ -858,11 +1017,26 @@ _STATE = _PaperTelemetry()
 configure = _STATE.configure
 start_request = _STATE.start
 bind_request = _STATE.bind_request
+set_pending_tensors = _STATE.set_pending_tensors
+clear_pending_tensors = _STATE.clear_pending_tensors
 sample = _STATE.sample
 set_phase = _STATE.set_phase
 mark_generation_start = _STATE.mark_generation_start
 finish_request = _STATE.finish
 request_report = _STATE.report
+
+
+@contextlib.contextmanager
+def request_scope(rid: Any):
+    """Attribute unbound samples to one request within this context."""
+    if not enabled():
+        yield
+        return
+    token = _SYNCHRONOUS_REQUEST_ID.set(str(getattr(rid, "rid", rid)))
+    try:
+        yield
+    finally:
+        _SYNCHRONOUS_REQUEST_ID.reset(token)
 
 
 def measure_synchronous_request(kind: str, default_phase: str):

@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
+import os
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -51,7 +52,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.mem_cache.c2kv_semantics import is_c2kv_graph_compatible
+from sglang.srt.mem_cache.c2kv_semantics import (
+    is_c2kv_graph_compatible,
+    is_c2kv_prefill_graph_512_eligible,
+    validate_c2kv_prefill_graph_512_setup,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -193,12 +198,22 @@ class PiecewiseCudaGraphRunner:
         log_info_on_rank0(
             logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
         )
+        self.c2kv_prefill_graph_512 = os.environ.get("C2KV_PREFILL_GRAPH_512") == "1"
+        if self.c2kv_prefill_graph_512:
+            validate_c2kv_prefill_graph_512_setup(
+                model_runner.server_args, model_runner.model, self.device
+            )
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
+        self.prefill_capture_hidden_mode = (
+            CaptureHiddenMode.LAST
+            if self.c2kv_prefill_graph_512
+            else CaptureHiddenMode.NULL
+        )
 
         self.max_num_tokens = (
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
@@ -386,7 +401,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.prefill_capture_hidden_mode,
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
@@ -414,6 +429,10 @@ class PiecewiseCudaGraphRunner:
         return torch.int64 if not is_npu() else torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
+        if self.c2kv_prefill_graph_512 and not is_c2kv_prefill_graph_512_eligible(
+            forward_batch
+        ):
+            return False
         if not is_c2kv_graph_compatible(forward_batch):
             return False
         # Disable piecewise cuda graph for input embeddings
@@ -545,7 +564,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.prefill_capture_hidden_mode,
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,

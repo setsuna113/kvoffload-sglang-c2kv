@@ -40,6 +40,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
 )
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -583,6 +584,16 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return EvictResult()
 
+        import os
+
+        partial_leaf_enabled = (
+            os.environ.get("C2KV_RADIX_EVICT_PARTIAL_LEAF", "false").lower()
+            in ("1", "true", "yes", "on")
+            and type(self) is RadixCache
+            and type(self.token_to_kv_pool_allocator) is TokenToKVPoolAllocator
+            and self.page_size == 1
+            and not self.is_eagle
+        )
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
@@ -595,6 +606,23 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            remaining = num_tokens - num_evicted
+            partial_prefix_len = None
+            if (
+                partial_leaf_enabled
+                and 0 < remaining < len(x.value)
+                and len(x.key) == len(x.value)
+                and not x.key.is_bigram
+                and x.lock_ref == 0
+                and not x.children
+            ):
+                last_access_time = x.last_access_time
+                creation_time = x.creation_time
+                prefix = self._split_node(x.key, x, len(x.value) - remaining)
+                prefix.last_access_time = last_access_time
+                prefix.creation_time = creation_time
+                partial_prefix_len = len(prefix.value)
+
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
@@ -604,6 +632,16 @@ class RadixCache(BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+            if partial_prefix_len is not None and os.environ.get(
+                "C2KV_RADIX_EVICT_TRACE", "false"
+            ).lower() in ("1", "true", "yes", "on"):
+                logging.getLogger(__name__).info(
+                    "C2KV_RADIX_PARTIAL_LEAF original_leaf_len=%d "
+                    "suffix_freed=%d prefix_retained=%d",
+                    partial_prefix_len + len(x.value),
+                    len(x.value),
+                    partial_prefix_len,
+                )
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)

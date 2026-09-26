@@ -12,9 +12,14 @@ from typing import Callable, Optional
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
 
-# PyTorch 2.8 accepts kernel_options as a plain dict.
+# FlexAttention accepts kernel_options as a plain dict.
 C2KV_KERNEL_OPTIONS = {
     "FORCE_USE_FLEX_ATTENTION": True,
+    # BLOCK_M=128, BLOCK_N=64 exceeds Ada's shared-memory limit for Qwen3.
+    # Halve the query tile without changing the attention computation.
+    # Both dimensions divide create_block_mask's default 128-token blocks.
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
 }
 
 
@@ -174,6 +179,115 @@ def get_prepare_gist_input_func(gist_cfg: GistConfig) -> Callable:
         return block_mask, gist_mask, position_ids
 
     return prepare_gist_input
+
+
+def prepare_packed_gist_input(input_id_lists, ratio, gist_overlap, device):
+    """Pack independent documents as all raw tokens followed by all gist tokens.
+
+    Returns (raw_input_ids, attention_mask, gist_mask, position_ids,
+    raw_lengths, gist_lengths). All positions and attention rules are local to
+    each document; the mask has one physical batch row.
+    """
+    if ratio <= 0:
+        raise ValueError("compression_ratio must be greater than 0.")
+    if gist_overlap < 0:
+        raise ValueError("gist_overlap must be nonnegative.")
+    if not input_id_lists:
+        raise ValueError("Packed gist extraction requires at least one document.")
+
+    raw_lengths = [len(ids) for ids in input_id_lists]
+    if any(length == 0 for length in raw_lengths):
+        raise ValueError("Packed gist extraction requires nonempty documents.")
+    gist_lengths = [(length + ratio - 1) // ratio for length in raw_lengths]
+    raw_len = sum(raw_lengths)
+    gist_len = sum(gist_lengths)
+    total_len = raw_len + gist_len
+
+    raw_input_ids = torch.tensor(
+        [token for ids in input_id_lists for token in ids],
+        dtype=torch.long,
+        device=device,
+    ).unsqueeze(0)
+    doc_ids = torch.tensor(
+        [doc for doc, length in enumerate(raw_lengths) for _ in range(length)]
+        + [doc for doc, length in enumerate(gist_lengths) for _ in range(length)],
+        dtype=torch.long,
+        device=device,
+    )
+    local_indices = torch.tensor(
+        [index for length in raw_lengths for index in range(length)]
+        + [index for length in gist_lengths for index in range(length)],
+        dtype=torch.long,
+        device=device,
+    )
+    position_ids = torch.tensor(
+        [index for length in raw_lengths for index in range(length)]
+        + [
+            min((index + 1) * ratio - 1, length - 1)
+            for length, gist_count in zip(raw_lengths, gist_lengths)
+            for index in range(gist_count)
+        ],
+        dtype=torch.long,
+        device=device,
+    ).unsqueeze(0)
+
+    def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+        # create_block_mask may evaluate a rounded tile past total_len.
+        valid = (
+            (q_idx >= 0)
+            & (q_idx < total_len)
+            & (kv_idx >= 0)
+            & (kv_idx < total_len)
+        )
+        q_safe = q_idx.clamp(0, total_len - 1)
+        kv_safe = kv_idx.clamp(0, total_len - 1)
+        same_doc = doc_ids[q_safe] == doc_ids[kv_safe]
+        q_raw = q_idx < raw_len
+        kv_raw = kv_idx < raw_len
+        q_local = local_indices[q_safe]
+        kv_local = local_indices[kv_safe]
+
+        raw_to_raw = q_raw & kv_raw & (q_local >= kv_local)
+        gist_to_raw = (~q_raw) & kv_raw & (
+            ((kv_local >= q_local * ratio - gist_overlap)
+             & (kv_local < (q_local + 1) * ratio))
+            | (kv_local < ratio)
+        )
+        gist_to_gist = (~q_raw) & (~kv_raw) & (q_local >= kv_local)
+        return valid & same_doc & (raw_to_raw | gist_to_raw | gist_to_gist)
+
+    if torch.device(device).type == "npu":
+        idx = torch.arange(total_len, device=device, dtype=torch.long)
+        attention_mask = mask_mod(0, 0, idx[:, None], idx[None, :])
+        attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
+    else:
+        attention_mask = create_block_mask(
+            mask_mod, B=1, H=None, Q_LEN=total_len, KV_LEN=total_len, device=device
+        )
+    gist_mask = torch.ones((1, gist_len), dtype=torch.bool, device=device)
+    return (
+        raw_input_ids,
+        attention_mask,
+        gist_mask,
+        position_ids,
+        raw_lengths,
+        gist_lengths,
+    )
+
+
+def apply_gist_residual_per_document(
+    input_hidden, gist_hidden, raw_lengths, gist_lengths, residual_fn, **kwargs
+):
+    """Apply the singleton residual rule separately to each packed document."""
+    raw_parts = input_hidden.split(raw_lengths, dim=1)
+    gist_parts = gist_hidden.split(gist_lengths, dim=1)
+    return torch.cat(
+        [
+            residual_fn(raw, gist, **kwargs)
+            for raw, gist in zip(raw_parts, gist_parts)
+        ],
+        dim=1,
+    )
 
 
 def _apply_gist_residual_interleave(

@@ -31,6 +31,129 @@ class _C2KVPool:
         return 5
 
 
+def test_kv_snapshot_retains_entries_and_pins_during_cache_mutation():
+    telemetry = _PaperTelemetry()
+    pins = {"first": 1}
+    cache = {}
+
+    class Entry:
+        @property
+        def gist_len(self):
+            cache["new"] = SimpleNamespace(gist_len=7)
+            pins.clear()
+            return 2
+
+    cache.update(first=Entry(), second=SimpleNamespace(gist_len=3))
+    telemetry._c2kv_pool = SimpleNamespace(
+        _cache=cache, _pin_counts=pins, current_tokens=lambda: 5, max_total_tokens=50
+    )
+    snapshot = telemetry._kv_snapshot()
+    assert snapshot["c2kv_cached_pinned_kv_tokens"] == 2
+    assert snapshot["c2kv_cached_evictable_kv_tokens"] == 3
+    assert len(cache) == 3
+
+
+def test_opt_in_pool_snapshot_preserves_fields_without_scanning(monkeypatch):
+    class Cache(dict):
+        def items(self):
+            raise AssertionError("Fast snapshot must not scan cache entries")
+
+    telemetry = _PaperTelemetry()
+    pool = SimpleNamespace(_cache={"a": SimpleNamespace(gist_len=2),
+                                  "b": SimpleNamespace(gist_len=3)},
+                           _pin_counts={"a": 1}, current_tokens=lambda: 5,
+                           max_total_tokens=50, token_accounting=lambda: (5, 2, 3))
+    telemetry._c2kv_pool = pool
+    expected = telemetry._kv_snapshot()
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.setenv("C2KV_PAPER_POOL_SNAPSHOT", "1")
+    telemetry.configure(None, pool, bytes_per_kv_token=0)
+    pool._cache = Cache(pool._cache)
+    assert telemetry._kv_snapshot() == expected
+    # All three counts come from one publication, even if current_tokens()
+    # has already moved to a later metadata revision.
+    pool.current_tokens = lambda: 99
+    assert telemetry._kv_snapshot() == expected
+    pool.token_accounting = lambda: (5, 2, 1)
+    assert telemetry._kv_snapshot()["c2kv_cache_accounting_available"] is False
+
+
+def test_reference_payload_retains_layers_during_state_mutation():
+    telemetry = _PaperTelemetry()
+    layers = {}
+    tensors = [torch.zeros(2) for _ in range(6)]
+
+    class Layer:
+        value, positions = tensors[1:3]
+
+        @property
+        def key(self):
+            layers.clear()
+            return tensors[0]
+
+    layers.update(first=Layer(), second=SimpleNamespace(
+        key=tensors[3], value=tensors[4], positions=tensors[5]
+    ))
+    owner = SimpleNamespace(history_kv_reference_state=SimpleNamespace(layers=layers))
+    payload = telemetry._reference_payload([owner])
+    assert payload["bytes"] == sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+    assert not layers
+
+
+def test_torch_snapshot_reads_all_values_from_one_nested_stats_call(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def memory_stats():
+        calls.append(1)
+        return {
+            "allocated_bytes": {"all": {"current": 11, "peak": 13}},
+            "reserved_bytes": {"all": {"current": 17, "peak": 19}},
+        }
+
+    monkeypatch.setattr(torch.cuda, "memory_stats_as_nested_dict", memory_stats)
+    assert _PaperTelemetry()._torch_snapshot() == {
+        "allocated_bytes": 11,
+        "reserved_bytes": 17,
+        "peak_allocated_bytes": 13,
+        "peak_reserved_bytes": 19,
+    }
+    assert calls == [1]
+
+
+def test_torch_snapshot_missing_stats_default_to_zero(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_stats_as_nested_dict",
+        lambda: {"allocated_bytes": {"all": {"current": 11}}},
+    )
+    assert _PaperTelemetry()._torch_snapshot() == {
+        "allocated_bytes": 11,
+        "reserved_bytes": 0,
+        "peak_allocated_bytes": 0,
+        "peak_reserved_bytes": 0,
+    }
+
+
+def test_torch_snapshot_unavailable_or_stats_error_returns_unknown(monkeypatch):
+    def fail_stats():
+        raise RuntimeError("allocator stats unavailable")
+
+    monkeypatch.setattr(torch.cuda, "memory_stats_as_nested_dict", fail_stats)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    expected = {
+        "allocated_bytes": None,
+        "reserved_bytes": None,
+        "peak_allocated_bytes": None,
+        "peak_reserved_bytes": None,
+    }
+    telemetry = _PaperTelemetry()
+    assert telemetry._torch_snapshot() == expected
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert telemetry._torch_snapshot() == expected
+
+
 def test_request_scoped_metrics_include_generation_and_history(monkeypatch, tmp_path):
     log_path = tmp_path / "paper.jsonl"
     monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
@@ -300,6 +423,221 @@ def test_nested_tensor_storage_is_deduplicated_globally():
     )
     assert measured["logical_bytes"] == (4 + 4 + 8) * 4
     assert measured["storage_bytes"] == base.untyped_storage().nbytes()
+    repeated = _PaperTelemetry._tensor_bytes([base, base])
+    assert repeated["logical_bytes"] == 2 * base.numel() * base.element_size()
+    assert repeated["storage_bytes"] == base.untyped_storage().nbytes()
+
+
+def test_nonpending_sample_preserves_repeated_tensor_logical_bytes(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.delenv("C2KV_PAPER_CONCURRENT", raising=False)
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    telemetry = _PaperTelemetry()
+    telemetry.configure(None, None, bytes_per_kv_token=4)
+    telemetry.start(server_request_id="sync", outer_request_id="sync",
+                    phase="extraction", kind="c2kv_extract")
+    tensor = torch.zeros(4, dtype=torch.float32)
+    snap = telemetry.sample("same_twice", tensors=[tensor, tensor],
+                            temporary_kv=True)
+    assert snap["temporary_kv_tensor_bytes"] == {
+        "logical_bytes": 32, "storage_bytes": 16,
+    }
+    assert snap["kv"]["simultaneous_temporary_kv_tokens"] == 8
+    assert snap["kv"]["request_resident_kv_bytes"] == 16
+    assert telemetry.finish()["metrics"][
+        "temporary_extraction_recovery_peak_kv_bytes"] == 32
+
+
+def test_pending_kv_is_resident_across_samples_without_rescanning(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.setenv("C2KV_PAPER_CONCURRENT", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    telemetry = _PaperTelemetry()
+    telemetry.configure(None, None, bytes_per_kv_token=4)
+    telemetry.start(server_request_id="async", outer_request_id="async",
+                    phase="extraction", kind="c2kv_extract")
+    pending = [torch.zeros(4, dtype=torch.float32)]
+    telemetry.set_pending_tensors("async", pending)
+
+    # The normal decode path reads cached counts; even pool.store sampling the
+    # registered source list must not scan or count it a second time.
+    monkeypatch.setattr(telemetry, "_tensor_accounting",
+                        lambda tensors: (_ for _ in ()).throw(AssertionError("rescanned")))
+    assert telemetry._kv_snapshot()["request_resident_kv_bytes"] == 16
+    with paper_telemetry.request_scope("async"):
+        tick = telemetry.sample("decode_tick")
+        same = telemetry.sample("pool_store", tensors=pending, temporary_kv=True)
+    assert tick["kv"]["simultaneous_temporary_kv_bytes"] == 16
+    assert same["kv"]["simultaneous_temporary_kv_bytes"] == 16
+    assert same["kv"]["request_resident_kv_bytes"] == 16
+    result = telemetry.finish(server_request_id="async")
+    assert result["metrics"]["request_peak_resident_kv_bytes"] == 16
+    assert result["metrics"]["temporary_extraction_recovery_peak_kv_bytes"] == 16
+    assert telemetry._kv_snapshot()["request_resident_kv_bytes"] == 0
+    assert telemetry._pending_tensors == {}
+
+
+def test_pending_kv_unions_storage_with_distinct_synchronous_work(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.setenv("C2KV_PAPER_CONCURRENT", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    telemetry = _PaperTelemetry()
+    telemetry.configure(None, None, bytes_per_kv_token=4)
+    for rid in ("async", "sync"):
+        telemetry.start(server_request_id=rid, outer_request_id=rid,
+                        phase="extraction", kind="c2kv_extract")
+    pending = torch.zeros(4, dtype=torch.float32)
+    telemetry.set_pending_tensors("async", [pending])
+    temporary = torch.zeros(2, dtype=torch.float32)
+    with paper_telemetry.request_scope("sync"):
+        sample = telemetry.sample("sync_work", tensors=[pending, temporary],
+                                  temporary_kv=True)
+    assert sample["kv"]["simultaneous_temporary_kv_tokens"] == 6
+    assert sample["kv"]["request_resident_kv_bytes"] == 24
+    assert telemetry._actives["async"]["temporary_logical_peak_bytes"] == 16
+    assert telemetry._actives["sync"]["temporary_logical_peak_bytes"] == 8
+    assert telemetry.finish(server_request_id="sync")["metrics"][
+        "request_peak_resident_kv_bytes"] == 24
+    assert telemetry._kv_snapshot()["request_resident_kv_bytes"] == 16
+
+    # A fresh view has another logical owner but shares physical storage.
+    view = pending[:2]
+    with paper_telemetry.request_scope("async"):
+        alias = telemetry.sample("view", tensors=[view], temporary_kv=True)
+    assert alias["kv"]["simultaneous_temporary_kv_bytes"] == 24
+    assert alias["kv"]["request_resident_kv_bytes"] == 16
+    telemetry.clear_pending_tensors("async")
+    assert telemetry._kv_snapshot()["request_resident_kv_bytes"] == 0
+    telemetry.finish(server_request_id="async")
+
+
+def test_pending_kv_replacement_and_request_scope_restore(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    telemetry = _PaperTelemetry()
+    first = torch.zeros(4, dtype=torch.float32)
+    second = torch.zeros(2, dtype=torch.float32)
+    telemetry.set_pending_tensors("async", [first, second])
+    assert telemetry._kv_snapshot()["simultaneous_temporary_kv_bytes"] == 24
+    telemetry.set_pending_tensors("async", [second])
+    assert telemetry._kv_snapshot()["simultaneous_temporary_kv_bytes"] == 8
+    telemetry.clear_pending_tensors("async")
+    assert telemetry._kv_snapshot()["simultaneous_temporary_kv_bytes"] == 0
+
+    marker = paper_telemetry._SYNCHRONOUS_REQUEST_ID
+    assert marker.get() is None
+    with paper_telemetry.request_scope("outer"):
+        assert marker.get() == "outer"
+        with paper_telemetry.request_scope("inner"):
+            assert marker.get() == "inner"
+        assert marker.get() == "outer"
+    assert marker.get() is None
+
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY")
+    telemetry.set_pending_tensors("disabled", [first])
+    with paper_telemetry.request_scope("disabled"):
+        assert marker.get() is None
+    assert "disabled" not in telemetry._pending_tensors
+
+
+def test_pending_append_matches_full_registration_with_aliases(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.setenv("C2KV_PAPER_CONCURRENT", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    incremental, replacement = _PaperTelemetry(), _PaperTelemetry()
+    shared = torch.zeros(8, dtype=torch.float32)
+    layers = [(shared, shared[:4]), (shared, torch.zeros(3)),
+              (shared[2:6], torch.zeros(2))]
+    for telemetry in (incremental, replacement):
+        telemetry.configure(None, None, bytes_per_kv_token=4)
+        for rid in ("async", "other"):
+            telemetry.start(server_request_id=rid, outer_request_id=rid,
+                            phase="extraction", kind="c2kv_extract")
+        telemetry.set_pending_tensors("other", (shared,))
+    for count, layer in enumerate(layers, 1):
+        incremental.set_pending_tensors("async", (layer,), append=True)
+        replacement.set_pending_tensors("async", tuple(layers[:count]))
+        assert incremental._kv_snapshot() == replacement._kv_snapshot()
+        # Pool publication receives a different container containing the same
+        # tensors; registered tensors and shared storages must not count twice.
+        with paper_telemetry.request_scope("async"):
+            old = replacement.sample("layer", tensors=layers[:count], temporary_kv=True)
+            new = incremental.sample("layer", tensors=layers[:count], temporary_kv=True)
+        assert new["kv"] == old["kv"]
+        assert new["temporary_kv_tensor_bytes"] == old["temporary_kv_tensor_bytes"]
+        for rid in ("async", "other"):
+            for key in ("temporary_logical_peak_bytes", "temporary_storage_peak_bytes"):
+                assert incremental._actives[rid][key] == replacement._actives[rid][key]
+    for rid in ("other", "async"):
+        new = incremental.finish(server_request_id=rid)
+        old = replacement.finish(server_request_id=rid)
+        for key in ("request_peak_resident_kv_bytes", "temporary_extraction_recovery_peak_kv_bytes",
+                    "temporary_extraction_recovery_peak_storage_bytes"):
+            assert new["metrics"][key] == old["metrics"][key]
+        assert incremental._kv_snapshot() == replacement._kv_snapshot()
+    assert incremental._pending_tensors == {}
+
+
+def test_pending_append_visits_only_new_tensors_and_preserves_replacement(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    telemetry = _PaperTelemetry()
+    account = telemetry._tensor_accounting
+    visited = []
+
+    def track(tensors):
+        visited.extend(tensors)
+        return account(tensors)
+
+    monkeypatch.setattr(telemetry, "_tensor_accounting", track)
+    tensors = [torch.zeros(size, dtype=torch.float32) for size in (2, 3, 4)]
+    for tensor in tensors:
+        telemetry.set_pending_tensors("async", (tensor,), append=True)
+    assert [id(tensor) for tensor in visited] == [id(tensor) for tensor in tensors]
+    assert telemetry._kv_snapshot()["request_resident_kv_bytes"] == 36
+    assert telemetry._pending_tensors["async"]["source"] == tuple(tensors)
+    telemetry.set_pending_tensors("async", (tensors[-1],))
+    assert telemetry._kv_snapshot()["request_resident_kv_bytes"] == 16
+    telemetry.clear_pending_tensors("async")
+    assert telemetry._kv_snapshot()["request_resident_kv_bytes"] == 0
+    telemetry.set_pending_tensors("async", iter((tensors[0],)), append=True)
+    assert telemetry._kv_snapshot()["request_resident_kv_bytes"] == 8
+    telemetry.clear_pending_tensors("async")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY")
+    telemetry.set_pending_tensors("disabled", tensors, append=True)
+    assert telemetry._pending_tensors == {}
+
+
+def test_pending_append_retains_sources_during_concurrent_sampling(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.setenv("C2KV_PAPER_CONCURRENT", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    telemetry = _PaperTelemetry()
+    telemetry.configure(None, None, bytes_per_kv_token=4)
+    telemetry.start(server_request_id="async", outer_request_id="async",
+                    phase="extraction", kind="c2kv_extract")
+    barrier = threading.Barrier(2)
+
+    def append_layers():
+        for _ in range(8):
+            # The registry must retain these tensors after this call returns.
+            telemetry.set_pending_tensors("async", (torch.zeros(4),), append=True)
+            barrier.wait(timeout=5)
+            barrier.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(append_layers)
+        for count in range(1, 9):
+            barrier.wait(timeout=5)
+            snapshot = telemetry.sample("decode_tick")
+            assert snapshot["kv"]["simultaneous_temporary_kv_bytes"] == count * 16
+            assert snapshot["kv"]["request_resident_kv_bytes"] == count * 16
+            barrier.wait(timeout=5)
+        future.result(timeout=5)
+    assert telemetry.finish(server_request_id="async")["metrics"][
+        "temporary_extraction_recovery_peak_kv_bytes"] == 128
+    assert telemetry._pending_tensors == {}
 
 
 class _TreeCache:

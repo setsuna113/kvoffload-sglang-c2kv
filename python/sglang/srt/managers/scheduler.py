@@ -22,6 +22,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -96,6 +97,8 @@ from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     C2KVBulkCacheLookupReqInput,
     C2KVBulkCacheLookupReqOutput,
+    C2KVExtractBatchReqInput,
+    C2KVExtractBatchReqOutput,
     C2KVPinLeaseReqInput,
     C2KVPinLeaseReqOutput,
     ClearHiCacheReqInput,
@@ -273,6 +276,24 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 ENABLE_C2KV_LOGGING = get_bool_env_var("SGLANG_ENABLE_C2KV_LOGGING")
 
 _is_npu = is_npu()
+
+
+def _is_native_output_only_mixed_chunk_req(req: Req) -> bool:
+    """Limit logprob mixing to the native C2KV generation contract."""
+    return (
+        bool(getattr(req, "c2kv_outer_request_id", None))
+        and bool(getattr(req, "c2kv_output_only_logprob", False))
+        and req.return_logprob
+        and req.top_logprobs_num == 0
+        and req.token_ids_logprob is None
+        and req.input_embeds is None
+        and req.c2kv_rounds is not None
+        and not req.is_prefill_only
+        and (not req.return_hidden_states or req.c2kv_prompt_last_hidden_only)
+        and not getattr(req, "history_kv_eviction", None)
+        and not getattr(req, "history_kv_reference_config", None)
+        and not getattr(req, "history_kv_reference_state", None)
+    )
 
 
 def _c2kv_pending_result_requires_early_process(req) -> bool:
@@ -1386,6 +1407,7 @@ class Scheduler(
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (TokenizedExtractReqInput, self.handle_extract_request),
+                (C2KVExtractBatchReqInput, self.handle_c2kv_extract_batch),
                 (C2KVBulkCacheLookupReqInput, self.handle_c2kv_bulk_cache_lookup),
                 (C2KVPinLeaseReqInput, self.handle_c2kv_pin_lease),
                 (
@@ -1496,6 +1518,11 @@ class Scheduler(
         The event loop blocks until shutdown.
         """
         self.schedule_stream = self.device_module.Stream(priority=0)
+        self.c2kv_async_extract = None
+        if os.environ.get("C2KV_GIST_ASYNC", "").lower() in {"1", "true", "yes", "on"}:
+            from sglang.srt.managers.c2kv_async_extract import AsyncGistExtraction
+
+            self.c2kv_async_extract = AsyncGistExtraction(self)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         with self.device_module.StreamContext(self.schedule_stream):
@@ -1517,12 +1544,18 @@ class Scheduler(
             self.cur_batch = batch
 
             # Launch the current batch
+            async_extract = getattr(self, "c2kv_async_extract", None)
+            if async_extract is not None:
+                async_extract.advance(
+                    decode_dispatched=batch is not None and batch.forward_mode.is_decode()
+                )
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
-                self.self_check_during_idle()
+                if async_extract is None or not async_extract.busy:
+                    self.self_check_during_idle()
 
             # Update last_batch
             self.last_batch = batch
@@ -1585,13 +1618,20 @@ class Scheduler(
                 batch_result = None
                 self.cancel_bubble_timer()
 
+            async_extract = getattr(self, "c2kv_async_extract", None)
+            if async_extract is not None:
+                async_extract.advance(
+                    decode_dispatched=batch is not None and batch.forward_mode.is_decode()
+                )
+
             # Process the last batch
             if self.last_batch and not c2kv_early_process:
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None and not self.last_batch:
                 # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
+                if async_extract is None or not async_extract.busy:
+                    self.self_check_during_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1810,6 +1850,9 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        async_extract = getattr(self, "c2kv_async_extract", None)
+        if async_extract is not None:
+            recv_reqs = async_extract.take_ready_requests() + recv_reqs
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -1820,6 +1863,8 @@ class Scheduler(
                 )
                 continue
 
+            if async_extract is not None and async_extract.intercept(recv_req):
+                continue
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if not isinstance(output, RpcReqOutput):
@@ -2141,6 +2186,17 @@ class Scheduler(
             # When return_logprob is False, logprob_start_len should be ignored
             recv_req.logprob_start_len = -1
 
+        # Keep the request's output-only contract before -1 is normalized to
+        # the prompt length below. Native C2KV uses this for mixed prefill/decode.
+        req.c2kv_output_only_logprob = (
+            bool(recv_req.c2kv_outer_request_id)
+            and recv_req.return_logprob
+            and recv_req.logprob_start_len == -1
+            and recv_req.top_logprobs_num == 0
+            and recv_req.token_ids_logprob is None
+            and recv_req.input_embeds is None
+        )
+
         if recv_req.logprob_start_len == -1:
             if recv_req.return_logprob and recv_req.token_ids_logprob is None:
                 # If logprob is required but neither token_ids_logprob nor logprob_start_len is
@@ -2407,7 +2463,7 @@ class Scheduler(
         return key_hash, compression_ratio, None
 
     def handle_c2kv_bulk_cache_lookup(self, recv_req: C2KVBulkCacheLookupReqInput):
-        """Return a consecutive hit prefix without starting an encoder pass."""
+        """Return a consecutive hit prefix and optionally its first miss."""
         if self.c2kv_pool is None:
             return C2KVBulkCacheLookupReqOutput(
                 success=False, error="C2KV not enabled."
@@ -2446,12 +2502,237 @@ class Scheduler(
             return C2KVBulkCacheLookupReqOutput(
                 success=False, error="C2KV bulk cache lookup lost a cache hit"
             )
+        first_miss_result = None
+        if getattr(recv_req, "materialize_first_miss", False) and hit_count < len(recv_req.items):
+            # Keep the original single-document path for the mask, projection,
+            # cache admission, telemetry, and per-item error semantics.
+            first_miss_result = self.handle_extract_request(recv_req.items[hit_count])
         return C2KVBulkCacheLookupReqOutput(
-            hits=hits, first_miss_index=hit_count
+            hits=hits,
+            first_miss_index=hit_count,
+            first_miss_result=first_miss_result,
+        )
+
+    def handle_c2kv_extract_batch(self, recv_req: C2KVExtractBatchReqInput):
+        """Process an opt-in envelope in FIFO order, packing safe miss runs."""
+        if getattr(recv_req, "background_extraction", False):
+            # Unsupported or currently unallocatable background groups must
+            # return to the async singleton queue, never run on this thread.
+            return C2KVExtractBatchReqOutput(
+                rid=recv_req.rid, success=False, retry_individually=True,
+                attempted_model_calls=0,
+                error="C2KV background group requires singleton admission",
+            )
+        items = recv_req.items
+        outputs = []
+        model_runner = self.tp_worker.model_runner
+        packed_supported = (
+            self.c2kv_pool is not None
+            and self.tp_size == 1
+            and model_runner.model.__class__.__name__ == "Qwen3ForCausalLM"
+            and not getattr(model_runner.model, "full_length_pic", False)
+            and callable(getattr(model_runner, "forward_c2kv_extract_many", None))
+        )
+        index = 0
+        while index < len(items):
+            group = []
+            group_requests = []
+            if packed_supported:
+                seen_keys = set()
+                raw_tokens = gist_tokens = 0
+                ratio = projection_set = None
+                free_tokens = self.c2kv_pool.allocator.available_size()
+                for request in items[index : index + 4]:
+                    hit_count = None
+                    if isinstance(request, C2KVBulkCacheLookupReqInput):
+                        if (
+                            not request.materialize_first_miss
+                            or not 1 <= len(request.items) <= 32
+                        ):
+                            break
+                        hit_count = 0
+                        item = None
+                        # Probe without touching LRU. A later prefix hit must not
+                        # be returned before an earlier miss can evict it.
+                        for candidate in request.items:
+                            if not candidate.input_ids:
+                                break
+                            candidate_key, _, candidate_error = (
+                                self._c2kv_extract_cache_key(candidate)
+                            )
+                            if candidate_error is not None:
+                                break
+                            if candidate_key not in self.c2kv_pool._cache:
+                                item = candidate
+                                break
+                            hit_count += 1
+                        if item is None:
+                            break
+                    else:
+                        item = request
+                    if not item.input_ids:
+                        break
+                    key_hash, item_ratio, error = self._c2kv_extract_cache_key(item)
+                    item_projection = getattr(item, "projection_set", "history") or "history"
+                    if (
+                        error is not None
+                        or key_hash in self.c2kv_pool._cache
+                        or key_hash in seen_keys
+                        or not item.allow_cache_miss
+                        or (group and (item_ratio != ratio or item_projection != projection_set))
+                    ):
+                        break
+                    item_gist_tokens = (len(item.input_ids) + item_ratio - 1) // item_ratio
+                    if (
+                        item_gist_tokens > self.c2kv_pool.max_entry_tokens
+                        or item_gist_tokens > self.c2kv_pool.max_total_tokens
+                        or gist_tokens + item_gist_tokens > free_tokens
+                        or raw_tokens + len(item.input_ids) > 4096
+                    ):
+                        break
+                    group.append(item)
+                    group_requests.append((request, hit_count))
+                    seen_keys.add(key_hash)
+                    ratio, projection_set = item_ratio, item_projection
+                    raw_tokens += len(item.input_ids)
+                    gist_tokens += item_gist_tokens
+            if len(group) > 1:
+                prefix_hits = {}
+
+                def touch_prefix(offset):
+                    request, hit_count = group_requests[offset]
+                    if hit_count is not None:
+                        prefix_hits[offset] = [
+                            self.handle_extract_request(hit)
+                            for hit in request.items[:hit_count]
+                        ]
+
+                group_req = C2KVExtractBatchReqInput(
+                    rid=uuid.uuid4().hex,
+                    items=group,
+                    c2kv_outer_request_id=(
+                        getattr(recv_req, "c2kv_outer_request_id", None)
+                        or getattr(group[0], "c2kv_outer_request_id", None)
+                    ),
+                    c2kv_measurement_phase=(
+                        getattr(recv_req, "c2kv_measurement_phase", None)
+                        or getattr(group[0], "c2kv_measurement_phase", None)
+                    ),
+                )
+                result = self._run_c2kv_extract_group(
+                    group_req, ratio, projection_set, before_each=touch_prefix
+                )
+                for offset, (request, hit_count) in enumerate(group_requests):
+                    if hit_count is None:
+                        outputs.append(result.items[offset])
+                    else:
+                        hits = prefix_hits[offset]
+                        if any(not hit.success or not hit.cache_hit for hit in hits):
+                            outputs.append(
+                                C2KVBulkCacheLookupReqOutput(
+                                    rid=getattr(request, "rid", None),
+                                    success=False,
+                                    error="C2KV bulk cache lookup lost a cache hit",
+                                )
+                            )
+                        else:
+                            outputs.append(
+                                C2KVBulkCacheLookupReqOutput(
+                                    rid=getattr(request, "rid", None),
+                                    hits=hits,
+                                    first_miss_index=hit_count,
+                                    first_miss_result=result.items[offset],
+                                )
+                            )
+                index += len(group)
+            else:
+                request = items[index]
+                if isinstance(request, C2KVBulkCacheLookupReqInput):
+                    output = self.handle_c2kv_bulk_cache_lookup(request)
+                    output.rid = getattr(request, "rid", None)
+                else:
+                    output = self.handle_extract_request(request)
+                outputs.append(output)
+                index += 1
+        return C2KVExtractBatchReqOutput(
+            items=outputs,
+            success=True,
+        )
+
+    @paper_telemetry.measure_synchronous_request("c2kv_extract_batch", "extraction")
+    def _run_c2kv_extract_group(
+        self, recv_req: C2KVExtractBatchReqInput, ratio: int, projection_set: str,
+        before_each=None,
+    ):
+        if self.enable_overlap and self.forward_stream is not None:
+            self.schedule_stream.wait_stream(self.forward_stream)
+        duration_ns = None
+        measure = paper_telemetry.enabled()
+        if measure:
+            try:
+                self.schedule_stream.synchronize()
+            except Exception:
+                logger.warning("C2KV batch timing start synchronization failed", exc_info=True)
+                measure = False
+        started_ns = time.perf_counter_ns() if measure else None
+        results = None
+        error = None
+        try:
+            results = self.tp_worker.model_runner.forward_c2kv_extract_many(
+                [item.input_ids for item in recv_req.items],
+                ratio,
+                projection_set=projection_set,
+            )
+            if len(results) != len(recv_req.items):
+                raise ValueError("C2KV packed extraction returned the wrong item count")
+            gist_lengths = [result[1].shape[1] for result in results]
+            if (
+                any(
+                    length > min(
+                        self.c2kv_pool.max_entry_tokens,
+                        self.c2kv_pool.max_total_tokens,
+                    )
+                    for length in gist_lengths
+                )
+                or sum(gist_lengths) > self.c2kv_pool.allocator.available_size()
+            ):
+                raise ValueError("C2KV packed extraction exceeded reserved pool capacity")
+        except Exception as exc:
+            logger.error("C2KV packed extraction failed: %s", exc, exc_info=True)
+            error = str(exc)
+        finally:
+            if started_ns is not None:
+                try:
+                    self.schedule_stream.synchronize()
+                    duration_ns = max(0, time.perf_counter_ns() - started_ns)
+                except Exception:
+                    logger.warning("C2KV batch timing end synchronization failed", exc_info=True)
+        outputs = []
+        for offset, item in enumerate(recv_req.items):
+            if before_each is not None:
+                before_each(offset)
+            outputs.append(
+                self.handle_extract_request(
+                    item,
+                    _precomputed_gist=(
+                        None if error is not None else results[offset],
+                        error,
+                        recv_req.rid,
+                        len(recv_req.items),
+                        duration_ns,
+                    ),
+                )
+            )
+        return C2KVExtractBatchReqOutput(
+            items=outputs,
+            success=all(item.success for item in outputs),
+            error=next((item.error for item in outputs if not item.success), ""),
         )
 
     @paper_telemetry.measure_synchronous_request("c2kv_extract", "extraction")
-    def handle_extract_request(self, recv_req: "TokenizedExtractReqInput"):
+    def handle_extract_request(
+        self, recv_req: "TokenizedExtractReqInput", *, _precomputed_gist=None
+    ):
         from sglang.srt.managers.io_struct import C2KVExtractReqOutput
 
         if self.c2kv_pool is None:
@@ -2546,16 +2827,25 @@ class Scheduler(
         # peer communications by submission order, the ordering seen by each TP rank
         # can diverge → deadlock.  Serialise by making schedule_stream wait for any
         # in-flight forward_stream work before issuing extract NCCL operations.
-        if self.enable_overlap and self.forward_stream is not None:
+        if (
+            _precomputed_gist is None
+            and self.enable_overlap
+            and self.forward_stream is not None
+        ):
             self.schedule_stream.wait_stream(self.forward_stream)
 
-        input_ids = torch.tensor(
-            [recv_req.input_ids], dtype=torch.long, device="cuda"
-        )
-        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        input_ids = attention_mask = None
         error_msg = None
         gist_key_values = gist_mask = gist_position_ids = None
         gist_generation_duration_ns = None
+        batch_result_fields = {}
+        if _precomputed_gist is not None:
+            _, _, batch_id, batch_size, shared_duration_ns = _precomputed_gist
+            batch_result_fields = {
+                "extraction_batch_id": batch_id,
+                "extraction_batch_size": batch_size,
+                "shared_gist_generation_duration_ns": shared_duration_ns,
+            }
 
         def _release_npu_extract_temps():
             if not _is_npu:
@@ -2566,43 +2856,52 @@ class Scheduler(
             except Exception:
                 logger.warning("C2KV NPU extract cleanup failed", exc_info=True)
 
-        measure_gist_generation = paper_telemetry.enabled()
-        if measure_gist_generation:
-            try:
-                self.schedule_stream.synchronize()
-            except Exception:
-                logger.warning(
-                    "C2KV gist timing start synchronization failed",
-                    exc_info=True,
-                )
-                measure_gist_generation = False
-        gist_generation_started_ns = (
-            time.perf_counter_ns() if measure_gist_generation else None
-        )
-        try:
-            gist_key_values, gist_mask, gist_position_ids = (
-                self.tp_worker.model_runner.forward_c2kv_extract(
-                    input_ids,
-                    attention_mask,
-                    compression_ratio,
-                    projection_set=projection_set,
-                )
+        if _precomputed_gist is not None:
+            packed_result, error_msg, _, _, _ = _precomputed_gist
+            if error_msg is None:
+                gist_key_values, gist_mask, gist_position_ids = packed_result
+        else:
+            input_ids = torch.tensor(
+                [recv_req.input_ids], dtype=torch.long, device="cuda"
             )
-        except Exception as e:
-            logger.error(f"C2KV extract failed: {e}", exc_info=True)
-            error_msg = str(e)
-        finally:
-            if gist_generation_started_ns is not None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+            measure_gist_generation = paper_telemetry.enabled()
+            if measure_gist_generation:
                 try:
                     self.schedule_stream.synchronize()
-                    gist_generation_duration_ns = max(
-                        0, time.perf_counter_ns() - gist_generation_started_ns
-                    )
                 except Exception:
                     logger.warning(
-                        "C2KV gist timing end synchronization failed",
+                        "C2KV gist timing start synchronization failed",
                         exc_info=True,
                     )
+                    measure_gist_generation = False
+            gist_generation_started_ns = (
+                time.perf_counter_ns() if measure_gist_generation else None
+            )
+            try:
+                gist_key_values, gist_mask, gist_position_ids = (
+                    self.tp_worker.model_runner.forward_c2kv_extract(
+                        input_ids,
+                        attention_mask,
+                        compression_ratio,
+                        projection_set=projection_set,
+                    )
+                )
+            except Exception as e:
+                logger.error(f"C2KV extract failed: {e}", exc_info=True)
+                error_msg = str(e)
+            finally:
+                if gist_generation_started_ns is not None:
+                    try:
+                        self.schedule_stream.synchronize()
+                        gist_generation_duration_ns = max(
+                            0, time.perf_counter_ns() - gist_generation_started_ns
+                        )
+                    except Exception:
+                        logger.warning(
+                            "C2KV gist timing end synchronization failed",
+                            exc_info=True,
+                        )
 
         # TP pool-state guard: if forward_c2kv_extract raises on one rank but
         # not another, that rank skips c2kv_pool.store().  On the next extract
@@ -2629,6 +2928,7 @@ class Scheduler(
                 error=error_msg,
                 success=False,
                 gist_generation_duration_ns=gist_generation_duration_ns,
+                **batch_result_fields,
             )
 
         original_seq_len = len(recv_req.input_ids)
@@ -2660,6 +2960,7 @@ class Scheduler(
                 error=error_msg,
                 success=False,
                 gist_generation_duration_ns=gist_generation_duration_ns,
+                **batch_result_fields,
             )
         has_space = self.c2kv_pool.can_allocate(gist_len, existing_key=key_hash)
         if self.tp_size > 1 and torch.distributed.is_initialized():
@@ -2683,6 +2984,7 @@ class Scheduler(
                 error=error_msg,
                 success=False,
                 gist_generation_duration_ns=gist_generation_duration_ns,
+                **batch_result_fields,
             )
 
         try:
@@ -2702,6 +3004,7 @@ class Scheduler(
                 error=str(e),
                 success=False,
                 gist_generation_duration_ns=gist_generation_duration_ns,
+                **batch_result_fields,
             )
         self._log_c2kv_token_usage(
             "extract_store",
@@ -2717,6 +3020,7 @@ class Scheduler(
             gist_len=entry.gist_len,
             original_seq_len=original_seq_len,
             gist_generation_duration_ns=gist_generation_duration_ns,
+            **batch_result_fields,
         )
 
     @paper_telemetry.measure_synchronous_request("c2kv_repair_extract", "recovery")
@@ -6695,11 +6999,23 @@ class Scheduler(
         if (
             self.is_mixed_chunk
             and not self.running_batch.is_empty()
-            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+            and (
+                not (new_batch.return_logprob or self.running_batch.return_logprob)
+                or (
+                    self.spec_algorithm.is_none()
+                    and all(
+                        _is_native_output_only_mixed_chunk_req(req)
+                        for req in new_batch.reqs + self.running_batch.reqs
+                    )
+                    and all(
+                        req.c2kv_round_idx == len(req.c2kv_rounds)
+                        for req in self.running_batch.reqs
+                    )
+                )
+            )
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
         ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
@@ -7219,6 +7535,8 @@ class Scheduler(
         idle &= len(self.waiting_queue) == 0
 
         if not for_health_check:
+            async_extract = getattr(self, "c2kv_async_extract", None)
+            idle &= async_extract is None or not async_extract.busy
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0

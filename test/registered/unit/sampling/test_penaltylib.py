@@ -346,6 +346,77 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         # Non-stop tokens should be fine
         self.assertEqual(logits[0, 0].item(), 0.0)
 
+    def test_apply_matches_boolean_indexing_for_mixed_requests_and_dtypes(self):
+        """Compare with the previous implementation for mixed dtypes and logits."""
+        _, pen = self._setup(
+            [
+                (0, {5}, 2),
+                (2, {5, 7}, 3),
+                (2, {8}, 4),
+                (3, {6}, 5),
+            ]
+        )
+        pen.len_output_tokens.copy_(torch.tensor([[0], [1], [2], [1]]))
+        # Exercise float32-to-logits dtype conversion beyond the usual 0/-inf values.
+        pen.stop_token_penalties[1, 11] = -0.3
+        pen.stop_token_penalties[3, 12] = 0.2
+
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                original = torch.full((4, VOCAB_SIZE), 1.25, dtype=dtype)
+                original[0, 2] = float("nan")
+                original[0, 5] = float("-inf")
+                original[0, 9] = -0.0
+                original[2, 4] = float("inf")
+                original[2, 8] = -0.0
+                original[1, 3] = float("inf")
+                original[1, 11] = 0.03125
+                original[3, 12] = -0.0
+
+                expected = original.clone()
+                mask = (pen.len_output_tokens < pen.min_new_tokens).expand_as(
+                    expected
+                )
+                expected[mask] += pen.stop_token_penalties[mask]
+
+                actual = original.clone()
+                original_ptr = actual.data_ptr()
+                pen.apply(actual)
+                self.assertEqual(actual.data_ptr(), original_ptr)
+                torch.testing.assert_close(
+                    actual, expected, rtol=0, atol=0, equal_nan=True
+                )
+
+                inactive = ~mask
+                self.assertTrue(
+                    torch.equal(
+                        torch.signbit(actual[inactive]),
+                        torch.signbit(original[inactive]),
+                    )
+                )
+                torch.testing.assert_close(
+                    actual[inactive], original[inactive], rtol=0, atol=0, equal_nan=True
+                )
+
+    def test_apply_matches_boolean_indexing_after_merge_and_filter(self):
+        """Merged and filtered requests retain their own thresholds and stop sets."""
+        _, pen = self._setup([(1, {6}, 2), (0, {7}, 3)])
+        _, other = self._setup([(3, {8}, 4), (2, {9}, 5)])
+        pen.merge(other)
+        pen.filter(torch.tensor([3, 1, 2]))
+        pen.len_output_tokens.copy_(torch.tensor([[1], [0], [2]]))
+
+        expected = torch.zeros(3, VOCAB_SIZE)
+        mask = (pen.len_output_tokens < pen.min_new_tokens).expand_as(expected)
+        expected[mask] += pen.stop_token_penalties[mask]
+
+        actual = torch.zeros_like(expected)
+        pen.apply(actual)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+        self.assertTrue(torch.isneginf(actual[0, 5]))
+        self.assertEqual(actual[1, 3].item(), 0.0)
+        self.assertTrue(torch.isneginf(actual[2, 4]))
+
     def test_filter_keeps_subset(self):
         """Test that filter keeps the second request (min_tokens=5) and drops the first."""
         orch, pen = self._setup([(3, None, 2), (5, None, 2)])

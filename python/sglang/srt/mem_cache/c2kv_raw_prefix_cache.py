@@ -17,6 +17,13 @@ def native_raw_prefix_cache_enabled() -> bool:
     )
 
 
+def native_raw_prefix_cache_priority_enabled() -> bool:
+    return os.environ.get("C2KV_NATIVE_RAW_PREFIX_CACHE_PRIORITY", "false").lower() in (
+        "1",
+        "true",
+    )
+
+
 def _candidate(req, tree_cache):
     if not native_raw_prefix_cache_enabled():
         return None, None, "disabled"
@@ -81,7 +88,16 @@ def _candidate(req, tree_cache):
     return raw_ids, radix_cache, None
 
 
-def _report(req, *, status, reason=None, hit_tokens=None, inserted_tokens=None, prefix_tokens=None):
+def _report(
+    req,
+    *,
+    status,
+    reason=None,
+    hit_tokens=None,
+    inserted_tokens=None,
+    prefix_tokens=None,
+    eviction_priority=None,
+):
     report = getattr(req, "c2kv_raw_prefix_cache", None)
     if report is None:
         report = {"enabled": True, "hit_tokens": 0, "inserted_tokens": 0}
@@ -94,6 +110,8 @@ def _report(req, *, status, reason=None, hit_tokens=None, inserted_tokens=None, 
         report["inserted_tokens"] = inserted_tokens
     if prefix_tokens is not None:
         report["prefix_tokens"] = prefix_tokens
+    if eviction_priority is not None:
+        report["eviction_priority"] = eviction_priority
 
 
 def match_c2kv_first_raw_prefix(req, tree_cache) -> bool:
@@ -156,11 +174,14 @@ def cache_c2kv_first_raw_prefix(req, tree_cache) -> bool:
         req.req_pool_idx, :raw_len
     ]
     key = RadixKey(raw_ids, req.extra_key)
+    priority = getattr(req, "priority", 0) or 0
+    if native_raw_prefix_cache_priority_enabled():
+        priority = max(priority, 1)
     result = radix_cache.insert(
         InsertParams(
             key=key,
             value=kv_indices.to(dtype=torch.int64, copy=True),
-            priority=getattr(req, "priority", 0) or 0,
+            priority=priority,
         )
     )
     duplicate_len = result.prefix_len
@@ -191,5 +212,6 @@ def cache_c2kv_first_raw_prefix(req, tree_cache) -> bool:
         hit_tokens=old_protected_len,
         inserted_tokens=raw_len - duplicate_len,
         prefix_tokens=raw_len,
+        eviction_priority=priority,
     )
     return True

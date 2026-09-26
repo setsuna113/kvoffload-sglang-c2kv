@@ -67,8 +67,9 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         self.len_output_tokens += 1
 
     def _apply(self, logits: torch.Tensor):
-        mask = (self.len_output_tokens < self.min_new_tokens).expand_as(logits)
-        logits[mask] += self.stop_token_penalties[mask]
+        active = self.len_output_tokens < self.min_new_tokens
+        penalized = (logits + self.stop_token_penalties).to(dtype=logits.dtype)
+        logits.copy_(torch.where(active, penalized, logits))
 
     def _filter(self, keep_indices: torch.Tensor):
         self.min_new_tokens = self.min_new_tokens[keep_indices]
